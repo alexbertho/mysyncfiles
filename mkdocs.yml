@@ -1,0 +1,39 @@
+site_name: MySyncFiles
+site_description: Guide d'installation et d'exploitation de MySyncFiles
+site_url: !ENV MYSYNC_DOCS_SITE_URL
+repo_url: https://github.com/alexbertho/mysyncfiles
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: readthedocs
+  locale: fr
+
+plugins:
+  - search
+
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
+
+nav:
+  - Accueil: index.md
+  - Installation:
+      - Serveur: install-server.md
+      - Client: install-client.md
+  - Comprendre:
+      - Architecture: architecture.md
+      - Fonctionnement du serveur: server.md
+      - Fonctionnement du client: client.md
+  - Administrer:
+      - Configuration: configuration.md
+      - Déploiement et publication: operations.md
+      - Dépannage: troubleshooting.md
+  - Sécurité:
+      - Garanties et limites: security.md
+      - Identité TPM: device-auth.md
+      - Suivi de la revue: security-review-followup.md
