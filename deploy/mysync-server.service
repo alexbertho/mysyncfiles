@@ -1,0 +1,21 @@
+[Unit]
+Description=MySyncFiles server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mysyncfiles
+Group=mysyncfiles
+StateDirectory=mysyncfiles
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/mysync-server serve --data-dir /var/lib/mysyncfiles --listen 127.0.0.1:8484
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

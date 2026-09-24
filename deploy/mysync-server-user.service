@@ -1,0 +1,16 @@
+[Unit]
+Description=MySyncFiles server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mysync-server serve --data-dir %h/.local/share/mysync-server --listen 127.0.0.1:8484
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

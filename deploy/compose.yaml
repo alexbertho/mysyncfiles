@@ -1,0 +1,34 @@
+name: mysyncfiles
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: mysyncfiles-server:local
+    user: "${MYSYNC_UID:-1000}:${MYSYNC_GID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    volumes:
+      - type: bind
+        source: ${MYSYNC_DATA_DIR:?Set MYSYNC_DATA_DIR in deploy/.env}
+        target: /data
+      - type: bind
+        source: ${MYSYNC_RELEASES_DIR:?Set MYSYNC_RELEASES_DIR in deploy/.env}
+        target: /releases
+        read_only: true
+    ports:
+      - "127.0.0.1:8484:8484"
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stop_grace_period: 1m
+    restart: unless-stopped
