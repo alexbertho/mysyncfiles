@@ -402,6 +402,191 @@ async fn enroll(
     assert_eq!(enrollment.fingerprint, key.fingerprint()?);
     Ok(enrollment.fingerprint)
 }
+
+#[tokio::test]
+async fn pairing_code_requires_local_registration_and_tpm_approval() -> Result<()> {
+    let ca = Certificate::ca()?;
+    let simulator = Simulator::start()?;
+    let cert = simulator.certify_ek(&ca, "rsa")?;
+    let server = Server::start(&ca).await?;
+    let http = Client::new();
+    let code = device_auth::pairing_code()?;
+    let canonical = device_auth::normalize_pairing_code(&code)?;
+    assert_eq!(canonical.len(), 20);
+    assert_eq!(code.matches('-').count(), 3);
+    assert_eq!(
+        device_auth::normalize_pairing_code("OOOOO-IIIII-LLLLL-00000")?,
+        "00000111111111100000"
+    );
+    let ready = || {
+        http.post(format!("{}/v1/enroll/ready", server.url))
+            .json(&serde_json::json!({"code": code}))
+            .send()
+    };
+    assert_eq!(ready().await?.status(), StatusCode::ACCEPTED);
+    let (mut key, _) = Identity::create(&simulator.tcti, "rsa")?;
+    assert_eq!(
+        start_enroll(&http, &server, &canonical, &key, &cert)
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let id = device_auth::register_pair(&server.state, "paired-client", &code)?;
+    assert_eq!(
+        device_auth::register_pair(&server.state, "paired-client", &canonical.to_lowercase())?,
+        id
+    );
+    assert!(device_auth::register_pair(&server.state, "another-client", &code).is_err());
+    assert_eq!(ready().await?.status(), StatusCode::NO_CONTENT);
+    let fingerprint = enroll(&http, &server, &canonical, &mut key, &cert).await?;
+    assert_eq!(
+        device_auth::enrollment_by_id(&server.state, &id)?
+            .fingerprint
+            .as_deref(),
+        Some(fingerprint.as_str())
+    );
+    assert!(session(&http, &server, &key).await.is_err());
+    assert!(device_auth::approve(&server.state, &id, &"0".repeat(64)).is_err());
+    device_auth::approve(&server.state, &id, &fingerprint)?;
+    session(&http, &server, &key).await?;
+    assert_eq!(ready().await?.status(), StatusCode::GONE);
+    let cancelled_code = device_auth::pairing_code()?;
+    let cancelled_id =
+        device_auth::register_pair(&server.state, "cancelled-pair", &cancelled_code)?;
+    device_auth::cancel(&server.state, &cancelled_id)?;
+    assert_eq!(
+        http.post(format!("{}/v1/enroll/ready", server.url))
+            .json(&serde_json::json!({"code": cancelled_code}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::GONE
+    );
+    let expired_code = device_auth::pairing_code()?;
+    let expired_id = device_auth::register_pair(&server.state, "expired-pair", &expired_code)?;
+    server.db()?.execute(
+        "UPDATE device_enrollments SET expires_at=1 WHERE id=?1",
+        [&expired_id],
+    )?;
+    assert_eq!(
+        http.post(format!("{}/v1/enroll/ready", server.url))
+            .json(&serde_json::json!({"code": expired_code}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::GONE
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
+    let ca = Certificate::ca()?;
+    let simulator = Simulator::start()?;
+    simulator.certify_ek(&ca, "rsa")?;
+    let server = Server::start(&ca).await?;
+    let local = tempfile::tempdir()?;
+    let config = local.path().join("config.json");
+    let root = local.path().join("mirror");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("hello.txt"), b"hello")?;
+    let pending_config = config.clone();
+    let pending_root = root.clone();
+    let origin = server.url.clone();
+    let tcti = simulator.tcti.clone();
+    let setup = tokio::spawn(async move {
+        client::setup_with_tcti(&pending_config, origin, pending_root, None, None, tcti).await
+    });
+    let pair_path = config.with_extension("pairing.json");
+    let code = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&pair_path) {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                break Ok::<String, anyhow::Error>(value["code"].as_str().unwrap().to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let id = device_auth::register_pair(&server.state, "setup-client", &code)?;
+    let fingerprint = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let entry = device_auth::enrollment_by_id(&server.state, &id)?;
+            if entry.status == "pending-approval" {
+                break Ok::<String, anyhow::Error>(entry.fingerprint.unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    device_auth::approve(&server.state, &id, &fingerprint)?;
+    let outcome = tokio::time::timeout(Duration::from_secs(30), setup).await???;
+    assert_eq!(outcome.report.uploaded, 1);
+    assert_eq!(outcome.conflicts, 0);
+    assert!(!pair_path.exists());
+    assert!(config.exists());
+    let conflict_dir = root.join(".mysync-conflicts");
+    std::fs::create_dir(&conflict_dir)?;
+    std::fs::write(conflict_dir.join("review.txt"), b"review this file")?;
+    let resumed = client::setup_with_tcti(
+        &config,
+        server.url.clone(),
+        root.clone(),
+        None,
+        None,
+        simulator.tcti.clone(),
+    )
+    .await?;
+    assert_eq!(resumed.report.uploaded, 0);
+    assert_eq!(resumed.conflicts, 1);
+    std::fs::remove_file(conflict_dir.join("review.txt"))?;
+    let cleared = client::setup_with_tcti(
+        &config,
+        server.url.clone(),
+        root,
+        None,
+        None,
+        simulator.tcti.clone(),
+    )
+    .await?;
+    assert_eq!(cleared.conflicts, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_pairing_discards_the_local_code() -> Result<()> {
+    let ca = Certificate::ca()?;
+    let server = Server::start(&ca).await?;
+    let local = tempfile::tempdir()?;
+    let config = local.path().join("config.json");
+    let root = local.path().join("mirror");
+    let pending_config = config.clone();
+    let origin = server.url.clone();
+    let setup = tokio::spawn(async move {
+        client::setup_with_tcti(&pending_config, origin, root, None, None, "unused".into()).await
+    });
+    let pair_path = config.with_extension("pairing.json");
+    let code = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&pair_path) {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                break Ok::<String, anyhow::Error>(value["code"].as_str().unwrap().to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let id = device_auth::register_pair(&server.state, "cancel-setup", &code)?;
+    device_auth::cancel(&server.state, &id)?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), setup)
+            .await??
+            .is_err()
+    );
+    assert!(!pair_path.exists());
+    assert!(!config.exists());
+    Ok(())
+}
 async fn signed(
     http: &Client,
     url: &str,

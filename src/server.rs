@@ -39,8 +39,23 @@ pub struct ServerState {
     releases_dir: Option<crate::local_fs::Mirror>,
     pub(crate) db: Mutex<Connection>,
     pub(crate) enrollment_limit: tokio::sync::Semaphore,
+    pair_ready_rate: Mutex<(std::time::Instant, u32)>,
     pub(crate) signed_request_limit: tokio::sync::Semaphore,
     active_uploads: Mutex<HashSet<String>>,
+}
+
+impl ServerState {
+    pub(crate) fn allow_pair_ready(&self) -> bool {
+        let mut rate = self.pair_ready_rate.lock().unwrap();
+        if rate.0.elapsed() >= Duration::from_secs(1) {
+            *rate = (std::time::Instant::now(), 0);
+        }
+        if rate.1 >= 40 {
+            return false;
+        }
+        rate.1 += 1;
+        true
+    }
 }
 
 struct ActiveUpload {
@@ -210,6 +225,7 @@ pub fn open_with_releases(
             .transpose()?,
         db: Mutex::new(conn),
         enrollment_limit: tokio::sync::Semaphore::new(4),
+        pair_ready_rate: Mutex::new((std::time::Instant::now(), 0)),
         signed_request_limit: tokio::sync::Semaphore::new(8),
         active_uploads: Mutex::new(HashSet::new()),
     }))
@@ -1026,6 +1042,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/updates/{target}/{file}", get(client_release))
         .route("/v1/enroll/start", post(crate::device_auth::enroll_start))
         .route("/v1/enroll/finish", post(crate::device_auth::enroll_finish))
+        .route(
+            "/v1/enroll/ready",
+            post(crate::device_auth::pair_ready).layer(axum::extract::DefaultBodyLimit::max(128)),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
 }

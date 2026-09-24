@@ -12,7 +12,7 @@ Le serveur est l'autorité sur les révisions. Une requête qui part d'une ancie
 
 `/v1/health` donne un contrôle local de disponibilité. `/install.sh` sert le script client après configuration de l'origine publique. `/v1/updates/…` sert les releases signées présentes dans le montage dédié. Les routes de synchronisation exigent une session et une preuve TPM liée à la requête. Les réponses et transferts sont bornés, et l'API ne suit aucune redirection HTTP.
 
-Les opérations d'administration des appareils (`device auth-configure`, `invite`, `pending`, `approve`, `revoke`) s'exécutent localement via `mysync-server` dans le conteneur. Il n'existe pas de route HTTP pour approuver un appareil. Voir la [configuration](configuration.md) et l'[appairage](device-auth.md#appairage-et-approbation).
+Les opérations d'administration des appareils (`device auth-configure`, `pair`, `invite`, `pending`, `approve`, `revoke`) s'exécutent localement via `mysync-server` dans le conteneur. `make pair` guide l'appairage courant ; il n'existe pas de route HTTP pour approuver un appareil. Voir la [configuration](configuration.md) et l'[appairage](device-auth.md#appairage-et-approbation).
 
 ## Limites opérationnelles
 

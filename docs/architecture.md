@@ -21,6 +21,6 @@ Une suppression apparaît comme une révision et peut être restaurée depuis la
 
 ## Identité et mises à jour
 
-Chaque appareil crée une clé non exportable dans son TPM. L'administrateur fournit une invitation, le serveur vérifie la chaîne EK constructeur et l'appareil doit être approuvé après comparaison de l'empreinte. Les requêtes suivantes portent une preuve TPM fraîche. Voir le [guide d'identité](device-auth.md).
+Chaque appareil crée une clé non exportable dans son TPM. Le client affiche un code que l'administrateur saisit localement sur le serveur ; le serveur vérifie ensuite la chaîne EK constructeur et l'appareil doit être approuvé après comparaison de l'empreinte. Les requêtes suivantes portent une preuve TPM fraîche. Le parcours manuel par invitation reste disponible. Voir le [guide d'identité](device-auth.md).
 
 Le serveur distribue aussi l'installateur et les releases du client. Le manifeste de release est signé ; le client vérifie cette signature et le hash du binaire avant installation ou mise à jour. La clé privée de signature reste hors du serveur et des fichiers servis. Voir la [publication](operations.md#publier-un-client-signe).

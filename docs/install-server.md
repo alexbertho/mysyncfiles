@@ -44,4 +44,4 @@ Utiliser ensuite l'[origine publique et les racines EK vérifiées](device-auth.
 
 [Publier un binaire signé](operations.md#publier-un-client-signe) pour chaque architecture cliente utilisée. Cette publication est une opération distincte de `make install` et `make start`. Tant qu'aucune release compatible n'est publiée, le script d'installation ne peut pas installer de client.
 
-Vérifier depuis l'extérieur que l'origine HTTPS sert `/install.sh` et que le certificat TLS est valide. Créer une [invitation par appareil](install-client.md#inviter-et-approuver-un-appareil) juste avant l'appairage, puis suivre le [guide client](install-client.md).
+Vérifier depuis l'extérieur que l'origine HTTPS sert `/install.sh` et que le certificat TLS est valide. Pour chaque client, lancer `make pair` après l'affichage de son code d'appairage, puis suivre le [guide client](install-client.md#appairer-et-approuver-un-appareil).

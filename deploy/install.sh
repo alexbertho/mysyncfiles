@@ -223,6 +223,7 @@ if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode 
 PY
 done
 destination="$destination_dir/mysync"
+setup_available=0
 if [ -L "$destination" ]; then
     die "Refusing symbolic-link client binary: $destination"
 fi
@@ -230,6 +231,9 @@ if [ -e "$destination" ]; then
     [ -f "$destination" ] && [ -x "$destination" ] || die "Existing client is not a regular executable: $destination"
     warn "An existing client was left untouched: $destination"
     say 'Use mysync update for signed upgrades; this bootstrap installer never downgrades a client.'
+    if cmp -s "$tmp/mysync" "$destination"; then
+        setup_available=1
+    fi
 else
     staged="$destination_dir/.mysync-install-$$"
     [ ! -e "$staged" ] && [ ! -L "$staged" ] || die 'Temporary installation path already exists.'
@@ -238,24 +242,52 @@ else
     rm -f -- "$staged"
     staged=
     ok "Installed $destination"
+    setup_available=1
 fi
 
 cat > "$tmp/mysync.service" <<'MYSYNC_UNIT'
 @MYSYNC_UNIT@
 MYSYNC_UNIT
 unit="$unit_dir/mysync.service"
+service_ready=1
 if [ -L "$unit" ]; then
     die "Refusing symbolic-link service file: $unit"
 fi
 if [ -e "$unit" ]; then
     if ! cmp -s "$tmp/mysync.service" "$unit"; then
         warn "Existing service file was left untouched: $unit"
+        service_ready=0
     fi
 else
     install -m 644 "$tmp/mysync.service" "$unit"
     ok 'Installed systemd user service (not started yet).'
 fi
 say
-say 'Next: enroll and get administrator approval, then run mysync enroll-activate.'
-say 'After activation: systemctl --user enable --now mysync.service'
-say 'For startup without login: sudo loginctl enable-linger "$(id -un)"'
+if [ "$setup_available" = 1 ] && [ -t 1 ] && [ -r /dev/tty ]; then
+    step 6 'Pairing this client with the server'
+    printf 'Folder to synchronize [%s/Sync]: ' "$HOME" >/dev/tty
+    mirror_dir=
+    IFS= read -r mirror_dir </dev/tty || die 'Cannot read the folder from the terminal.'
+    [ -n "$mirror_dir" ] || mirror_dir="$HOME/Sync"
+    set -- setup --server "$SERVER_URL" --dir "$mirror_dir"
+    [ -z "${MYSYNC_EK_CERT:-}" ] || set -- "$@" --ek-cert "$MYSYNC_EK_CERT"
+    if [ -n "${MYSYNC_EK_CHAIN:-}" ]; then
+        [ -r "$MYSYNC_EK_CHAIN" ] || die 'MYSYNC_EK_CHAIN is not readable by this user.'
+        set -- "$@" --ek-chain "$MYSYNC_EK_CHAIN"
+    fi
+    "$destination" "$@" || die 'Pairing or first synchronization is incomplete. Rerun this installer or mysync setup to resume; the service remains stopped.'
+    if [ "$service_ready" = 1 ]; then
+        systemctl --user daemon-reload || die 'Synchronization succeeded, but the user service manager could not reload.'
+        systemctl --user enable --now mysync.service || die 'Synchronization succeeded, but the user service could not start. Check systemctl --user status mysync.service.'
+        ok 'Client paired, files checked and user service started.'
+    else
+        warn 'Pairing succeeded, but the existing service file differs; review it before starting the service.'
+    fi
+    say 'For startup without login: sudo loginctl enable-linger "$(id -un)"'
+else
+    say "Next: run $destination setup --server $SERVER_URL --dir \"\$HOME/Sync\" in a terminal."
+    if [ "$setup_available" = 0 ]; then
+        say 'Update the existing client with mysync update before using the new setup command.'
+    fi
+    say 'The user service remains stopped until setup succeeds.'
+fi

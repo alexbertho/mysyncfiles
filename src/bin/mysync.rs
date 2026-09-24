@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use mysyncfiles::client::{self, Api, SyncReport};
 
@@ -20,6 +20,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Pair this client with an administrator, then verify the first sync
+    Setup {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        ek_chain: Option<PathBuf>,
+        #[arg(long)]
+        ek_cert: Option<PathBuf>,
+    },
     /// Check TPM 2.0 access and an EK certificate without enrolling
     Doctor {
         /// Manufacturer EK leaf certificate in DER when absent from TPM NV
@@ -79,6 +90,22 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config.unwrap_or(client::default_config_path()?);
     match cli.command {
+        Command::Setup {
+            server,
+            dir,
+            ek_chain,
+            ek_cert,
+        } => {
+            let outcome = client::setup(&config_path, server, dir, ek_cert, ek_chain).await?;
+            let conflicts = outcome.conflicts.max(outcome.report.conflicts);
+            print_report(outcome.report);
+            if conflicts != 0 {
+                bail!(
+                    "{conflicts} conflict file(s) need review in .mysync-conflicts/; the service was not started"
+                );
+            }
+            println!("Initial synchronization verified; the service can now be started.");
+        }
         Command::Doctor { ek_cert } => {
             let certificate = ek_cert
                 .as_deref()

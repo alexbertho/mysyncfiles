@@ -67,11 +67,17 @@ Le serveur accepte uniquement les identités TPM approuvées. Il n'a pas besoin 
 
 ## Appairage et approbation
 
+Le parcours interactif recommandé est `mysync setup` sur le client et `make pair` sur le serveur. Le client génère un code aléatoire de 100 bits, affiché en quatre groupes de cinq caractères et enregistré dans un fichier privé. `make pair` l'enregistre sous forme de hash dans SQLite avec un nom d'appareil et une durée de 15 minutes. La route publique `/v1/enroll/ready` indique seulement si ce code a été enregistré ; elle ne peut approuver aucun appareil. Le serveur ne vérifie la chaîne EK et ne crée le défi TPM qu'après cet enregistrement local.
+
+Après la preuve TPM, le client et la commande serveur affichent l'empreinte complète de la clé. L'administrateur la compare par un canal fiable et confirme dans le terminal serveur. Le client attend alors l'approbation, effectue une première synchronisation et vérifie les conflits avant l'activation du service. Un code divulgué ou une confirmation d'empreinte faite sans comparaison peut conduire à approuver le mauvais appareil ; le code ne remplace pas la vérification humaine.
+
+Le parcours manuel avec invitation reste disponible :
+
 1. L'administrateur crée une invitation avec `device invite --name NOM --output FICHIER`. Elle contient 256 bits aléatoires, n'est stockée que sous forme de hash en base et expire après 15 minutes. Utiliser un nom distinct par appareil et transmettre le fichier de manière confidentielle.
 2. Le client lance `mysync enroll --server URL --dir DOSSIER --invitation-stdin < FICHIER`. Il conserve sa clé et le défi dans `config.enrollment.json` privé, hors du miroir. Une nouvelle tentative reprend la même clé au lieu de consommer l'invitation avec une nouvelle identité.
 3. Le serveur vérifie le certificat EK, réserve l'invitation à une seule clé puis vérifie la réponse d'activation. L'appareil reste sans accès aux fichiers pendant l'attente d'approbation (24 heures maximum).
 4. L'administrateur exécute `device pending`, compare l'empreinte affichée avec celle du client par un canal fiable, puis `device approve --id ID --fingerprint EMPREINTE`. Une empreinte fournie uniquement par le serveur ne suffit pas pour cette comparaison.
-5. Le client exécute `mysync enroll-activate`. Il vérifie l'accès approuvé, remplace sa configuration privée, efface le fichier d'appairage en attente et synchronise. Les étapes d'[installation et d'activation du service](install-client.md#activer-la-synchronisation) dépendent du mode d'installation du client.
+5. Le client exécute `mysync enroll-activate`. Il vérifie l'accès approuvé, remplace sa configuration privée, efface le fichier d'appairage en attente et synchronise. Les étapes d'[installation et d'activation du service](install-client.md#activer-la-synchronisation-manuelle) dépendent du mode d'installation du client.
 
 Les commandes administrateur nécessitent aussi `--data-dir /data` dans le conteneur. Elles sont locales au serveur : aucune route HTTP d'approbation n'est exposée. Une invitation volée peut bloquer l'appairage en se réservant une clé, mais elle ne suffit pas à obtenir l'accès sans attestation et approbation de l'empreinte attendue.
 

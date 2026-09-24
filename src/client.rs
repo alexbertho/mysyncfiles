@@ -248,6 +248,17 @@ impl Api {
         Ok(())
     }
 
+    pub async fn is_approved(&self) -> Result<bool> {
+        let mut request = self.http.post(self.url("/v1/auth/session")).build()?;
+        self.sign_request(&mut request, "").await?;
+        let response = self.http.execute(request).await?;
+        if response.status() == StatusCode::FORBIDDEN {
+            return Ok(false);
+        }
+        let _: crate::auth_protocol::Session = bounded_json(response, CONTROL_JSON_LIMIT).await?;
+        Ok(true)
+    }
+
     async fn session_token(&self) -> Result<String> {
         let mut session = self.session.lock().await;
         if let Some(current) = session
@@ -494,6 +505,209 @@ pub(crate) fn validate_server_url(server: &str) -> Result<()> {
 struct PendingEnrollment {
     config: ClientConfig,
     challenge: Option<crate::auth_protocol::EnrollChallenge>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PairingRequest {
+    server: String,
+    root: PathBuf,
+    code: String,
+}
+
+pub struct SetupOutcome {
+    pub report: SyncReport,
+    pub conflicts: usize,
+}
+
+async fn wait_for_pair_ready(
+    server: &str,
+    code: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool> {
+    validate_server_url(server)?;
+    let http = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let url = format!("{}/v1/enroll/ready", server.trim_end_matches('/'));
+    let mut interval = Duration::from_secs(5);
+    loop {
+        match http
+            .post(&url)
+            .json(&serde_json::json!({"code": code}))
+            .send()
+            .await
+        {
+            Ok(response) if response.status() == StatusCode::NO_CONTENT => return Ok(true),
+            Ok(response) if response.status() == StatusCode::GONE => return Ok(false),
+            Ok(response) if response.status() == StatusCode::ACCEPTED => {
+                interval = Duration::from_secs(5);
+            }
+            Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
+                interval = Duration::from_secs(30);
+            }
+            Ok(response) => bail!("pairing readiness failed: HTTP {}", response.status()),
+            Err(_) => interval = std::cmp::min(interval * 2, Duration::from_secs(30)),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for administrator; rerun setup to resume")
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn wait_for_approval(
+    config_path: &Path,
+    server: &str,
+    code: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool> {
+    let pending_path = config_path.with_extension("enrollment.json");
+    let pending: PendingEnrollment = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
+    let api = Api::new(&pending.config)?;
+    let ready_url = format!("{}/v1/enroll/ready", server.trim_end_matches('/'));
+    loop {
+        if api.is_approved().await? {
+            return Ok(true);
+        }
+        let response = api
+            .http
+            .post(&ready_url)
+            .json(&serde_json::json!({"code": code}))
+            .send()
+            .await?;
+        if response.status() == StatusCode::GONE {
+            if api.is_approved().await? {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if response.status() != StatusCode::NO_CONTENT
+            && response.status() != StatusCode::TOO_MANY_REQUESTS
+        {
+            bail!("pairing status failed: HTTP {}", response.status());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for administrator approval; rerun setup to resume")
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+pub async fn setup(
+    config_path: &Path,
+    server: String,
+    root: PathBuf,
+    ek_cert: Option<PathBuf>,
+    ek_chain: Option<PathBuf>,
+) -> Result<SetupOutcome> {
+    setup_with_tcti(
+        config_path,
+        server,
+        root,
+        ek_cert,
+        ek_chain,
+        crate::tpm::default_tcti(),
+    )
+    .await
+}
+
+pub async fn setup_with_tcti(
+    config_path: &Path,
+    server: String,
+    root: PathBuf,
+    ek_cert: Option<PathBuf>,
+    ek_chain: Option<PathBuf>,
+    tcti: String,
+) -> Result<SetupOutcome> {
+    validate_server_url(&server)?;
+    std::fs::create_dir_all(&root)?;
+    let root = root.canonicalize()?;
+    let parent = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    if parent.canonicalize()?.starts_with(&root) {
+        bail!("config must be outside the synchronized folder");
+    }
+    let pair_path = config_path.with_extension("pairing.json");
+    if config_path.exists() {
+        let config = load_config(config_path)?;
+        if config.server != server || config.root != root {
+            bail!("existing client profile has a different server or folder");
+        }
+        let report = sync(config_path).await?;
+        let conflicts = status(config_path).await?.conflicts;
+        if pair_path.exists() {
+            std::fs::remove_file(pair_path)?;
+        }
+        return Ok(SetupOutcome { report, conflicts });
+    }
+    let pair_lock = acquire_lock(config_path).await?;
+    if config_path.exists() {
+        bail!("client was configured by another setup process; rerun setup");
+    }
+    let request: PairingRequest = if pair_path.exists() {
+        let request: PairingRequest = serde_json::from_slice(&std::fs::read(&pair_path)?)?;
+        if request.server != server || request.root != root {
+            bail!("another pairing is already pending");
+        }
+        request
+    } else {
+        if config_path.with_extension("enrollment.json").exists() {
+            bail!("a manual enrollment is already pending");
+        }
+        let request = PairingRequest {
+            server: server.clone(),
+            root: root.clone(),
+            code: crate::device_auth::pairing_code()?,
+        };
+        private_write_json(&pair_path, &request)?;
+        request
+    };
+    drop(pair_lock);
+    println!("Pairing code: {}", request.code);
+    println!("Ask the administrator to run `make pair` on the server. Waiting...");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+    let pending_path = config_path.with_extension("enrollment.json");
+    let already_approved = if pending_path.exists() {
+        let pending: PendingEnrollment = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
+        Api::new(&pending.config)?.is_approved().await?
+    } else {
+        false
+    };
+    if !already_approved {
+        if !wait_for_pair_ready(&server, &request.code, deadline).await? {
+            if pending_path.exists() {
+                std::fs::remove_file(&pending_path)?;
+            }
+            std::fs::remove_file(&pair_path)?;
+            bail!("pairing code expired or was cancelled; rerun setup for a new code");
+        }
+        let enrolled = enroll_with_tcti(
+            config_path,
+            server,
+            root,
+            crate::device_auth::normalize_pairing_code(&request.code)?,
+            ek_cert,
+            ek_chain,
+            tcti,
+        )
+        .await?;
+        println!("TPM fingerprint: {}", enrolled.fingerprint);
+        println!("Waiting for administrator fingerprint confirmation...");
+        if !wait_for_approval(config_path, &request.server, &request.code, deadline).await? {
+            std::fs::remove_file(&pending_path)?;
+            std::fs::remove_file(&pair_path)?;
+            bail!("pairing was cancelled or expired; rerun setup for a new code");
+        }
+    }
+    let report = activate_enrollment(config_path).await?;
+    let conflicts = status(config_path).await?.conflicts;
+    std::fs::remove_file(pair_path)?;
+    Ok(SetupOutcome { report, conflicts })
 }
 
 pub async fn enroll(
