@@ -21,10 +21,9 @@ use crate::model::{
 };
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub server: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<crate::tpm::Identity>,
     pub root: PathBuf,
@@ -73,8 +72,7 @@ pub struct Status {
 pub struct Api {
     http: Client,
     base: String,
-    token: String,
-    identity: Option<crate::tpm::Identity>,
+    signer: crate::tpm::RequestSigner,
     session: tokio::sync::Mutex<Option<crate::auth_protocol::Session>>,
 }
 
@@ -198,21 +196,9 @@ fn save_state(config_path: &Path, state: &LocalState) -> Result<()> {
 
 impl Api {
     pub fn new(config: &ClientConfig) -> Result<Self> {
-        let url = reqwest::Url::parse(&config.server).context("invalid server URL")?;
-        let host = url.host_str().unwrap_or_default();
-        let local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
-        if url.scheme() != "https" && !(url.scheme() == "http" && local) {
-            bail!("server URL must use HTTPS (HTTP is allowed only on loopback)");
-        }
-        if url.query().is_some()
-            || url.fragment().is_some()
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            bail!("server URL must not contain credentials, a query, or a fragment");
-        }
-        if config.token.is_empty() && config.identity.is_none() {
-            bail!("device key is empty");
+        validate_server_url(&config.server)?;
+        if config.identity.is_none() {
+            bail!("TPM identity is missing; enroll this device first");
         }
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -223,14 +209,14 @@ impl Api {
         Ok(Self {
             http,
             base: config.server.trim_end_matches('/').to_owned(),
-            token: config.token.clone(),
-            identity: config.identity.clone(),
+            signer: crate::tpm::RequestSigner::new(
+                config.identity.clone().context("TPM identity is missing")?,
+            )?,
             session: tokio::sync::Mutex::new(None),
         })
     }
 
     async fn sign_request(&self, request: &mut reqwest::Request, token: &str) -> Result<()> {
-        let identity = self.identity.clone().context("TPM identity missing")?;
         let bytes = match request.body() {
             None => &[][..],
             Some(body) => body
@@ -238,13 +224,13 @@ impl Api {
                 .context("signed requests require a bounded body")?,
         };
         let claims = crate::auth_protocol::Claims::new(
-            &identity.device,
+            self.signer.device(),
             request.method().as_str(),
             request.url().as_str(),
             bytes,
             token,
         )?;
-        let proof = tokio::task::spawn_blocking(move || identity.proof(claims)).await??;
+        let proof = self.signer.proof(claims).await?;
         request
             .headers_mut()
             .insert(crate::auth_protocol::PROOF_HEADER, proof.parse()?);
@@ -284,9 +270,6 @@ impl Api {
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        if self.identity.is_none() {
-            return Ok(builder.bearer_auth(&self.token).send().await?);
-        }
         let request = builder.build()?;
         for attempt in 0..2 {
             let token = self.session_token().await?;
@@ -490,46 +473,21 @@ impl Api {
     }
 }
 
-pub async fn configure(
-    config_path: &Path,
-    server: String,
-    token: String,
-    root: PathBuf,
-    first_device: bool,
-) -> Result<SyncReport> {
-    if config_path.exists() {
-        bail!("config already exists: {}", config_path.display());
+pub(crate) fn validate_server_url(server: &str) -> Result<()> {
+    let url = reqwest::Url::parse(server).context("invalid server URL")?;
+    let host = url.host_str().unwrap_or_default();
+    let local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
+        bail!("server URL must use HTTPS (HTTP is allowed only on loopback)");
     }
-    std::fs::create_dir_all(&root)?;
-    let root = root.canonicalize()?;
-    let config_parent = config_path
-        .parent()
-        .ok_or_else(|| anyhow!("invalid config path"))?;
-    let config_parent = if config_parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        config_parent
-    };
-    std::fs::create_dir_all(config_parent)?;
-    let config_parent = config_parent.canonicalize()?;
-    if config_parent.starts_with(&root) {
-        bail!("config must be outside the synchronized folder");
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        bail!("server URL must not contain credentials, a query, or a fragment");
     }
-    let config = ClientConfig {
-        server,
-        token,
-        identity: None,
-        root,
-        auto_update: true,
-        update_public_key: default_update_public_key(),
-    };
-    let api = Api::new(&config)?;
-    let manifest = api.manifest().await?;
-    if first_device && manifest.entries.iter().any(|entry| !entry.deleted) {
-        bail!("server already contains files; use 'connect' for this device");
-    }
-    private_write_json(config_path, &config)?;
-    sync(config_path).await
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -543,6 +501,7 @@ pub async fn enroll(
     server: String,
     root: PathBuf,
     invitation: String,
+    ek_cert: Option<PathBuf>,
     ek_chain: Option<PathBuf>,
 ) -> Result<crate::auth_protocol::Enrollment> {
     enroll_with_tcti(
@@ -550,6 +509,7 @@ pub async fn enroll(
         server,
         root,
         invitation,
+        ek_cert,
         ek_chain,
         crate::tpm::default_tcti(),
     )
@@ -563,6 +523,7 @@ pub async fn enroll_with_tcti(
     server: String,
     root: PathBuf,
     invitation: String,
+    ek_cert: Option<PathBuf>,
     ek_chain: Option<PathBuf>,
     tcti: String,
 ) -> Result<crate::auth_protocol::Enrollment> {
@@ -578,19 +539,14 @@ pub async fn enroll_with_tcti(
         bail!("config must be outside the synchronized folder");
     }
     let _lock = acquire_lock(config_path).await?;
-    let previous = if config_path.exists() {
-        let old = load_config(config_path)?;
-        if old.root != root || old.server.trim_end_matches('/') != server.trim_end_matches('/') {
-            bail!("enrollment must keep the configured server and folder");
-        }
-        if old.identity.is_some() {
-            bail!("client is already TPM-enrolled; revoke it before creating a new identity");
-        }
-        Some(old)
-    } else {
-        None
-    };
+    if config_path.exists() {
+        bail!("config already exists; enrollment requires a fresh client profile");
+    }
     let pending_path = config_path.with_extension("enrollment.json");
+    let external_certificate = ek_cert
+        .as_deref()
+        .map(crate::tpm::read_ek_certificate)
+        .transpose()?;
     let mut pending: PendingEnrollment = if pending_path.exists() {
         let value: PendingEnrollment = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
         if value.config.root != root || value.config.server != server {
@@ -598,20 +554,25 @@ pub async fn enroll_with_tcti(
         }
         value
     } else {
+        let creation_certificate = external_certificate.clone();
         let identity = tokio::task::spawn_blocking(move || {
-            crate::tpm::Identity::create(&tcti, "rsa")
-                .or_else(|_| crate::tpm::Identity::create(&tcti, "ecc"))
-                .map(|(identity, _)| identity)
+            if let Some(certificate) = creation_certificate {
+                let kind = crate::tpm::certificate_kind(&certificate)?;
+                crate::tpm::Identity::create_with_certificate(&tcti, kind, Some(&certificate))
+                    .map(|(identity, _)| identity)
+            } else {
+                crate::tpm::Identity::create(&tcti, "rsa")
+                    .or_else(|_| crate::tpm::Identity::create(&tcti, "ecc"))
+                    .map(|(identity, _)| identity)
+            }
         })
         .await??;
         let config = ClientConfig {
             server,
-            token: String::new(),
             identity: Some(identity),
             root,
-            auto_update: previous.as_ref().map_or(true, |old| old.auto_update),
-            update_public_key: previous
-                .map_or_else(default_update_public_key, |old| old.update_public_key),
+            auto_update: true,
+            update_public_key: default_update_public_key(),
         };
         Api::new(&config)?;
         let pending = PendingEnrollment {
@@ -629,7 +590,14 @@ pub async fn enroll_with_tcti(
             .clone()
             .context("missing pending TPM key")?;
         let cert_identity = identity.clone();
-        let leaf = tokio::task::spawn_blocking(move || cert_identity.ek_certificate()).await??;
+        let leaf = tokio::task::spawn_blocking(move || {
+            if let Some(certificate) = external_certificate {
+                cert_identity.ek_certificate_from(&certificate)
+            } else {
+                cert_identity.ek_certificate()
+            }
+        })
+        .await??;
         let mut chain = vec![hex::encode(leaf)];
         if let Some(path) = ek_chain {
             for cert in openssl::x509::X509::stack_from_pem(&std::fs::read(path)?)? {
@@ -960,19 +928,23 @@ async fn sync_pass(
     Ok(rescan)
 }
 
-pub async fn sync(config_path: &Path) -> Result<SyncReport> {
-    let _lock = acquire_lock(config_path).await?;
-    let config = load_config(config_path)?;
-    let mirror = Mirror::open(&config.root)?;
+async fn sync_passes(config_path: &Path, root: &Path, api: &Api) -> Result<SyncReport> {
+    let mirror = Mirror::open(root)?;
     mirror.clear_staging()?;
-    let api = Api::new(&config)?;
     let mut report = SyncReport::default();
     for _ in 0..5 {
-        if !sync_pass(config_path, &api, &mirror, &mut report).await? {
+        if !sync_pass(config_path, api, &mirror, &mut report).await? {
             return Ok(report);
         }
     }
     bail!("files kept changing during sync; retry shortly")
+}
+
+pub async fn sync(config_path: &Path) -> Result<SyncReport> {
+    let _lock = acquire_lock(config_path).await?;
+    let config = load_config(config_path)?;
+    let api = Api::new(&config)?;
+    sync_passes(config_path, &config.root, &api).await
 }
 
 pub async fn status(config_path: &Path) -> Result<Status> {
@@ -1017,6 +989,7 @@ pub async fn status(config_path: &Path) -> Result<Status> {
 
 pub async fn daemon(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
+    let api = Api::new(&config)?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -1033,7 +1006,12 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
     let mut update_interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
     update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if let Err(error) = sync(config_path).await {
+        let result = async {
+            let _lock = acquire_lock(config_path).await?;
+            sync_passes(config_path, &config.root, &api).await
+        }
+        .await;
+        if let Err(error) = result {
             eprintln!("sync failed: {error:#}");
         }
         tokio::select! {

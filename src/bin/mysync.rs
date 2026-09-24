@@ -20,6 +20,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check TPM 2.0 access and an EK certificate without enrolling
+    Doctor {
+        /// Manufacturer EK leaf certificate in DER when absent from TPM NV
+        #[arg(long)]
+        ek_cert: Option<PathBuf>,
+    },
     /// Enroll a TPM identity; administrator approval is required before activation
     Enroll {
         #[arg(long)]
@@ -31,33 +37,12 @@ enum Command {
         /// PEM intermediate EK certificates, obtained from the TPM manufacturer
         #[arg(long)]
         ek_chain: Option<PathBuf>,
+        /// Manufacturer EK leaf certificate in DER when absent from TPM NV
+        #[arg(long)]
+        ek_cert: Option<PathBuf>,
     },
-    /// Activate an approved enrollment and retire the local legacy credential
+    /// Activate an approved enrollment
     EnrollActivate,
-    /// Connect the first device and upload its existing files
-    Init {
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        token: Option<String>,
-        /// Read the device key from standard input
-        #[arg(long, conflicts_with = "token")]
-        token_stdin: bool,
-        #[arg(long)]
-        dir: PathBuf,
-    },
-    /// Connect another device to an existing server
-    Connect {
-        #[arg(long)]
-        server: String,
-        #[arg(long)]
-        token: Option<String>,
-        /// Read the device key from standard input
-        #[arg(long, conflicts_with = "token")]
-        token_stdin: bool,
-        #[arg(long)]
-        dir: PathBuf,
-    },
     /// Run one synchronization pass
     Sync,
     /// Watch local changes and poll the server continuously
@@ -83,16 +68,10 @@ fn print_report(report: SyncReport) {
     );
 }
 
-fn device_key(value: Option<String>, from_stdin: bool) -> Result<String> {
-    if from_stdin {
-        let mut value = String::new();
-        std::io::stdin().read_line(&mut value)?;
-        return Ok(value.trim_end_matches(['\r', '\n']).to_owned());
-    }
-    Ok(match value {
-        Some(value) => value,
-        None => rpassword::prompt_password("Device key: ")?,
-    })
+fn invitation_from_stdin() -> Result<String> {
+    let mut value = String::new();
+    std::io::stdin().read_line(&mut value)?;
+    Ok(value.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 #[tokio::main]
@@ -100,58 +79,38 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config.unwrap_or(client::default_config_path()?);
     match cli.command {
+        Command::Doctor { ek_cert } => {
+            let certificate = ek_cert
+                .as_deref()
+                .map(mysyncfiles::tpm::read_ek_certificate)
+                .transpose()?;
+            let kind = mysyncfiles::tpm::doctor_with_certificate(
+                &mysyncfiles::tpm::default_tcti(),
+                certificate.as_deref(),
+            )?;
+            println!("TPM 2.0 is reachable and the {kind} EK matches its certificate.");
+            println!("Manufacturer trust is checked during enrollment.");
+        }
         Command::Enroll {
             server,
             dir,
             invitation_stdin,
             ek_chain,
+            ek_cert,
         } => {
             let invitation = if invitation_stdin {
-                device_key(None, true)?
+                invitation_from_stdin()?
             } else {
                 rpassword::prompt_password("Enrollment invitation: ")?
             };
-            let result = client::enroll(&config_path, server, dir, invitation, ek_chain).await?;
+            let result =
+                client::enroll(&config_path, server, dir, invitation, ek_cert, ek_chain).await?;
             println!(
                 "enrollment={}\nfingerprint={}\nstatus={}\nCompare this fingerprint with the administrator, then run mysync enroll-activate.",
                 result.id, result.fingerprint, result.status
             );
         }
         Command::EnrollActivate => print_report(client::activate_enrollment(&config_path).await?),
-        Command::Init {
-            server,
-            token,
-            token_stdin,
-            dir,
-        } => {
-            print_report(
-                client::configure(
-                    &config_path,
-                    server,
-                    device_key(token, token_stdin)?,
-                    dir,
-                    true,
-                )
-                .await?,
-            );
-        }
-        Command::Connect {
-            server,
-            token,
-            token_stdin,
-            dir,
-        } => {
-            print_report(
-                client::configure(
-                    &config_path,
-                    server,
-                    device_key(token, token_stdin)?,
-                    dir,
-                    false,
-                )
-                .await?,
-            );
-        }
         Command::Sync => print_report(client::sync(&config_path).await?),
         Command::Daemon => client::daemon(&config_path).await?,
         Command::Status => {

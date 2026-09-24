@@ -21,6 +21,36 @@ fn executable(path: &Path, version: &str) -> Result<()> {
 }
 
 #[tokio::test]
+async fn installer_is_served_from_the_image_only_after_public_url_configuration() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let state = server::open(&data)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/install.sh", listener.local_addr()?);
+    let task =
+        tokio::spawn(async move { axum::serve(listener, server::router(state)).await.unwrap() });
+    let http = reqwest::Client::new();
+    assert_eq!(
+        http.get(&url).send().await?.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    rusqlite::Connection::open(data.join("metadata.sqlite3"))?.execute(
+        "INSERT INTO auth_settings(key, value) VALUES('public_url', ?1)",
+        ["https://sync.example.test"],
+    )?;
+    let response = http.get(&url).send().await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let script = response.text().await?;
+    assert!(script.contains("SERVER_URL='https://sync.example.test'"));
+    assert!(script.contains(release::PUBLIC_KEY_HEX.trim()));
+    assert!(script.contains("ExecStart=%h/.local/bin/mysync daemon"));
+    assert!(!script.contains("@MYSYNC_"));
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn releases_refuse_symlinks_even_during_atomic_parent_and_leaf_swaps() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let releases = temp.path().join("releases");
@@ -178,7 +208,6 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         configs.push(ClientConfig {
             server: format!("http://{}", listener.local_addr()?),
-            token: "test".into(),
             identity: None,
             root: temp.path().into(),
             auto_update: true,
@@ -189,7 +218,7 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
         }));
     }
     let newer = async {
-        tokio::time::timeout(Duration::from_secs(3), started.notified()).await?;
+        tokio::time::timeout(Duration::from_secs(10), started.notified()).await?;
         let result = update::check_and_install_at(&configs[1], &installed, "0.1.0").await;
         resume.notify_one();
         result
@@ -249,7 +278,6 @@ async fn update_keeps_installed_client_when_signed_candidate_cannot_run() -> Res
         std::fs::write(&installed, "old binary")?;
         let config = ClientConfig {
             server: format!("http://{address}"),
-            token: "test-key".into(),
             identity: None,
             root: temp.path().into(),
             auto_update: true,
@@ -309,7 +337,6 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
     executable(&installed, "0.1.0")?;
     let config = ClientConfig {
         server: format!("http://{address}"),
-        token: "test-key".into(),
         identity: None,
         root: temp.path().to_path_buf(),
         auto_update: true,
@@ -381,7 +408,6 @@ async fn update_rejects_unsigned_metadata() -> Result<()> {
     std::fs::write(&installed, "old binary")?;
     let config = ClientConfig {
         server: format!("http://{address}"),
-        token: "test-key".into(),
         identity: None,
         root: temp.path().to_path_buf(),
         auto_update: true,

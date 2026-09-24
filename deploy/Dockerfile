@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libtss2-dev lib
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY deploy/install.sh deploy/mysync.service ./deploy/
 RUN cargo build --locked --release --bin mysync-server
 
 FROM debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a

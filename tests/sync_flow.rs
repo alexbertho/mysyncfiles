@@ -8,21 +8,37 @@ use mysyncfiles::{
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+mod common;
+use mysyncfiles::tpm::Identity;
 
 async fn running_server(
     temp: &TempDir,
-) -> Result<(String, String, String, tokio::task::JoinHandle<()>)> {
+) -> Result<(String, Identity, Identity, common::TestServer)> {
     let data = temp.path().join("server");
-    let state = server::open(&data)?;
-    mysyncfiles::device_auth::allow_legacy_for_migration(&state)?;
-    let first = server::add_device(&state, "laptop")?;
-    let second = server::add_device(&state, "desktop")?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let task = tokio::spawn(async move {
-        axum::serve(listener, server::router(state)).await.unwrap();
-    });
-    Ok((format!("http://{address}"), first, second, task))
+    let mut server = common::TestServer::start(&data).await?;
+    let first = server.add_device("first-device").await?;
+    let second = server.add_device("second-device").await?;
+    Ok((server.url.clone(), first, second, server))
+}
+
+async fn configure(
+    config_path: &Path,
+    url: String,
+    key: Identity,
+    root: std::path::PathBuf,
+    first: bool,
+) -> Result<client::SyncReport> {
+    if first
+        && client::Api::new(&common::config(&url, &root, key.clone()))?
+            .manifest()
+            .await?
+            .entries
+            .iter()
+            .any(|entry| !entry.deleted)
+    {
+        anyhow::bail!("server already contains files");
+    }
+    common::configure_client(config_path, &url, key, root).await
 }
 
 fn conflict_contents(root: &Path) -> Result<Vec<String>> {
@@ -39,7 +55,7 @@ fn conflict_contents(root: &Path) -> Result<Vec<String>> {
 #[tokio::test]
 async fn two_devices_conflict_trash_restore_and_revoke() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (url, first_key, second_key, task) = running_server(&temp).await?;
+    let (url, first_key, second_key, _server) = running_server(&temp).await?;
     let laptop = temp.path().join("laptop");
     let desktop = temp.path().join("desktop");
     let laptop_config = temp.path().join("laptop-config.json");
@@ -48,7 +64,7 @@ async fn two_devices_conflict_trash_restore_and_revoke() -> Result<()> {
     std::fs::write(laptop.join("notes.txt"), "initial")?;
     std::fs::write(laptop.join("docs/item.txt"), "recoverable")?;
 
-    client::configure(
+    configure(
         &laptop_config,
         url.clone(),
         first_key.clone(),
@@ -56,7 +72,7 @@ async fn two_devices_conflict_trash_restore_and_revoke() -> Result<()> {
         true,
     )
     .await?;
-    client::configure(
+    configure(
         &desktop_config,
         url.clone(),
         second_key,
@@ -104,22 +120,21 @@ async fn two_devices_conflict_trash_restore_and_revoke() -> Result<()> {
     );
 
     let state = server::open(temp.path().join("server"))?;
-    assert!(server::revoke_device(&state, "desktop")?);
+    assert!(server::revoke_device(&state, "second-device")?);
     assert!(client::sync(&desktop_config).await.is_err());
     client::sync(&laptop_config).await?;
-    task.abort();
     Ok(())
 }
 
 #[tokio::test]
 async fn expired_trash_is_purged_and_invalid_paths_are_rejected() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (url, key, _, task) = running_server(&temp).await?;
+    let (url, key, _, _server) = running_server(&temp).await?;
     let root = temp.path().join("files");
     let config = temp.path().join("config.json");
     std::fs::create_dir_all(&root)?;
     std::fs::write(root.join("remove.txt"), "trash me")?;
-    client::configure(&config, url.clone(), key.clone(), root.clone(), true).await?;
+    configure(&config, url.clone(), key.clone(), root.clone(), true).await?;
     std::fs::create_dir_all(root.join(".mysync-staging"))?;
     std::fs::write(root.join(".mysync-staging/orphan"), "partial download")?;
     client::sync(&config).await?;
@@ -162,30 +177,30 @@ async fn expired_trash_is_purged_and_invalid_paths_are_rejected() -> Result<()> 
     assert!(!temp.path().join("server/blobs").join(blob).exists());
     assert!(api.trash().await?.is_empty());
 
-    let response = reqwest::Client::new()
-        .put(format!("{url}/v1/file"))
-        .query(&[("path", "../escape"), ("base_revision", "0")])
-        .bearer_auth(key)
-        .body("bad")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await?;
+    let response = common::send_signed(
+        reqwest::Client::new()
+            .put(format!("{url}/v1/file"))
+            .query(&[("path", "../escape"), ("base_revision", "0")])
+            .body("bad")
+            .timeout(Duration::from_secs(5)),
+        &key,
+    )
+    .await?;
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     assert!(!temp.path().join("escape").exists());
-    task.abort();
     Ok(())
 }
 
 #[tokio::test]
 async fn daemon_watches_local_changes_and_polls_remote_changes() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (url, first_key, second_key, server_task) = running_server(&temp).await?;
+    let (url, first_key, second_key, _server) = running_server(&temp).await?;
     let laptop = temp.path().join("laptop");
     let desktop = temp.path().join("desktop");
     let laptop_config = temp.path().join("laptop-config.json");
     let desktop_config = temp.path().join("desktop-config.json");
-    client::configure(&laptop_config, url.clone(), first_key, laptop.clone(), true).await?;
-    client::configure(&desktop_config, url, second_key, desktop.clone(), false).await?;
+    configure(&laptop_config, url.clone(), first_key, laptop.clone(), true).await?;
+    configure(&desktop_config, url, second_key, desktop.clone(), false).await?;
 
     let daemon_config = laptop_config.clone();
     let daemon_task = tokio::spawn(async move { client::daemon(&daemon_config).await });
@@ -222,19 +237,18 @@ async fn daemon_watches_local_changes_and_polls_remote_changes() -> Result<()> {
     })
     .await??;
     daemon_task.abort();
-    server_task.abort();
     Ok(())
 }
 
 #[tokio::test]
 async fn large_upload_rejects_oversized_chunks_and_resumes() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (url, first_key, second_key, task) = running_server(&temp).await?;
+    let (url, first_key, second_key, _server) = running_server(&temp).await?;
     let laptop = temp.path().join("laptop");
     let desktop = temp.path().join("desktop");
     let laptop_config = temp.path().join("laptop-config.json");
     let desktop_config = temp.path().join("desktop-config.json");
-    client::configure(
+    configure(
         &laptop_config,
         url.clone(),
         first_key.clone(),
@@ -247,38 +261,37 @@ async fn large_upload_rejects_oversized_chunks_and_resumes() -> Result<()> {
     let digest = hex::encode(Sha256::digest(&bytes));
     std::fs::write(laptop.join("large.bin"), &bytes)?;
     let http = reqwest::Client::new();
-    let progress: UploadProgress = http
-        .post(format!("{url}/v1/uploads"))
-        .bearer_auth(&first_key)
-        .json(&BeginUpload {
+    let progress: UploadProgress = common::send_signed(
+        http.post(format!("{url}/v1/uploads")).json(&BeginUpload {
             path: "large.bin".into(),
             base_revision: 0,
             size: bytes.len() as i64,
             sha256: digest.clone(),
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        }),
+        &first_key,
+    )
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
     assert_eq!(progress.offset, 0);
 
-    let oversized = http
-        .put(format!("{url}/v1/uploads/{}", progress.id))
-        .query(&[("offset", 0)])
-        .bearer_auth(&first_key)
-        .body(bytes.clone())
-        .send()
-        .await?;
+    let oversized = common::send_signed(
+        http.put(format!("{url}/v1/uploads/{}", progress.id))
+            .query(&[("offset", 0)])
+            .body(bytes.clone()),
+        &first_key,
+    )
+    .await?;
     assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 
-    let oversized_direct = http
-        .put(format!("{url}/v1/file"))
-        .query(&[("path", "too-large.bin"), ("base_revision", "0")])
-        .bearer_auth(&first_key)
-        .body(bytes.clone())
-        .send()
-        .await?;
+    let oversized_direct = common::send_signed(
+        http.put(format!("{url}/v1/file"))
+            .query(&[("path", "too-large.bin"), ("base_revision", "0")])
+            .body(bytes.clone()),
+        &first_key,
+    )
+    .await?;
     assert_eq!(
         oversized_direct.status(),
         reqwest::StatusCode::PAYLOAD_TOO_LARGE
@@ -288,21 +301,21 @@ async fn large_upload_rejects_oversized_chunks_and_resumes() -> Result<()> {
         0
     );
 
-    let progress: UploadProgress = http
-        .put(format!("{url}/v1/uploads/{}", progress.id))
-        .query(&[("offset", 0)])
-        .bearer_auth(&first_key)
-        .body(bytes[..UPLOAD_CHUNK_BYTES as usize].to_vec())
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let progress: UploadProgress = common::send_signed(
+        http.put(format!("{url}/v1/uploads/{}", progress.id))
+            .query(&[("offset", 0)])
+            .body(bytes[..UPLOAD_CHUNK_BYTES as usize].to_vec()),
+        &first_key,
+    )
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
     assert_eq!(progress.offset, UPLOAD_CHUNK_BYTES);
 
     let report = client::sync(&laptop_config).await?;
     assert_eq!(report.uploaded, 1);
-    client::configure(&desktop_config, url, second_key, desktop.clone(), false).await?;
+    configure(&desktop_config, url, second_key, desktop.clone(), false).await?;
     assert_eq!(std::fs::read(desktop.join("large.bin"))?, bytes);
     assert_eq!(
         client::Api::new(&client::load_config(&laptop_config)?)?
@@ -313,55 +326,51 @@ async fn large_upload_rejects_oversized_chunks_and_resumes() -> Result<()> {
             .as_deref(),
         Some(digest.as_str())
     );
-    task.abort();
     Ok(())
 }
 
 #[tokio::test]
 async fn pending_uploads_are_limited_per_device() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (url, key, _, task) = running_server(&temp).await?;
+    let (url, key, _, _server) = running_server(&temp).await?;
     let http = reqwest::Client::new();
     let digest = hex::encode(Sha256::digest(b"a"));
     for index in 0..16 {
-        let response = http
-            .post(format!("{url}/v1/uploads"))
-            .bearer_auth(&key)
-            .json(&BeginUpload {
+        let response = common::send_signed(
+            http.post(format!("{url}/v1/uploads")).json(&BeginUpload {
                 path: format!("file-{index}"),
                 base_revision: 0,
                 size: 1,
                 sha256: digest.clone(),
-            })
-            .send()
-            .await?;
+            }),
+            &key,
+        )
+        .await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
-    let response = http
-        .post(format!("{url}/v1/uploads"))
-        .bearer_auth(&key)
-        .json(&BeginUpload {
+    let response = common::send_signed(
+        http.post(format!("{url}/v1/uploads")).json(&BeginUpload {
             path: "file-17".into(),
             base_revision: 0,
             size: 1,
             sha256: digest,
-        })
-        .send()
-        .await?;
+        }),
+        &key,
+    )
+    .await?;
     assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-    task.abort();
     Ok(())
 }
 
 #[tokio::test]
 async fn first_device_accepts_a_server_with_only_deleted_entries() -> Result<()> {
     let temp = tempfile::tempdir()?;
-    let (url, first_key, second_key, task) = running_server(&temp).await?;
+    let (url, first_key, second_key, _server) = running_server(&temp).await?;
     let original = temp.path().join("original");
     let original_config = temp.path().join("original.json");
     std::fs::create_dir(&original)?;
     std::fs::write(original.join("old.txt"), "deleted before enrollment")?;
-    client::configure(
+    configure(
         &original_config,
         url.clone(),
         first_key,
@@ -376,8 +385,7 @@ async fn first_device_accepts_a_server_with_only_deleted_entries() -> Result<()>
     let fresh_config = temp.path().join("fresh.json");
     std::fs::create_dir(&fresh)?;
     std::fs::write(fresh.join("new.txt"), "enrolled")?;
-    client::configure(&fresh_config, url, second_key, fresh, true).await?;
+    configure(&fresh_config, url, second_key, fresh, true).await?;
     assert!(client::load_config(&fresh_config).is_ok());
-    task.abort();
     Ok(())
 }

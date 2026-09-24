@@ -8,16 +8,32 @@ use std::{
 };
 
 use anyhow::Result;
-use axum::{Json, Router, response::Redirect, routing::get};
+use axum::{
+    Json, Router,
+    response::Redirect,
+    routing::{get, post},
+};
 use futures_util::{StreamExt, stream};
 use mysyncfiles::{
     client::{self, ClientConfig},
     model::{BeginUpload, Entry, Manifest, RestoreRequest, TrashItem, UploadProgress, valid_path},
-    server, update,
+    update,
 };
 use reqwest::{Client, StatusCode};
 use sha2::{Digest, Sha256};
 use tokio::{sync::Notify, task::JoinHandle};
+mod common;
+use mysyncfiles::tpm::Identity;
+
+async fn configure(
+    path: &Path,
+    url: String,
+    key: Identity,
+    root: PathBuf,
+    _first: bool,
+) -> Result<client::SyncReport> {
+    common::configure_client(path, &url, key, root).await
+}
 
 fn unfinished_body(bytes: usize) -> axum::body::Body {
     axum::body::Body::from_stream(
@@ -47,7 +63,7 @@ async fn api_json_limits_reject_large_headers_and_unfinished_chunked_bodies() ->
             .await?;
             let temp = tempfile::tempdir()?;
             let api = client::Api::new(&config(&server.url, temp.path()))?;
-            let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let result = tokio::time::timeout(Duration::from_secs(15), async {
                 match route {
                     "/v1/manifest" => api.manifest().await.map(|_| ()),
                     "/v1/trash" => api.trash().await.map(|_| ()),
@@ -55,9 +71,10 @@ async fn api_json_limits_reject_large_headers_and_unfinished_chunked_bodies() ->
                 }
             })
             .await?;
+            let error = result.unwrap_err();
             assert!(
-                result.unwrap_err().to_string().contains("exceeds"),
-                "{route}, content-length={advertised}"
+                error.to_string().contains("exceeds"),
+                "{route}, content-length={advertised}, error={error:#}"
             );
         }
     }
@@ -137,7 +154,7 @@ async fn maximum_relative_path_can_be_downloaded_scanned_and_deleted() -> Result
     let root = temp.path().join("mirror");
     let config_path = temp.path().join("config.json");
     assert_eq!(
-        client::configure(
+        configure(
             &config_path,
             server.url.clone(),
             key.clone(),
@@ -239,7 +256,7 @@ async fn directory_file_transitions_converge_and_preserve_local_edits() -> Resul
         let second_config = temp.path().join("second.json");
         std::fs::create_dir_all(first.join("a"))?;
         std::fs::write(first.join("a/b"), b"original")?;
-        client::configure(
+        configure(
             &first_config,
             server.url.clone(),
             key.clone(),
@@ -247,7 +264,7 @@ async fn directory_file_transitions_converge_and_preserve_local_edits() -> Resul
             true,
         )
         .await?;
-        client::configure(
+        configure(
             &second_config,
             server.url.clone(),
             key.clone(),
@@ -306,45 +323,71 @@ fn sha(bytes: &[u8]) -> String {
 
 struct TestServer {
     url: String,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    _auth: Option<common::TestServer>,
 }
 
 impl TestServer {
     async fn start(router: Router) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
+        let router = router.route(
+            "/v1/auth/session",
+            post(|| async {
+                Json(mysyncfiles::auth_protocol::Session {
+                    token: "test-session".into(),
+                    expires_at: mysyncfiles::auth_protocol::now() + 900,
+                })
+            }),
+        );
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
         Ok(Self {
             url: format!("http://{address}"),
-            task,
+            task: Some(task),
+            _auth: None,
         })
     }
 
-    async fn sync_server(data: &Path) -> Result<(Self, String)> {
-        let state = server::open(data)?;
-        mysyncfiles::device_auth::allow_legacy_for_migration(&state)?;
-        let key = server::add_device(&state, "test-device")?;
-        Ok((Self::start(server::router(state)).await?, key))
+    async fn sync_server(data: &Path) -> Result<(Self, Identity)> {
+        let mut auth = common::TestServer::start(data).await?;
+        let key = auth.add_device("test-device").await?;
+        Ok((
+            Self {
+                url: auth.url.clone(),
+                task: None,
+                _auth: Some(auth),
+            },
+            key,
+        ))
     }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
 fn config(server: &str, root: &Path) -> ClientConfig {
-    ClientConfig {
-        server: server.to_owned(),
-        token: "test-device-key".into(),
-        identity: None,
-        root: root.to_path_buf(),
-        auto_update: false,
-        update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
+    thread_local! {
+        static DEVICE: std::cell::RefCell<Option<(common::Simulator, Identity)>> = const { std::cell::RefCell::new(None) };
     }
+    DEVICE.with(|device| {
+        let mut device = device.borrow_mut();
+        if device.is_none() {
+            let simulator = common::Simulator::start().unwrap();
+            simulator
+                .certify_ek(&common::Certificate::ca().unwrap())
+                .unwrap();
+            let (identity, _) = Identity::create(&simulator.tcti, "rsa").unwrap();
+            *device = Some((simulator, identity));
+        }
+        common::config(server, root, device.as_ref().unwrap().1.clone())
+    })
 }
 
 // Block the first download at the server until the test has changed the local
@@ -693,29 +736,29 @@ async fn api_and_updater_never_follow_redirects() -> Result<()> {
 async fn put(
     http: &Client,
     server: &TestServer,
-    key: &str,
+    key: &Identity,
     path: &str,
     base: i64,
 ) -> Result<reqwest::Response> {
-    Ok(http
-        .put(format!("{}/v1/file", server.url))
-        .bearer_auth(key)
-        .query(&[("path", path), ("base_revision", &base.to_string())])
-        .body("content")
-        .send()
-        .await?)
+    common::send_signed(
+        http.put(format!("{}/v1/file", server.url))
+            .query(&[("path", path), ("base_revision", &base.to_string())])
+            .body("content"),
+        key,
+    )
+    .await
 }
 
-async fn remove(http: &Client, server: &TestServer, key: &str, entry: &Entry) -> Result<()> {
-    http.delete(format!("{}/v1/file", server.url))
-        .bearer_auth(key)
-        .query(&[
+async fn remove(http: &Client, server: &TestServer, key: &Identity, entry: &Entry) -> Result<()> {
+    common::send_signed(
+        http.delete(format!("{}/v1/file", server.url)).query(&[
             ("path", entry.path.as_str()),
             ("base_revision", &entry.revision.to_string()),
-        ])
-        .send()
-        .await?
-        .error_for_status()?;
+        ]),
+        key,
+    )
+    .await?
+    .error_for_status()?;
     Ok(())
 }
 
@@ -768,13 +811,11 @@ async fn concurrent_uploads_cannot_publish_a_file_and_its_descendant() -> Result
     let mut statuses = [parent?.status().as_u16(), child?.status().as_u16()];
     statuses.sort();
     assert_eq!(statuses, [200, 409]);
-    let manifest: Manifest = http
-        .get(format!("{}/v1/manifest", server.url))
-        .bearer_auth(&key)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let manifest: Manifest =
+        common::send_signed(http.get(format!("{}/v1/manifest", server.url)), &key)
+            .await?
+            .json()
+            .await?;
     assert_eq!(manifest.generation, 1);
     assert_eq!(manifest.entries.len(), 1);
     Ok(())
@@ -786,36 +827,37 @@ async fn chunked_upload_rechecks_hierarchy_at_commit() -> Result<()> {
     let (server, key) = TestServer::sync_server(temp.path()).await?;
     let http = Client::new();
     for (pending, other) in [("a/b", "a"), ("c", "c/d")] {
-        let progress: UploadProgress = http
-            .post(format!("{}/v1/uploads", server.url))
-            .bearer_auth(&key)
-            .json(&BeginUpload {
-                path: pending.into(),
-                base_revision: 0,
-                size: 1,
-                sha256: sha(b"x"),
-            })
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        http.put(format!("{}/v1/uploads/{}", server.url, progress.id))
-            .bearer_auth(&key)
-            .query(&[("offset", 0)])
-            .body("x")
-            .send()
-            .await?
-            .error_for_status()?;
+        let progress: UploadProgress = common::send_signed(
+            http.post(format!("{}/v1/uploads", server.url))
+                .json(&BeginUpload {
+                    path: pending.into(),
+                    base_revision: 0,
+                    size: 1,
+                    sha256: sha(b"x"),
+                }),
+            &key,
+        )
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        common::send_signed(
+            http.put(format!("{}/v1/uploads/{}", server.url, progress.id))
+                .query(&[("offset", 0)])
+                .body("x"),
+            &key,
+        )
+        .await?
+        .error_for_status()?;
         assert_eq!(
             put(&http, &server, &key, other, 0).await?.status(),
             StatusCode::OK
         );
-        let response = http
-            .post(format!("{}/v1/uploads/{}/commit", server.url, progress.id))
-            .bearer_auth(&key)
-            .send()
-            .await?;
+        let response = common::send_signed(
+            http.post(format!("{}/v1/uploads/{}/commit", server.url, progress.id)),
+            &key,
+        )
+        .await?;
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
     Ok(())
@@ -838,28 +880,27 @@ async fn restore_rejects_collisions_but_allows_deleted_ancestors_and_descendants
             .error_for_status()?
             .json()
             .await?;
-        let trash: Vec<TrashItem> = http
-            .get(format!("{}/v1/trash", server.url))
-            .bearer_auth(&key)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let trash: Vec<TrashItem> =
+            common::send_signed(http.get(format!("{}/v1/trash", server.url)), &key)
+                .await?
+                .json()
+                .await?;
         let id = trash.iter().find(|item| item.path == original).unwrap().id;
-        let response = http
-            .post(format!("{}/v1/trash/restore", server.url))
-            .bearer_auth(&key)
-            .json(&RestoreRequest { id })
-            .send()
-            .await?;
+        let response = common::send_signed(
+            http.post(format!("{}/v1/trash/restore", server.url))
+                .json(&RestoreRequest { id }),
+            &key,
+        )
+        .await?;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         remove(&http, &server, &key, &blocker).await?;
-        http.post(format!("{}/v1/trash/restore", server.url))
-            .bearer_auth(&key)
-            .json(&RestoreRequest { id })
-            .send()
-            .await?
-            .error_for_status()?;
+        common::send_signed(
+            http.post(format!("{}/v1/trash/restore", server.url))
+                .json(&RestoreRequest { id }),
+            &key,
+        )
+        .await?
+        .error_for_status()?;
     }
     Ok(())
 }
@@ -880,17 +921,18 @@ async fn path_component_limits_are_measured_in_bytes_at_all_ingress_points() -> 
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            http.post(format!("{}/v1/uploads", server.url))
-                .bearer_auth(&key)
-                .json(&BeginUpload {
-                    path,
-                    base_revision: 0,
-                    size: 1,
-                    sha256: sha(b"x")
-                })
-                .send()
-                .await?
-                .status(),
+            common::send_signed(
+                http.post(format!("{}/v1/uploads", server.url))
+                    .json(&BeginUpload {
+                        path,
+                        base_revision: 0,
+                        size: 1,
+                        sha256: sha(b"x")
+                    }),
+                &key
+            )
+            .await?
+            .status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -901,19 +943,20 @@ async fn path_component_limits_are_measured_in_bytes_at_all_ingress_points() -> 
             StatusCode::OK
         );
     }
-    // Old trash may predate the validation change. Restoration must validate it.
+    // Corrupted trash metadata must also be validated on restoration.
     let entry: Entry = put(&http, &server, &key, "old", 0).await?.json().await?;
     remove(&http, &server, &key, &entry).await?;
     let db = rusqlite::Connection::open(temp.path().join("metadata.sqlite3"))?;
     db.execute("UPDATE trash SET path = ?1", ["a".repeat(256)])?;
     let id: i64 = db.query_row("SELECT id FROM trash", [], |row| row.get(0))?;
     assert_eq!(
-        http.post(format!("{}/v1/trash/restore", server.url))
-            .bearer_auth(&key)
-            .json(&RestoreRequest { id })
-            .send()
-            .await?
-            .status(),
+        common::send_signed(
+            http.post(format!("{}/v1/trash/restore", server.url))
+                .json(&RestoreRequest { id }),
+            &key
+        )
+        .await?
+        .status(),
         StatusCode::BAD_REQUEST
     );
     Ok(())

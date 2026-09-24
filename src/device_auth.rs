@@ -74,13 +74,6 @@ pub fn initialize(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS device_sessions(token_hash TEXT PRIMARY KEY,enrollment_id TEXT NOT NULL REFERENCES device_enrollments(id),expires_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS proof_nonces(enrollment_id TEXT NOT NULL,nonce TEXT NOT NULL,expires_at INTEGER NOT NULL,
           PRIMARY KEY(enrollment_id,nonce));")?;
-    // Existing deployments get an explicit migration window. New databases
-    // start with legacy bearer authentication disabled.
-    db.execute(
-        "INSERT OR IGNORE INTO auth_settings(key,value)
-        VALUES('allow_legacy',CASE WHEN EXISTS(SELECT 1 FROM devices) THEN '1' ELSE '0' END)",
-        [],
-    )?;
     Ok(())
 }
 fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
@@ -90,19 +83,7 @@ fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
         })
         .optional()?)
 }
-pub fn allow_legacy_for_migration(state: &ServerState) -> Result<()> {
-    state.db.lock().unwrap().execute(
-        "INSERT OR REPLACE INTO auth_settings VALUES('allow_legacy','1')",
-        [],
-    )?;
-    Ok(())
-}
-pub fn configure(
-    state: &ServerState,
-    public_url: &str,
-    roots: &Path,
-    allow_legacy: bool,
-) -> Result<()> {
+pub fn configure(state: &ServerState, public_url: &str, roots: &Path) -> Result<()> {
     let url = reqwest::Url::parse(public_url)?;
     ensure!(
         url.scheme() == "https"
@@ -128,7 +109,6 @@ pub fn configure(
     for (key, value) in [
         ("public_url", url.as_str().trim_end_matches('/').to_owned()),
         ("ek_roots", String::from_utf8(pem)?),
-        ("allow_legacy", if allow_legacy { "1" } else { "0" }.into()),
     ] {
         tx.execute(
             "INSERT OR REPLACE INTO auth_settings VALUES(?1,?2)",
@@ -136,24 +116,6 @@ pub fn configure(
         )?;
     }
     tx.commit()?;
-    Ok(())
-}
-pub fn require_tpm(state: &ServerState) -> Result<()> {
-    let db = state.db.lock().unwrap();
-    let remaining: i64 = db.query_row(
-        "SELECT COUNT(*) FROM devices d WHERE revoked_at IS NULL AND NOT EXISTS(
-        SELECT 1 FROM device_enrollments e WHERE e.device_id=d.id AND approved_at IS NOT NULL)",
-        [],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        remaining == 0,
-        "{remaining} devices still need enrollment or revocation"
-    );
-    db.execute(
-        "UPDATE auth_settings SET value='0' WHERE key='allow_legacy'",
-        [],
-    )?;
     Ok(())
 }
 pub fn invite(state: &ServerState, name: &str) -> Result<String> {
@@ -205,8 +167,8 @@ fn insert_invitation(state: &ServerState, name: &str, token: &str) -> Result<()>
         id
     } else {
         tx.execute(
-            "INSERT INTO devices(name,token_hash,created_at) VALUES(?1,?2,?3)",
-            params![name, hash(random_secret()?), now()],
+            "INSERT INTO devices(name,created_at) VALUES(?1,?2)",
+            params![name, now()],
         )?;
         tx.last_insert_rowid()
     };
@@ -247,16 +209,11 @@ pub fn list(state: &ServerState) -> Result<Vec<DeviceEnrollment>> {
 pub fn approve(state: &ServerState, id: &str, expected_fingerprint: &str) -> Result<()> {
     let mut db = state.db.lock().unwrap();
     let tx = db.transaction()?;
-    let device:Option<i64>=tx.query_row("SELECT e.device_id FROM device_enrollments e JOIN devices d ON d.id=e.device_id
+    let exists:Option<i64>=tx.query_row("SELECT e.device_id FROM device_enrollments e JOIN devices d ON d.id=e.device_id
         WHERE e.id=?1 AND e.fingerprint=?2 AND verified_at IS NOT NULL AND expires_at>?3 AND d.revoked_at IS NULL",
         params![id,expected_fingerprint,now()],|r|r.get(0)).optional()?;
-    let device = device.context("no verified enrollment with this fingerprint")?;
+    exists.context("no verified enrollment with this fingerprint")?;
     tx.execute("UPDATE device_enrollments SET approved_at=?2,activation_hash=NULL,challenge=NULL WHERE id=?1",params![id,now()])?;
-    // Irreversibly retire the old bearer credential in the same transaction.
-    tx.execute(
-        "UPDATE devices SET token_hash=?2 WHERE id=?1",
-        params![device, hash(random_secret()?)],
-    )?;
     tx.commit()?;
     Ok(())
 }
@@ -475,24 +432,14 @@ pub async fn middleware(
 ) -> Result<Response, ApiError> {
     let is_session = request.uri().path() == "/v1/auth/session";
     // Retain the permit until the handler releases the buffered request too.
-    let mut body_permit = None;
+    let body_permit;
     let authorization = request
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_owned();
-    if let Some(token) = authorization.strip_prefix("Bearer ") {
-        let db = state.db.lock().unwrap();
-        if is_session || setting(&db, "allow_legacy").map_err(auth_error)?.as_deref() != Some("1") {
-            return Err(auth_error("TPM enrollment required"));
-        }
-        let id:Option<i64>=db.query_row("SELECT id FROM devices d WHERE token_hash=?1 AND revoked_at IS NULL AND NOT EXISTS(
-            SELECT 1 FROM device_enrollments e WHERE e.device_id=d.id AND approved_at IS NOT NULL)",[hash(token)],|r|r.get(0)).optional().map_err(auth_error)?;
-        request
-            .extensions_mut()
-            .insert(id.ok_or_else(|| auth_error("invalid legacy credential"))?);
-    } else {
+    {
         let proof = request
             .headers()
             .get(PROOF_HEADER)
@@ -543,12 +490,12 @@ pub async fn middleware(
             let mut db = state.db.lock().unwrap();
             let tx = db.transaction().map_err(ApiError::internal)?;
             check_active_session(&tx, &proof.claims.device, token, is_session)?;
-            body_permit = Some(state.signed_request_limit.try_acquire().map_err(|_| {
+            body_permit = state.signed_request_limit.try_acquire().map_err(|_| {
                 ApiError(
                     StatusCode::TOO_MANY_REQUESTS,
                     "too many signed requests in flight".into(),
                 )
-            })?);
+            })?;
             tx.execute("DELETE FROM proof_nonces WHERE expires_at<=?1", [now()])
                 .map_err(ApiError::internal)?;
             let inserted = tx

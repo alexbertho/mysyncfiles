@@ -21,6 +21,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libssl-dev pkg-config swtpm swtpm-tools tpm2-tools
       - name: Format and test
         run: |
+          sh -n deploy/install.sh
           cargo fmt --all -- --check
           cargo test --locked
       - name: Build release binaries

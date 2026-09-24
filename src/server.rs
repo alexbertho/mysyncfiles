@@ -1,13 +1,13 @@
 use std::{
     collections::HashSet,
-    io::{Read, SeekFrom, Write},
+    io::{Read, SeekFrom},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, bail};
 use axum::{
     Extension, Json, Router,
     body::Body,
@@ -123,10 +123,6 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-fn token_hash(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
-}
-
 fn private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -150,6 +146,15 @@ pub fn open_with_releases(
     private_dir(&data_dir.join("blobs"))?;
     private_dir(&data_dir.join("tmp"))?;
     let conn = Connection::open(data_dir.join("metadata.sqlite3"))?;
+    let columns = conn
+        .prepare("PRAGMA table_info(devices)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.iter().any(|column| column == "token_hash") {
+        bail!(
+            "obsolete device-key database: back it up and start with an empty server data directory"
+        );
+    }
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
@@ -160,7 +165,6 @@ pub fn open_with_releases(
          CREATE TABLE IF NOT EXISTS devices (
              id INTEGER PRIMARY KEY,
              name TEXT NOT NULL UNIQUE,
-             token_hash TEXT NOT NULL UNIQUE,
              created_at INTEGER NOT NULL,
              revoked_at INTEGER
          );
@@ -209,63 +213,6 @@ pub fn open_with_releases(
         signed_request_limit: tokio::sync::Semaphore::new(8),
         active_uploads: Mutex::new(HashSet::new()),
     }))
-}
-
-pub fn add_device(state: &ServerState, name: &str) -> Result<String> {
-    let token = new_device_token();
-    insert_device(state, name, &token)?;
-    Ok(token)
-}
-
-fn new_device_token() -> String {
-    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
-}
-
-fn insert_device(state: &ServerState, name: &str, token: &str) -> Result<()> {
-    if name.trim().is_empty() {
-        return Err(anyhow!("device name cannot be empty"));
-    }
-    let db = state.db.lock().unwrap();
-    let allowed: bool = db.query_row(
-        "SELECT value='1' FROM auth_settings WHERE key='allow_legacy'",
-        [],
-        |r| r.get(0),
-    )?;
-    if !allowed {
-        return Err(anyhow!(
-            "legacy keys disabled; use device invite for TPM enrollment"
-        ));
-    }
-    db.execute(
-        "INSERT INTO devices(name, token_hash, created_at) VALUES(?1, ?2, ?3)",
-        params![name, token_hash(&token), now()],
-    )?;
-    Ok(())
-}
-
-pub fn add_device_to_file(state: &ServerState, name: &str, path: &Path) -> Result<()> {
-    if name.trim().is_empty() {
-        return Err(anyhow!("device name cannot be empty"));
-    }
-    let token = new_device_token();
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    let result: Result<()> = (|| {
-        writeln!(file, "{token}")?;
-        file.sync_all()?;
-        insert_device(state, name, &token)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
-    result
 }
 
 pub fn list_devices(state: &ServerState) -> Result<Vec<(i64, String, bool)>> {
@@ -359,6 +306,47 @@ fn next_revision(db: &Connection) -> rusqlite::Result<i64> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+fn shell_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+async fn client_installer(State(state): State<Arc<ServerState>>) -> Result<Response, ApiError> {
+    let public_url: Option<String> = state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT value FROM auth_settings WHERE key = 'public_url'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    let public_url = public_url.ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "configure the server public URL before installing clients".into(),
+        )
+    })?;
+    let script = include_str!("../deploy/install.sh")
+        .replace("@MYSYNC_SERVER_URL@", &shell_quoted(&public_url))
+        .replace(
+            "@MYSYNC_PUBLIC_KEY@",
+            &shell_quoted(release::PUBLIC_KEY_HEX.trim()),
+        )
+        .replace(
+            "@MYSYNC_UNIT@",
+            include_str!("../deploy/mysync.service").trim_end_matches('\n'),
+        );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(script))
+        .map_err(ApiError::internal)
 }
 
 async fn client_release(
@@ -1034,6 +1022,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .merge(protected)
         .route("/v1/health", get(health))
+        .route("/install.sh", get(client_installer))
         .route("/v1/updates/{target}/{file}", get(client_release))
         .route("/v1/enroll/start", post(crate::device_auth::enroll_start))
         .route("/v1/enroll/finish", post(crate::device_auth::enroll_finish))
