@@ -1,0 +1,240 @@
+use std::{net::SocketAddr, path::PathBuf};
+
+use anyhow::{Result, bail};
+use clap::{Parser, Subcommand};
+use mysyncfiles::server;
+
+#[derive(Parser)]
+#[command(
+    name = "mysync-server",
+    version,
+    about = "Personal file synchronization server"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create the server data directory and database
+    Init {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Start the HTTP API on a loopback address behind an HTTPS reverse proxy
+    Serve {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8484")]
+        listen: SocketAddr,
+        #[arg(long)]
+        releases_dir: Option<PathBuf>,
+    },
+    /// Manage device keys
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+    /// Manage deleted server files
+    Trash {
+        #[command(subcommand)]
+        command: TrashCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrashCommand {
+    /// Permanently remove one item from the server trash
+    Purge {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        id: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCommand {
+    /// Configure TPM manufacturer trust and the externally visible server origin
+    AuthConfigure {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        public_url: String,
+        #[arg(long)]
+        ek_roots: PathBuf,
+        /// Temporary compatibility window for old, unpaired devices only
+        #[arg(long)]
+        allow_legacy: bool,
+    },
+    /// Create a single-use, 15-minute TPM enrollment invitation
+    Invite {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// List enrollment IDs, fingerprints and approval status
+    Pending {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Cancel an unapproved invitation without disabling an existing legacy key
+    Cancel {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        id: String,
+    },
+    /// Approve a verified TPM after comparing its fingerprint with the client
+    Approve {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        fingerprint: String,
+    },
+    /// Disable old bearer credentials after every device is paired or revoked
+    RequireTpm {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Add a device and print its key once
+    Add {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        name: String,
+        /// Save the new key in a private file instead of printing it
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// List device names and revocation status
+    List {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Revoke one device key
+    Revoke {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Init { data_dir } => {
+            server::open(&data_dir)?;
+            println!("server initialized at {}", data_dir.display());
+        }
+        Command::Serve {
+            data_dir,
+            listen,
+            releases_dir,
+        } => server::serve(data_dir, listen, releases_dir).await?,
+        Command::Device { command } => match command {
+            DeviceCommand::AuthConfigure {
+                data_dir,
+                public_url,
+                ek_roots,
+                allow_legacy,
+            } => {
+                mysyncfiles::device_auth::configure(
+                    server::open(data_dir)?.as_ref(),
+                    &public_url,
+                    &ek_roots,
+                    allow_legacy,
+                )?;
+                println!("TPM trust configured; legacy_enabled={allow_legacy}");
+            }
+            DeviceCommand::Invite {
+                data_dir,
+                name,
+                output,
+            } => {
+                mysyncfiles::device_auth::invite_to_file(
+                    server::open(data_dir)?.as_ref(),
+                    &name,
+                    &output,
+                )?;
+                println!("invitation created; valid for 15 minutes");
+            }
+            DeviceCommand::Pending { data_dir } => {
+                for entry in mysyncfiles::device_auth::list(server::open(data_dir)?.as_ref())? {
+                    println!(
+                        "id={} name={} status={} fingerprint={}",
+                        entry.id,
+                        entry.name,
+                        entry.status,
+                        entry.fingerprint.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+            DeviceCommand::Cancel { data_dir, id } => {
+                mysyncfiles::device_auth::cancel(server::open(data_dir)?.as_ref(), &id)?;
+                println!("invitation cancelled; approved devices are unchanged");
+            }
+            DeviceCommand::Approve {
+                data_dir,
+                id,
+                fingerprint,
+            } => {
+                mysyncfiles::device_auth::approve(
+                    server::open(data_dir)?.as_ref(),
+                    &id,
+                    &fingerprint,
+                )?;
+                println!("device approved; its legacy credential is retired");
+            }
+            DeviceCommand::RequireTpm { data_dir } => {
+                mysyncfiles::device_auth::require_tpm(server::open(data_dir)?.as_ref())?;
+                println!("TPM authentication required for all devices");
+            }
+            DeviceCommand::Add {
+                data_dir,
+                name,
+                output,
+            } => {
+                let state = server::open(data_dir)?;
+                if let Some(path) = output {
+                    server::add_device_to_file(&state, &name, &path)?;
+                    println!("device={name}\nkey_file={}", path.display());
+                } else {
+                    let key = server::add_device(&state, &name)?;
+                    println!("device={name}\nkey={key}");
+                }
+            }
+            DeviceCommand::List { data_dir } => {
+                let state = server::open(data_dir)?;
+                for (id, name, revoked) in server::list_devices(&state)? {
+                    println!("id={id} name={name} revoked={revoked}");
+                }
+            }
+            DeviceCommand::Revoke { data_dir, name } => {
+                let state = server::open(data_dir)?;
+                if !server::revoke_device(&state, &name)? {
+                    bail!("active device not found: {name}");
+                }
+                println!("revoked {name}");
+            }
+        },
+        Command::Trash { command } => match command {
+            TrashCommand::Purge { data_dir, id } => {
+                let state = server::open(data_dir)?;
+                if !server::purge_trash_item(&state, id)? {
+                    bail!("trash item not found: {id}");
+                }
+                println!("purged trash item {id}");
+            }
+        },
+    }
+    Ok(())
+}

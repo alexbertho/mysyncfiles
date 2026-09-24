@@ -1,0 +1,17 @@
+/target/
+/data/
+/backups/
+/keys/
+*.state.json
+*.enrollment.json
+*.key
+*.p12
+*.pfx
+*.sqlite3*
+*.db
+*.db-*
+*.log
+.env
+.env.*
+!.env.example
+deploy/.env

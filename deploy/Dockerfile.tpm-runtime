@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=debian:13-slim
+FROM ${BASE_IMAGE}
+RUN if [ -e /etc/arch-release ]; then \
+      pacman -Syu --noconfirm --needed tpm2-tss tpm2-tools openssl swtpm; \
+    else \
+      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tpm2-tools swtpm; \
+    fi
+USER 65534:65534
+ENTRYPOINT ["/test-tpm"]

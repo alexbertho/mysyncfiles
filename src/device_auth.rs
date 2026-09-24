@@ -1,0 +1,624 @@
+use crate::{
+    auth_protocol::*,
+    server::{ApiError, ServerState},
+};
+use anyhow::{Context, Result, ensure};
+use axum::{
+    Json,
+    body::{Body, to_bytes},
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::Response,
+};
+use openssl::{
+    pkey::{PKey, Public},
+    stack::Stack,
+    x509::{X509, X509StoreContext, store::X509StoreBuilder},
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use std::{path::Path, sync::Arc, time::Duration};
+
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn read_signed_body(body: Body) -> Result<axum::body::Bytes, ApiError> {
+    tokio::time::timeout(
+        REQUEST_BODY_TIMEOUT,
+        to_bytes(body, crate::model::UPLOAD_CHUNK_BYTES as usize),
+    )
+    .await
+    .map_err(|_| ApiError(StatusCode::REQUEST_TIMEOUT, "request body timed out".into()))?
+    .map_err(|_| {
+        ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid or oversized request body".into(),
+        )
+    })
+}
+
+fn check_active_session(
+    db: &Connection,
+    enrollment: &str,
+    token: &str,
+    is_session: bool,
+) -> Result<(), ApiError> {
+    let active: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices d JOIN device_enrollments e ON e.device_id=d.id
+        WHERE e.id=?1 AND e.approved_at IS NOT NULL AND d.revoked_at IS NULL)",
+            [enrollment],
+            |r| r.get(0),
+        )
+        .map_err(auth_error)?;
+    if !active {
+        return Err(auth_error("device revoked"));
+    }
+    if !is_session {
+        let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM device_sessions WHERE token_hash=?1 AND enrollment_id=?2 AND expires_at>?3)",
+            params![hash(token), enrollment, now()], |r| r.get(0)).map_err(auth_error)?;
+        if !valid {
+            return Err(auth_error("expired or mismatched session"));
+        }
+    }
+    Ok(())
+}
+
+pub fn initialize(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS auth_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS device_enrollments(
+          id TEXT PRIMARY KEY,device_id INTEGER NOT NULL REFERENCES devices(id),
+          invitation_hash TEXT NOT NULL UNIQUE,expires_at INTEGER NOT NULL,
+          public TEXT,fingerprint TEXT,ek_fingerprint TEXT,activation_hash TEXT,challenge TEXT,
+          verified_at INTEGER,approved_at INTEGER);
+        CREATE TABLE IF NOT EXISTS device_sessions(token_hash TEXT PRIMARY KEY,enrollment_id TEXT NOT NULL REFERENCES device_enrollments(id),expires_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS proof_nonces(enrollment_id TEXT NOT NULL,nonce TEXT NOT NULL,expires_at INTEGER NOT NULL,
+          PRIMARY KEY(enrollment_id,nonce));")?;
+    // Existing deployments get an explicit migration window. New databases
+    // start with legacy bearer authentication disabled.
+    db.execute(
+        "INSERT OR IGNORE INTO auth_settings(key,value)
+        VALUES('allow_legacy',CASE WHEN EXISTS(SELECT 1 FROM devices) THEN '1' ELSE '0' END)",
+        [],
+    )?;
+    Ok(())
+}
+fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(db
+        .query_row("SELECT value FROM auth_settings WHERE key=?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+pub fn allow_legacy_for_migration(state: &ServerState) -> Result<()> {
+    state.db.lock().unwrap().execute(
+        "INSERT OR REPLACE INTO auth_settings VALUES('allow_legacy','1')",
+        [],
+    )?;
+    Ok(())
+}
+pub fn configure(
+    state: &ServerState,
+    public_url: &str,
+    roots: &Path,
+    allow_legacy: bool,
+) -> Result<()> {
+    let url = reqwest::Url::parse(public_url)?;
+    ensure!(
+        url.scheme() == "https"
+            || (url.scheme() == "http"
+                && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))),
+        "HTTPS public URL required"
+    );
+    ensure!(
+        url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path() == "/",
+        "public URL must be an origin without credentials or path"
+    );
+    let pem = std::fs::read(roots)?;
+    ensure!(
+        !X509::stack_from_pem(&pem)?.is_empty(),
+        "at least one trusted EK CA certificate required"
+    );
+    let mut db = state.db.lock().unwrap();
+    let tx = db.transaction()?;
+    for (key, value) in [
+        ("public_url", url.as_str().trim_end_matches('/').to_owned()),
+        ("ek_roots", String::from_utf8(pem)?),
+        ("allow_legacy", if allow_legacy { "1" } else { "0" }.into()),
+    ] {
+        tx.execute(
+            "INSERT OR REPLACE INTO auth_settings VALUES(?1,?2)",
+            params![key, value],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+pub fn require_tpm(state: &ServerState) -> Result<()> {
+    let db = state.db.lock().unwrap();
+    let remaining: i64 = db.query_row(
+        "SELECT COUNT(*) FROM devices d WHERE revoked_at IS NULL AND NOT EXISTS(
+        SELECT 1 FROM device_enrollments e WHERE e.device_id=d.id AND approved_at IS NOT NULL)",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        remaining == 0,
+        "{remaining} devices still need enrollment or revocation"
+    );
+    db.execute(
+        "UPDATE auth_settings SET value='0' WHERE key='allow_legacy'",
+        [],
+    )?;
+    Ok(())
+}
+pub fn invite(state: &ServerState, name: &str) -> Result<String> {
+    let token = random_secret()?;
+    insert_invitation(state, name, &token)?;
+    Ok(token)
+}
+
+pub fn invite_to_file(state: &ServerState, name: &str, path: &Path) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let token = random_secret()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    let result = (|| {
+        writeln!(file, "{token}")?;
+        file.sync_all()?;
+        // Publish the invitation only after its private export is durable.
+        insert_invitation(state, name, &token)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn insert_invitation(state: &ServerState, name: &str, token: &str) -> Result<()> {
+    ensure!(
+        !name.trim().is_empty() && name.len() <= 255,
+        "invalid device name"
+    );
+    let mut db = state.db.lock().unwrap();
+    let tx = db.transaction()?;
+    ensure!(
+        setting(&tx, "ek_roots")?.is_some(),
+        "configure the public URL and EK CA roots first"
+    );
+    let existing: Option<(i64, Option<i64>)> = tx
+        .query_row(
+            "SELECT id,revoked_at FROM devices WHERE name=?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let id = if let Some((id, revoked)) = existing {
+        ensure!(revoked.is_none(), "revoked name; use a new device name");
+        id
+    } else {
+        tx.execute(
+            "INSERT INTO devices(name,token_hash,created_at) VALUES(?1,?2,?3)",
+            params![name, hash(random_secret()?), now()],
+        )?;
+        tx.last_insert_rowid()
+    };
+    let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM device_enrollments WHERE device_id=?1 AND (approved_at IS NOT NULL OR expires_at>?2))",params![id,now()],|r|r.get(0))?;
+    ensure!(
+        !occupied,
+        "device already enrolled or an invitation is pending"
+    );
+    tx.execute("INSERT INTO device_enrollments(id,device_id,invitation_hash,expires_at) VALUES(?1,?2,?3,?4)",
+        params![uuid::Uuid::new_v4().to_string(),id,hash(token),now()+900])?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct DeviceEnrollment {
+    pub id: String,
+    pub name: String,
+    pub fingerprint: Option<String>,
+    pub status: String,
+}
+pub fn list(state: &ServerState) -> Result<Vec<DeviceEnrollment>> {
+    let db = state.db.lock().unwrap();
+    let mut q=db.prepare("SELECT e.id,d.name,e.fingerprint,CASE
+        WHEN d.revoked_at IS NOT NULL THEN 'revoked' WHEN e.approved_at IS NOT NULL THEN 'approved'
+        WHEN e.expires_at<=?1 THEN 'expired' WHEN e.verified_at IS NOT NULL THEN 'pending-approval'
+        ELSE 'invited' END FROM device_enrollments e JOIN devices d ON d.id=e.device_id ORDER BY d.id")?;
+    Ok(q.query_map([now()], |r| {
+        Ok(DeviceEnrollment {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            fingerprint: r.get(2)?,
+            status: r.get(3)?,
+        })
+    })?
+    .collect::<rusqlite::Result<_>>()?)
+}
+pub fn approve(state: &ServerState, id: &str, expected_fingerprint: &str) -> Result<()> {
+    let mut db = state.db.lock().unwrap();
+    let tx = db.transaction()?;
+    let device:Option<i64>=tx.query_row("SELECT e.device_id FROM device_enrollments e JOIN devices d ON d.id=e.device_id
+        WHERE e.id=?1 AND e.fingerprint=?2 AND verified_at IS NOT NULL AND expires_at>?3 AND d.revoked_at IS NULL",
+        params![id,expected_fingerprint,now()],|r|r.get(0)).optional()?;
+    let device = device.context("no verified enrollment with this fingerprint")?;
+    tx.execute("UPDATE device_enrollments SET approved_at=?2,activation_hash=NULL,challenge=NULL WHERE id=?1",params![id,now()])?;
+    // Irreversibly retire the old bearer credential in the same transaction.
+    tx.execute(
+        "UPDATE devices SET token_hash=?2 WHERE id=?1",
+        params![device, hash(random_secret()?)],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Cancel only an unapproved invitation. Approved keys must be revoked instead.
+pub fn cancel(state: &ServerState, id: &str) -> Result<()> {
+    let changed = state.db.lock().unwrap().execute(
+        "UPDATE device_enrollments SET expires_at=0,activation_hash=NULL,challenge=NULL
+         WHERE id=?1 AND approved_at IS NULL AND expires_at>0",
+        [id],
+    )?;
+    ensure!(
+        changed == 1,
+        "no cancellable invitation; revoke approved devices instead"
+    );
+    Ok(())
+}
+
+fn verify_ek(roots: &str, chain: &[String]) -> Result<PKey<Public>> {
+    ensure!(
+        !chain.is_empty() && chain.len() <= 8,
+        "invalid EK certificate chain"
+    );
+    let certs = chain
+        .iter()
+        .map(|c| {
+            ensure!(c.len() <= 32768, "certificate too large");
+            Ok(X509::from_der(&hex::decode(c)?)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut store = X509StoreBuilder::new()?;
+    for ca in X509::stack_from_pem(roots.as_bytes())? {
+        store.add_cert(ca)?;
+    }
+    let mut untrusted = Stack::new()?;
+    for cert in certs.iter().skip(1) {
+        untrusted.push(cert.clone())?;
+    }
+    let mut ctx = X509StoreContext::new()?;
+    ensure!(
+        ctx.init(&store.build(), &certs[0], &untrusted, |ctx| ctx
+            .verify_cert())?,
+        "untrusted or expired EK certificate"
+    );
+    let key = certs[0].public_key()?;
+    let der = certs[0].to_der()?;
+    let (_, leaf) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|e| anyhow::anyhow!("EK certificate: {e}"))?;
+    ensure!(!leaf.is_ca(), "EK certificate must not be a CA");
+    let usage = leaf
+        .extended_key_usage()?
+        .context("EK extended key usage missing")?;
+    ensure!(
+        usage
+            .value
+            .other
+            .iter()
+            .any(|oid| oid.to_id_string() == "2.23.133.8.1"),
+        "certificate is not a TPM endorsement certificate"
+    );
+    let usage = leaf.key_usage()?.context("EK key usage missing")?;
+    ensure!(
+        if key.rsa().is_ok() {
+            usage.value.key_encipherment()
+        } else {
+            usage.value.key_agreement()
+        },
+        "invalid EK key usage"
+    );
+    ensure!(
+        key.rsa().is_ok_and(|k| k.size() == 256)
+            || key
+                .ec_key()
+                .is_ok_and(|k| k.group().curve_name() == Some(openssl::nid::Nid::X9_62_PRIME256V1)),
+        "unsupported EK public key"
+    );
+    Ok(key)
+}
+
+// Use the upstream TPM2 software implementation of MakeCredential, without a
+// TPM on the server. All paths belong to a private temporary directory; no shell
+// or client-supplied executable/flags are involved.
+async fn make_credential(
+    ek: &PKey<Public>,
+    name: &[u8],
+    activation: &str,
+) -> Result<(String, String)> {
+    let temp = tempfile::tempdir()?;
+    let public = temp.path().join("ek.pem");
+    let secret = temp.path().join("secret");
+    let output = temp.path().join("credential");
+    std::fs::write(&public, ek.public_key_to_pem()?)?;
+    std::fs::write(&secret, hex::decode(activation)?)?;
+    let mut command = tokio::process::Command::new("/usr/bin/tpm2_makecredential");
+    command
+        .args([
+            "-T",
+            "none",
+            "-G",
+            if ek.rsa().is_ok() { "rsa" } else { "ecc" },
+            "-u",
+        ])
+        .arg(&public)
+        .arg("-s")
+        .arg(&secret)
+        .arg("-n")
+        .arg(hex::encode(name))
+        .arg("-o")
+        .arg(&output)
+        .kill_on_drop(true);
+    let result =
+        tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await??;
+    ensure!(result.status.success(), "TPM MakeCredential failed");
+    let bytes = std::fs::read(output)?;
+    ensure!(
+        bytes.len() >= 12 && bytes[..8] == [0xba, 0xdc, 0xc0, 0xde, 0, 0, 0, 1],
+        "unexpected MakeCredential format"
+    );
+    let n = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
+    ensure!(bytes.len() >= 12 + n, "truncated credential");
+    let m = u16::from_be_bytes([bytes[10 + n], bytes[11 + n]]) as usize;
+    ensure!(bytes.len() == 12 + n + m, "truncated secret");
+    Ok((
+        hex::encode(&bytes[10..10 + n]),
+        hex::encode(&bytes[12 + n..]),
+    ))
+}
+fn auth_error(error: impl std::fmt::Display) -> ApiError {
+    eprintln!("device authentication rejected: {error}");
+    ApiError(
+        StatusCode::UNAUTHORIZED,
+        "device authentication failed".into(),
+    )
+}
+pub async fn enroll_start(
+    State(state): State<Arc<ServerState>>,
+    Json(request): Json<EnrollStart>,
+) -> Result<Json<EnrollChallenge>, ApiError> {
+    let _permit = state
+        .enrollment_limit
+        .try_acquire()
+        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "enrollment busy".into()))?;
+    let (roots, id) = {
+        let db = state.db.lock().unwrap();
+        let roots = setting(&db, "ek_roots")
+            .map_err(auth_error)?
+            .ok_or_else(|| auth_error("EK roots not configured"))?;
+        let id:Option<String>=db.query_row("SELECT e.id FROM device_enrollments e JOIN devices d ON d.id=e.device_id
+            WHERE invitation_hash=?1 AND expires_at>?2 AND verified_at IS NULL AND d.revoked_at IS NULL",
+            params![hash(&request.invitation),now()],|r|r.get(0)).optional().map_err(auth_error)?;
+        (roots, id.ok_or_else(|| auth_error("invalid invitation"))?)
+    };
+    let key = verify_ek(&roots, &request.ek_chain).map_err(auth_error)?;
+    let fp = fingerprint(&request.public).map_err(auth_error)?;
+    let name = key_name(&request.public).map_err(auth_error)?;
+    let activation = random_secret().map_err(auth_error)?;
+    let (credential, secret) = make_credential(&key, &name, &activation)
+        .await
+        .map_err(ApiError::internal)?;
+    let challenge = EnrollChallenge {
+        id: id.clone(),
+        credential,
+        secret,
+    };
+    let ek_fp = hash(key.public_key_to_der().map_err(auth_error)?);
+    let mut db = state.db.lock().unwrap();
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let existing:Option<(Option<String>,Option<String>)>=tx.query_row("SELECT public,challenge FROM device_enrollments
+        WHERE id=?1 AND expires_at>?2 AND verified_at IS NULL AND EXISTS(SELECT 1 FROM devices WHERE id=device_id AND revoked_at IS NULL)",params![id,now()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(ApiError::internal)?;
+    let (old_public, old_challenge) =
+        existing.ok_or_else(|| auth_error("invitation no longer valid"))?;
+    if let Some(old) = old_public {
+        if old != request.public {
+            return Err(ApiError::conflict(
+                "invitation already bound to another key",
+            ));
+        }
+        return Ok(Json(
+            serde_json::from_str(&old_challenge.unwrap()).map_err(ApiError::internal)?,
+        ));
+    }
+    tx.execute("UPDATE device_enrollments SET public=?2,fingerprint=?3,ek_fingerprint=?4,activation_hash=?5,challenge=?6 WHERE id=?1",
+        params![id,request.public,fp,ek_fp,hash(hex::decode(activation).map_err(auth_error)?),serde_json::to_string(&challenge).map_err(ApiError::internal)?]).map_err(ApiError::internal)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(Json(challenge))
+}
+pub async fn enroll_finish(
+    State(state): State<Arc<ServerState>>,
+    Json(request): Json<EnrollFinish>,
+) -> Result<Json<Enrollment>, ApiError> {
+    let bytes = hex::decode(&request.activation).map_err(auth_error)?;
+    if bytes.len() != 32 {
+        return Err(auth_error("invalid activation"));
+    }
+    let mut db = state.db.lock().unwrap();
+    let tx = db.transaction().map_err(ApiError::internal)?;
+    let row:Option<(String,String)>=tx.query_row("SELECT activation_hash,fingerprint FROM device_enrollments e JOIN devices d ON d.id=e.device_id
+        WHERE e.id=?1 AND expires_at>?2 AND approved_at IS NULL AND d.revoked_at IS NULL",params![request.id,now()],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(ApiError::internal)?;
+    let (expected, fp) = row.ok_or_else(|| auth_error("unknown enrollment"))?;
+    if !openssl::memcmp::eq(hash(bytes).as_bytes(), expected.as_bytes()) {
+        return Err(auth_error("activation failed"));
+    }
+    tx.execute("UPDATE device_enrollments SET verified_at=COALESCE(verified_at,?2),expires_at=CASE WHEN verified_at IS NULL THEN ?2+86400 ELSE expires_at END,challenge=NULL WHERE id=?1",params![request.id,now()]).map_err(ApiError::internal)?;
+    tx.commit().map_err(ApiError::internal)?;
+    Ok(Json(Enrollment {
+        id: request.id,
+        fingerprint: fp,
+        status: "pending-approval".into(),
+    }))
+}
+
+pub async fn middleware(
+    State(state): State<Arc<ServerState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let is_session = request.uri().path() == "/v1/auth/session";
+    // Retain the permit until the handler releases the buffered request too.
+    let mut body_permit = None;
+    let authorization = request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    if let Some(token) = authorization.strip_prefix("Bearer ") {
+        let db = state.db.lock().unwrap();
+        if is_session || setting(&db, "allow_legacy").map_err(auth_error)?.as_deref() != Some("1") {
+            return Err(auth_error("TPM enrollment required"));
+        }
+        let id:Option<i64>=db.query_row("SELECT id FROM devices d WHERE token_hash=?1 AND revoked_at IS NULL AND NOT EXISTS(
+            SELECT 1 FROM device_enrollments e WHERE e.device_id=d.id AND approved_at IS NOT NULL)",[hash(token)],|r|r.get(0)).optional().map_err(auth_error)?;
+        request
+            .extensions_mut()
+            .insert(id.ok_or_else(|| auth_error("invalid legacy credential"))?);
+    } else {
+        let proof = request
+            .headers()
+            .get(PROOF_HEADER)
+            .and_then(|h| h.to_str().ok())
+            .ok_or_else(|| auth_error("missing proof"))?;
+        let proof = Proof::decode(proof).map_err(auth_error)?;
+        let (public, origin, device) = {
+            let db = state.db.lock().unwrap();
+            let row:Option<(String,i64)>=db.query_row("SELECT e.public,d.id FROM device_enrollments e JOIN devices d ON d.id=e.device_id
+                WHERE e.id=?1 AND e.approved_at IS NOT NULL AND d.revoked_at IS NULL",[&proof.claims.device],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(auth_error)?;
+            let (public, device) = row.ok_or_else(|| {
+                ApiError(
+                    StatusCode::FORBIDDEN,
+                    "device not approved or revoked".into(),
+                )
+            })?;
+            (
+                public,
+                setting(&db, "public_url")
+                    .map_err(auth_error)?
+                    .ok_or_else(|| auth_error("public URL missing"))?,
+                device,
+            )
+        };
+        let token = if is_session {
+            if !authorization.is_empty() {
+                return Err(auth_error("unexpected session credential"));
+            }
+            ""
+        } else {
+            authorization
+                .strip_prefix("MySync ")
+                .ok_or_else(|| auth_error("missing bound session"))?
+        };
+        let url = format!(
+            "{origin}{}",
+            request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/")
+        );
+        let (parts, body) = request.into_parts();
+        proof
+            .verify_headers(&public, parts.method.as_str(), &url, token)
+            .map_err(auth_error)?;
+        {
+            let mut db = state.db.lock().unwrap();
+            let tx = db.transaction().map_err(ApiError::internal)?;
+            check_active_session(&tx, &proof.claims.device, token, is_session)?;
+            body_permit = Some(state.signed_request_limit.try_acquire().map_err(|_| {
+                ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many signed requests in flight".into(),
+                )
+            })?);
+            tx.execute("DELETE FROM proof_nonces WHERE expires_at<=?1", [now()])
+                .map_err(ApiError::internal)?;
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO proof_nonces VALUES(?1,?2,?3)",
+                    params![proof.claims.device, proof.claims.nonce, now() + 120],
+                )
+                .map_err(ApiError::internal)?;
+            if inserted != 1 {
+                return Err(auth_error("replayed proof"));
+            }
+            tx.commit().map_err(ApiError::internal)?;
+        }
+        // The nonce is consumed even on a failed/cancelled body read. A retry
+        // must sign a fresh proof, so concurrent replays cannot reserve memory.
+        let bytes = read_signed_body(body).await?;
+        proof.verify_body(&bytes).map_err(auth_error)?;
+        check_active_session(
+            &state.db.lock().unwrap(),
+            &proof.claims.device,
+            token,
+            is_session,
+        )?;
+        request = Request::from_parts(parts, Body::from(bytes));
+        request.extensions_mut().insert(device);
+        request.extensions_mut().insert(proof.claims.device);
+    }
+    let response = next.run(request).await;
+    drop(body_permit);
+    Ok(response)
+}
+pub async fn session(
+    State(state): State<Arc<ServerState>>,
+    axum::Extension(id): axum::Extension<String>,
+) -> Result<Json<Session>, ApiError> {
+    let token = random_secret().map_err(ApiError::internal)?;
+    let expires = now() + SESSION_SECONDS;
+    let db = state.db.lock().unwrap();
+    db.execute("DELETE FROM device_sessions WHERE expires_at<=?1", [now()])
+        .map_err(ApiError::internal)?;
+    db.execute(
+        "INSERT INTO device_sessions VALUES(?1,?2,?3)",
+        params![hash(&token), id, expires],
+    )
+    .map_err(ApiError::internal)?;
+    Ok(Json(Session {
+        token,
+        expires_at: expires,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn signed_body_has_a_deadline_and_a_byte_limit() {
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<Vec<u8>, std::io::Error>,
+        >());
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            read_signed_body(body).await.unwrap_err().0,
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert_eq!(start.elapsed(), REQUEST_BODY_TIMEOUT);
+        let body = Body::from(vec![0; crate::model::UPLOAD_CHUNK_BYTES as usize + 1]);
+        assert_eq!(
+            read_signed_body(body).await.unwrap_err().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+}
