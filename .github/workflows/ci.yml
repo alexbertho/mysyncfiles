@@ -40,6 +40,8 @@ jobs:
         run: docker run --rm --mount type=bind,source="$PWD/target/release/mysync",target=/usr/local/bin/mysync,readonly archlinux:base bash -c 'pacman -Syu --noconfirm --needed tpm2-tss openssl && /usr/local/bin/mysync --version'
       - name: Build server image
         run: docker build -f deploy/Dockerfile .
+      - name: Validate documentation
+        run: make docs-check
       - name: Audit Rust dependencies
         run: |
           cargo install cargo-audit --locked --version 0.22.2

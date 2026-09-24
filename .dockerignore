@@ -2,6 +2,7 @@
 .gitignore
 .github
 docs
+site
 target
 README.md
 tests

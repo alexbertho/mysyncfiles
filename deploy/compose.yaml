@@ -32,3 +32,23 @@ services:
         max-file: "3"
     stop_grace_period: 1m
     restart: unless-stopped
+
+  docs:
+    profiles:
+      - docs
+    build:
+      context: .
+      dockerfile: Dockerfile.docs
+    image: mysyncfiles-docs:local
+    volumes:
+      - type: bind
+        source: ../mkdocs.yml
+        target: /workspace/mkdocs.yml
+        read_only: true
+      - type: bind
+        source: ../docs
+        target: /workspace/docs
+        read_only: true
+    ports:
+      - "127.0.0.1:8000:8000"
+    stop_grace_period: 2s
