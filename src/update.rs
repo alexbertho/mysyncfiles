@@ -12,10 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::{
-    client::{Api, ClientConfig},
-    release,
-};
+use crate::{client::ClientConfig, release};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -113,7 +110,7 @@ pub async fn check_and_install_at(
     executable: &Path,
     current_version: &str,
 ) -> Result<UpdateOutcome> {
-    Api::new(config)?;
+    crate::client::validate_server_url(&config.server)?;
     let target = release::current_target().ok_or_else(|| anyhow!("unsupported client platform"))?;
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(10))

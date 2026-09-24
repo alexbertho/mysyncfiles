@@ -7,6 +7,7 @@ README.md
 tests
 deploy/nginx-sync.conf
 deploy/*.service
+!deploy/mysync.service
 deploy/compose.yaml
 deploy/.env
 .env

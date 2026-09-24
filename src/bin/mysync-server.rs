@@ -31,7 +31,7 @@ enum Command {
         #[arg(long)]
         releases_dir: Option<PathBuf>,
     },
-    /// Manage device keys
+    /// Manage TPM-enrolled devices
     Device {
         #[command(subcommand)]
         command: DeviceCommand,
@@ -64,9 +64,6 @@ enum DeviceCommand {
         public_url: String,
         #[arg(long)]
         ek_roots: PathBuf,
-        /// Temporary compatibility window for old, unpaired devices only
-        #[arg(long)]
-        allow_legacy: bool,
     },
     /// Create a single-use, 15-minute TPM enrollment invitation
     Invite {
@@ -82,7 +79,7 @@ enum DeviceCommand {
         #[arg(long)]
         data_dir: PathBuf,
     },
-    /// Cancel an unapproved invitation without disabling an existing legacy key
+    /// Cancel an unapproved invitation
     Cancel {
         #[arg(long)]
         data_dir: PathBuf,
@@ -98,27 +95,12 @@ enum DeviceCommand {
         #[arg(long)]
         fingerprint: String,
     },
-    /// Disable old bearer credentials after every device is paired or revoked
-    RequireTpm {
-        #[arg(long)]
-        data_dir: PathBuf,
-    },
-    /// Add a device and print its key once
-    Add {
-        #[arg(long)]
-        data_dir: PathBuf,
-        #[arg(long)]
-        name: String,
-        /// Save the new key in a private file instead of printing it
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
     /// List device names and revocation status
     List {
         #[arg(long)]
         data_dir: PathBuf,
     },
-    /// Revoke one device key
+    /// Revoke one device
     Revoke {
         #[arg(long)]
         data_dir: PathBuf,
@@ -145,15 +127,13 @@ async fn main() -> Result<()> {
                 data_dir,
                 public_url,
                 ek_roots,
-                allow_legacy,
             } => {
                 mysyncfiles::device_auth::configure(
                     server::open(data_dir)?.as_ref(),
                     &public_url,
                     &ek_roots,
-                    allow_legacy,
                 )?;
-                println!("TPM trust configured; legacy_enabled={allow_legacy}");
+                println!("TPM trust configured");
             }
             DeviceCommand::Invite {
                 data_dir,
@@ -192,25 +172,7 @@ async fn main() -> Result<()> {
                     &id,
                     &fingerprint,
                 )?;
-                println!("device approved; its legacy credential is retired");
-            }
-            DeviceCommand::RequireTpm { data_dir } => {
-                mysyncfiles::device_auth::require_tpm(server::open(data_dir)?.as_ref())?;
-                println!("TPM authentication required for all devices");
-            }
-            DeviceCommand::Add {
-                data_dir,
-                name,
-                output,
-            } => {
-                let state = server::open(data_dir)?;
-                if let Some(path) = output {
-                    server::add_device_to_file(&state, &name, &path)?;
-                    println!("device={name}\nkey_file={}", path.display());
-                } else {
-                    let key = server::add_device(&state, &name)?;
-                    println!("device={name}\nkey={key}");
-                }
+                println!("device approved");
             }
             DeviceCommand::List { data_dir } => {
                 let state = server::open(data_dir)?;

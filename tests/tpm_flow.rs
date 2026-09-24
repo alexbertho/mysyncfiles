@@ -5,7 +5,7 @@ use mysyncfiles::{
     auth_protocol::*,
     client::{self, ClientConfig},
     device_auth, server,
-    tpm::Identity,
+    tpm::{self, Identity},
 };
 use openssl::{
     asn1::Asn1Time,
@@ -88,6 +88,9 @@ impl Simulator {
         Ok(())
     }
     fn certify_ek(&self, ca: &Certificate, kind: &str) -> Result<Vec<u8>> {
+        self.issue_ek(ca, kind, true)
+    }
+    fn issue_ek(&self, ca: &Certificate, kind: &str, install_nv: bool) -> Result<Vec<u8>> {
         let context = self._dir.path().join("ek.ctx");
         let pem = self._dir.path().join("ek.pem");
         self.tool(
@@ -108,7 +111,9 @@ impl Simulator {
         let key = PKey::public_key_from_pem(&std::fs::read(pem)?)?;
         let certificate = ca.sign_ek(&key, kind, false, true)?;
         let der = certificate.to_der()?;
-        self.install_cert(&der, kind)?;
+        if install_nv {
+            self.install_cert(&der, kind)?;
+        }
         self.tool("tpm2_flushcontext", &["-t"])?;
         Ok(der)
     }
@@ -139,6 +144,113 @@ impl Simulator {
         Ok(())
     }
 }
+
+#[test]
+fn doctor_requires_a_readable_ek_certificate() -> Result<()> {
+    let simulator = Simulator::start()?;
+    let error = tpm::doctor(&simulator.tcti).unwrap_err();
+    assert!(error.to_string().contains("no readable"));
+    let ca = Certificate::ca()?;
+    simulator.certify_ek(&ca, "rsa")?;
+    assert_eq!(tpm::doctor(&simulator.tcti)?, "rsa");
+    Ok(())
+}
+
+#[test]
+fn external_ek_certificate_must_match_this_tpm() -> Result<()> {
+    let ca = Certificate::ca()?;
+    let first = Simulator::start()?;
+    let certificate = first.issue_ek(&ca, "rsa", false)?;
+    assert!(tpm::doctor(&first.tcti).is_err());
+    assert_eq!(
+        tpm::doctor_with_certificate(&first.tcti, Some(&certificate))?,
+        "rsa"
+    );
+    let (identity, returned) =
+        Identity::create_with_certificate(&first.tcti, "rsa", Some(&certificate))?;
+    assert_eq!(returned, certificate);
+    assert_eq!(identity.ek_certificate_from(&certificate)?, certificate);
+
+    let second = Simulator::start()?;
+    assert!(tpm::doctor_with_certificate(&second.tcti, Some(&certificate)).is_err());
+    assert!(Identity::create_with_certificate(&second.tcti, "rsa", Some(&certificate)).is_err());
+    assert!(Identity::create_with_certificate(&first.tcti, "ecc", Some(&certificate)).is_err());
+    assert!(identity.ek_certificate_from(b"not DER").is_err());
+
+    let ecc = Simulator::start()?;
+    let ecc_certificate = ecc.issue_ek(&ca, "ecc", false)?;
+    assert_eq!(
+        tpm::doctor_with_certificate(&ecc.tcti, Some(&ecc_certificate))?,
+        "ecc"
+    );
+    let (ecc_identity, _) =
+        Identity::create_with_certificate(&ecc.tcti, "ecc", Some(&ecc_certificate))?;
+    assert_eq!(
+        ecc_identity.ek_certificate_from(&ecc_certificate)?,
+        ecc_certificate
+    );
+    Ok(())
+}
+
+#[test]
+fn external_ek_certificate_file_is_bounded_and_der_only() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("ek.der");
+    std::fs::write(&path, vec![0; 16 * 1024 + 1])?;
+    assert!(tpm::read_ek_certificate(&path).is_err());
+    std::fs::write(&path, b"not a DER certificate")?;
+    assert!(tpm::read_ek_certificate(&path).is_err());
+    let ca = Certificate::ca()?;
+    let mut der = ca.certificate.to_der()?;
+    der.extend_from_slice(b"trailing bytes");
+    std::fs::write(&path, der)?;
+    assert!(tpm::read_ek_certificate(&path).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn reusable_tpm_signer_keeps_request_proofs_fresh_and_bound() -> Result<()> {
+    let simulator = Simulator::start()?;
+    let ca = Certificate::ca()?;
+    simulator.certify_ek(&ca, "rsa")?;
+    let (mut identity, _) = Identity::create(&simulator.tcti, "rsa")?;
+    identity.device = "test-device".into();
+    let signer = tpm::RequestSigner::new(identity.clone())?;
+    let url = "https://sync.example.org/v1/manifest";
+    let token = "short-lived-session";
+
+    let first = Proof::decode(
+        &signer
+            .proof(Claims::new(&identity.device, "GET", url, b"", token)?)
+            .await?,
+    )?;
+    let second = Proof::decode(
+        &signer
+            .proof(Claims::new(&identity.device, "GET", url, b"", token)?)
+            .await?,
+    )?;
+    first.verify(&identity.public, "GET", url, b"", token)?;
+    second.verify(&identity.public, "GET", url, b"", token)?;
+    assert_ne!(first.claims.nonce, second.claims.nonce);
+    assert!(
+        second
+            .verify(&identity.public, "GET", url, b"", "wrong-session")
+            .is_err()
+    );
+    assert!(
+        second
+            .verify(
+                &identity.public,
+                "GET",
+                "https://other.example.org/",
+                b"",
+                token
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
 struct Certificate {
     key: PKey<Private>,
     certificate: X509,
@@ -224,7 +336,7 @@ impl Server {
         let url = format!("http://{}", listener.local_addr()?);
         let roots = dir.path().join("roots.pem");
         std::fs::write(&roots, ca.certificate.to_pem()?)?;
-        device_auth::configure(&state, &url, &roots, true)?;
+        device_auth::configure(&state, &url, &roots)?;
         let router = server::router(state.clone());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         Ok(Self {
@@ -523,29 +635,26 @@ async fn signed_requests_authenticate_before_buffering_and_bound_in_flight_bodie
 }
 
 #[tokio::test]
-async fn tpm_enrollment_request_binding_replay_revocation_and_migration() -> Result<()> {
+async fn tpm_enrollment_request_binding_replay_and_revocation() -> Result<()> {
     let ca = Certificate::ca()?;
     let simulator = Simulator::start()?;
     let cert = simulator.certify_ek(&ca, "rsa")?;
     let (mut key, _) = Identity::create(&simulator.tcti, "rsa")?;
     let server = Server::start(&ca).await?;
     let http = Client::new();
-    let legacy = server::add_device(&server.state, "device-a")?;
     let invitation = device_auth::invite(&server.state, "device-a")?;
-    assert!(device_auth::require_tpm(&server.state).is_err());
     let fingerprint = enroll(&http, &server, &invitation, &mut key, &cert).await?;
     assert!(session(&http, &server, &key).await.is_err());
     assert!(device_auth::approve(&server.state, &key.device, &"0".repeat(64)).is_err());
     device_auth::approve(&server.state, &key.device, &fingerprint)?;
     assert_eq!(
         http.get(format!("{}/v1/manifest", server.url))
-            .bearer_auth(&legacy)
+            .bearer_auth("obsolete-device-key")
             .send()
             .await?
             .status(),
         StatusCode::UNAUTHORIZED
     );
-    device_auth::require_tpm(&server.state)?;
     let active = session(&http, &server, &key).await?;
     let url = format!("{}/v1/manifest", server.url);
     let request = signed(&http, &url, Method::GET, vec![], &key, &active.token).await?;
@@ -610,7 +719,6 @@ async fn tpm_enrollment_request_binding_replay_revocation_and_migration() -> Res
     std::fs::create_dir(&root)?;
     let config = ClientConfig {
         server: server.url.clone(),
-        token: String::new(),
         identity: Some(key.clone()),
         root: root.clone(),
         auto_update: false,
@@ -634,6 +742,16 @@ async fn tpm_enrollment_request_binding_replay_revocation_and_migration() -> Res
     // Expiring a cached session must force a signed renewal, not a downgrade.
     let api = client::Api::new(&config)?;
     api.manifest().await?;
+    let sessions_before: i64 =
+        server
+            .db()?
+            .query_row("SELECT COUNT(*) FROM device_sessions", [], |row| row.get(0))?;
+    api.manifest().await?;
+    let sessions_after: i64 =
+        server
+            .db()?
+            .query_row("SELECT COUNT(*) FROM device_sessions", [], |row| row.get(0))?;
+    assert_eq!(sessions_before, sessions_after);
     server
         .db()?
         .execute("UPDATE device_sessions SET expires_at=1", [])?;
@@ -756,34 +874,18 @@ async fn tpm_attestation_requires_trusted_valid_ek_and_one_key_per_invitation() 
 }
 
 #[tokio::test]
-async fn client_enrollment_is_resumable_and_preserves_existing_settings() -> Result<()> {
+async fn client_enrollment_is_resumable() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let ca = Certificate::ca()?;
     let simulator = Simulator::start()?;
     simulator.certify_ek(&ca, "rsa")?;
-    for migrate in [false, true] {
+    {
         let server = Server::start(&ca).await?;
         let local = tempfile::tempdir()?;
         let root = local.path().join("mirror");
         std::fs::create_dir(&root)?;
         std::fs::write(root.join("keep.txt"), b"keep local data")?;
         let path = local.path().join("config.json");
-        let original = if migrate {
-            let config = ClientConfig {
-                server: server.url.clone(),
-                token: server::add_device(&server.state, "lifecycle")?,
-                identity: None,
-                root: root.clone(),
-                auto_update: false,
-                update_public_key: "11".repeat(32),
-            };
-            let bytes = serde_json::to_vec(&config)?;
-            std::fs::write(&path, &bytes)?;
-            client::sync(&path).await?;
-            Some(bytes)
-        } else {
-            None
-        };
         let invitation = device_auth::invite(&server.state, "lifecycle")?;
         let mut fingerprint = String::new();
         let mut enrollment_id = String::new();
@@ -793,6 +895,7 @@ async fn client_enrollment_is_resumable_and_preserves_existing_settings() -> Res
                 server.url.clone(),
                 root.clone(),
                 invitation.clone(),
+                None,
                 None,
                 simulator.tcti.clone(),
             )
@@ -805,11 +908,7 @@ async fn client_enrollment_is_resumable_and_preserves_existing_settings() -> Res
             fingerprint = enrolled.fingerprint;
             enrollment_id = enrolled.id;
             assert!(client::activate_enrollment(&path).await.is_err());
-            if let Some(bytes) = &original {
-                assert_eq!(&std::fs::read(&path)?, bytes);
-            } else {
-                assert!(!path.exists());
-            }
+            assert!(!path.exists());
             assert_eq!(
                 std::fs::metadata(path.with_extension("enrollment.json"))?
                     .permissions()
@@ -820,37 +919,127 @@ async fn client_enrollment_is_resumable_and_preserves_existing_settings() -> Res
         }
         device_auth::approve(&server.state, &enrollment_id, &fingerprint)?;
         let report = client::activate_enrollment(&path).await?;
-        assert_eq!(report.uploaded, usize::from(!migrate));
+        assert_eq!(report.uploaded, 1);
         assert_eq!(report.conflicts, 0);
         assert!(!path.with_extension("enrollment.json").exists());
         let config = client::load_config(&path)?;
-        assert!(config.token.is_empty());
         assert_eq!(config.identity.as_ref().unwrap().device, enrollment_id);
-        assert_eq!(config.auto_update, !migrate);
-        if migrate {
-            assert_eq!(config.update_public_key, "11".repeat(32));
-        }
+        assert!(config.auto_update);
         assert_eq!(std::fs::read(root.join("keep.txt"))?, b"keep local data");
         assert_eq!(
             std::fs::metadata(&path)?.permissions().mode() & 0o777,
             0o600
         );
-        device_auth::require_tpm(&server.state)?;
-        assert!(server::add_device(&server.state, "no-legacy").is_err());
     }
     Ok(())
 }
 
+#[tokio::test]
+async fn client_enrolls_with_external_ek_certificate() -> Result<()> {
+    let ca = Certificate::ca()?;
+    let simulator = Simulator::start()?;
+    let certificate = simulator.issue_ek(&ca, "rsa", false)?;
+    let server = Server::start(&ca).await?;
+    let local = tempfile::tempdir()?;
+    let root = local.path().join("mirror");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("local.txt"), b"hello")?;
+    let cert_path = local.path().join("ek.der");
+    std::fs::write(&cert_path, certificate)?;
+    let config = local.path().join("config.json");
+    let invitation = device_auth::invite(&server.state, "external-ek")?;
+    let untrusted_ca = Certificate::ca()?;
+    let untrusted_certificate = simulator.issue_ek(&untrusted_ca, "rsa", false)?;
+    let untrusted_path = local.path().join("untrusted.der");
+    std::fs::write(&untrusted_path, untrusted_certificate)?;
+    assert!(
+        client::enroll_with_tcti(
+            &config,
+            server.url.clone(),
+            root.clone(),
+            invitation.clone(),
+            Some(untrusted_path),
+            None,
+            simulator.tcti.clone(),
+        )
+        .await
+        .is_err()
+    );
+    let enrolled = client::enroll_with_tcti(
+        &config,
+        server.url.clone(),
+        root.clone(),
+        invitation.clone(),
+        Some(cert_path.clone()),
+        None,
+        simulator.tcti.clone(),
+    )
+    .await?;
+    assert_eq!(enrolled.status, "pending-approval");
+    let repeated = client::enroll_with_tcti(
+        &config,
+        server.url.clone(),
+        root.clone(),
+        invitation,
+        Some(cert_path),
+        None,
+        simulator.tcti.clone(),
+    )
+    .await?;
+    assert_eq!(repeated.fingerprint, enrolled.fingerprint);
+    device_auth::approve(&server.state, &enrolled.id, &enrolled.fingerprint)?;
+    let report = client::activate_enrollment(&config).await?;
+    assert_eq!(report.uploaded, 1);
+    Ok(())
+}
+
 #[test]
-fn fresh_server_rejects_legacy_device_keys() -> Result<()> {
+fn unconfigured_server_rejects_invitations_without_overwriting_files() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let state = server::open(dir.path())?;
-    assert!(server::add_device(&state, "legacy").is_err());
     let export = dir.path().join("invitation");
     assert!(device_auth::invite_to_file(&state, "unconfigured", &export).is_err());
     assert!(!export.exists());
     std::fs::write(&export, "existing secret")?;
     assert!(device_auth::invite_to_file(&state, "unconfigured", &export).is_err());
     assert_eq!(std::fs::read(export)?, b"existing secret");
+    Ok(())
+}
+
+#[test]
+fn obsolete_device_key_database_cannot_start() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = rusqlite::Connection::open(dir.path().join("metadata.sqlite3"))?;
+    db.execute_batch("CREATE TABLE devices(id INTEGER PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL);")?;
+    drop(db);
+    assert!(
+        server::open(dir.path())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("obsolete device-key database")
+    );
+    Ok(())
+}
+
+#[test]
+fn old_bearer_client_profile_is_rejected() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "server": "http://127.0.0.1:8484",
+            "root": dir.path(),
+            "token": "obsolete-secret"
+        }))?,
+    )?;
+    assert!(
+        client::load_config(&path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unknown field `token`")
+    );
     Ok(())
 }
