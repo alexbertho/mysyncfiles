@@ -5,8 +5,8 @@ MySyncFiles synchronise un dossier entre des appareils Linux. Le serveur stocke 
 ## Commencer
 
 1. [Installer le serveur](install-server.md), configurer son origine HTTPS et ses autorités TPM, puis [publier un client signé](operations.md#publier-un-client-signe).
-2. [Installer le client](install-client.md) sur chaque appareil, créer une invitation, comparer son empreinte et approuver l'appairage.
-3. Activer le service utilisateur après la première synchronisation et [contrôler son état](troubleshooting.md).
+2. [Installer le client](install-client.md) sur chaque appareil et saisir son code avec `make pair` sur le serveur.
+3. Comparer l'empreinte TPM, puis [contrôler la première synchronisation et le service](troubleshooting.md).
 
 Le serveur n'a pas besoin de TPM. Chaque client a besoin d'un TPM 2.0 et d'un certificat EK constructeur vérifiable. Debian 13 et Arch Linux sont les systèmes clients testés.
 
@@ -15,7 +15,7 @@ Le serveur n'a pas besoin de TPM. Chaque client a besoin d'un TPM 2.0 et d'un ce
 | Terme | Sens |
 | --- | --- |
 | Miroir | Dossier local synchronisé avec le serveur. |
-| Invitation | Secret temporaire qui permet de demander un appairage, sans donner accès aux fichiers. |
+| Code d'appairage | Secret temporaire affiché par le client et saisi localement sur le serveur, sans donner accès aux fichiers. |
 | Appairage | Association d'une clé TPM à un appareil après contrôle et approbation. |
 | Conflit | Modification concurrente dont la version locale écartée reste dans `.mysync-conflicts/`. |
 | Release signée | Binaire client accompagné d'un manifeste signé et d'une empreinte vérifiée. |

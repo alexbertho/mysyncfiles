@@ -17,24 +17,21 @@ make start
 
 Configurer ensuite le proxy HTTPS et les autorités EK constructeur, puis [publier un client signé](docs/operations.md#publier-un-client-signe). Le serveur ne fournit pas de binaire client prêt à installer tant que cette publication n'a pas eu lieu.
 
-**Client.** Après avoir reçu une invitation privée de l'administrateur, remplacer le domaine d'exemple et installer le client signé :
+**Client.** Remplacer le domaine d'exemple et installer le client signé dans un terminal :
 
 ```sh
-curl -fsS https://sync.example.org/install.sh -o install.sh
-cat install.sh
-sh install.sh
-~/.local/bin/mysync enroll --server https://sync.example.org \
-  --dir "$HOME/Sync" --invitation-stdin < /chemin/prive/invitation
+curl -fsS --proto '=https' --max-redirs 0 https://sync.example.org/install.sh | sh
 ```
 
-Comparer l'empreinte affichée sur le client à celle du serveur avant l'approbation. Après approbation, sauvegarder le miroir puis activer la première synchronisation et le service :
+L'installateur demande la clé publique du serveur, puis affiche un code. Sur le serveur, l'administrateur lance :
 
 ```sh
-~/.local/bin/mysync enroll-activate
-systemctl --user enable --now mysync.service
+make pair
 ```
 
-Le [guide client](docs/install-client.md) donne les commandes d'invitation et d'approbation, le cas du certificat EK externe, l'activation au démarrage et les contrôles. Une première exécution du script suppose que l'origine HTTPS sert le bon script ; la signature protège le binaire téléchargé, pas un script distant compromis.
+Cette commande affiche la clé publique à transmettre directement au client par un canal fiable. Le client l'enregistre pour vérifier les réponses du serveur, même derrière un proxy TLS. Pour un profil existant, suivre la [migration de la clé serveur](docs/device-auth.md#authenticite-des-reponses-et-migration).
+
+Après comparaison de l'empreinte TPM, le client effectue une première synchronisation et démarre le service s'il n'y a pas de conflit. Le [guide client](docs/install-client.md) couvre la reprise, le cas du certificat EK externe et le parcours manuel. Une première exécution du script suppose que l'origine HTTPS sert le bon script ; la signature protège le binaire téléchargé, pas un script distant compromis.
 
 ## Documentation
 

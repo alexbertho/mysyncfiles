@@ -1,6 +1,11 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    io::{self, IsTerminal, Write},
+    net::SocketAddr,
+    path::PathBuf,
+    time::Duration,
+};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mysyncfiles::server;
 
@@ -17,6 +22,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print the origin public key to convey to clients through a trusted channel
+    ServerKey {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Create the server data directory and database
     Init {
         #[arg(long)]
@@ -56,6 +66,11 @@ enum TrashCommand {
 
 #[derive(Subcommand)]
 enum DeviceCommand {
+    /// Pair a client by its temporary code and confirm its TPM fingerprint
+    Pair {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Configure TPM manufacturer trust and the externally visible server origin
     AuthConfigure {
         #[arg(long)]
@@ -109,10 +124,62 @@ enum DeviceCommand {
     },
 }
 
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_owned())
+}
+
+async fn pair(data_dir: PathBuf) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        bail!("device pair requires an interactive terminal");
+    }
+    let state = server::open(data_dir)?;
+    println!("Server public key: {}", state.public_key());
+    println!("Give this key directly to the client before entering its pairing code.");
+    let name = prompt_line("Device name: ")?;
+    let code = rpassword::prompt_password("Code shown by the client: ")?;
+    let id = mysyncfiles::device_auth::register_pair(&state, &name, &code)?;
+    println!("Waiting for the client's TPM proof (up to 15 minutes)...");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
+    let fingerprint = loop {
+        let entry = mysyncfiles::device_auth::enrollment_by_id(&state, &id)?;
+        match entry.status.as_str() {
+            "pending-approval" => {
+                break entry
+                    .fingerprint
+                    .context("verified enrollment has no fingerprint")?;
+            }
+            "expired" | "revoked" => bail!("pairing request expired or was cancelled"),
+            "approved" => bail!("device is already approved"),
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for TPM proof; rerun this command with the same code to resume"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    println!("TPM fingerprint: {fingerprint}");
+    println!("Compare the full fingerprint directly with the client.");
+    let answer = prompt_line("Approve this device? [y/N] ")?;
+    if !matches!(answer.as_str(), "y" | "Y" | "yes" | "YES") {
+        mysyncfiles::device_auth::cancel(&state, &id)?;
+        bail!("pairing cancelled; the client was not approved");
+    }
+    mysyncfiles::device_auth::approve(&state, &id, &fingerprint)?;
+    println!("Device approved. The client will finish its first synchronization.");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::ServerKey { data_dir } => println!("{}", server::open(data_dir)?.public_key()),
         Command::Init { data_dir } => {
             server::open(&data_dir)?;
             println!("server initialized at {}", data_dir.display());
@@ -123,6 +190,7 @@ async fn main() -> Result<()> {
             releases_dir,
         } => server::serve(data_dir, listen, releases_dir).await?,
         Command::Device { command } => match command {
+            DeviceCommand::Pair { data_dir } => pair(data_dir).await?,
             DeviceCommand::AuthConfigure {
                 data_dir,
                 public_url,

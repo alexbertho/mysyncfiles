@@ -18,7 +18,7 @@ cargo test --locked
 
 Les binaires sont `mysync` (client), `mysync-server` et `mysync-release`. L'[environnement Docker TPM de développement](device-auth.md#tests-et-validation) permet aussi de compiler et tester sans installer cette chaîne sur l'hôte.
 
-Pour installer un client construit depuis les sources, exécuter `./deploy/install-tpm-deps.sh` et `./target/release/mysync doctor`, puis [appairer et approuver](install-client.md#inviter-et-approuver-un-appareil) l'appareil en remplaçant `~/.local/bin/mysync` par `./target/release/mysync` dans les commandes client. Après approbation, lancer `./target/release/mysync enroll-activate`, puis `./deploy/install-client.sh` à la place des commandes `systemctl` du guide client. Ce script copie le binaire dans `~/.local/bin`, installe l'unité utilisateur et active le *linger* systemd. Il accepte un chemin de binaire de confiance en argument. Pour un premier binaire téléchargé autrement que par `/install.sh`, vérifier sa provenance et son empreinte : une mise à jour signée ne protège pas rétroactivement ce premier téléchargement.
+Pour installer un client construit depuis les sources, exécuter `./deploy/install-tpm-deps.sh` et `./target/release/mysync doctor`, puis `./target/release/mysync setup --server URL_HTTPS --dir "$HOME/Sync"` et [appairer l'appareil](install-client.md#appairer-et-approuver-un-appareil) avec `make pair` sur le serveur. Après une première synchronisation sans conflit, lancer `./deploy/install-client.sh`. Ce script copie le binaire dans `~/.local/bin`, installe l'unité utilisateur, active le *linger* et démarre le service. Il accepte un chemin de binaire de confiance en argument. Pour un premier binaire téléchargé autrement que par `/install.sh`, vérifier sa provenance et son empreinte : une mise à jour signée ne protège pas rétroactivement ce premier téléchargement.
 
 ## Publier un client signé
 
@@ -38,11 +38,15 @@ Garder la clé privée hors du conteneur et du répertoire public de releases, i
 
 ## Administrer les appareils
 
-Chaque appareil nécessite une invitation et une approbation après comparaison de son empreinte ; la [procédure client](install-client.md#inviter-et-approuver-un-appareil) donne les commandes. Les sous-commandes `device` sont locales au serveur, jamais des routes HTTP d'administration. Une invitation expire après 15 minutes ; l'appairage en attente peut être annulé avec `device cancel --id ID --data-dir /data`.
+Le parcours recommandé est `make pair` : l'administrateur saisit le code affiché sur le client, attend la preuve TPM et confirme l'empreinte complète. La [procédure client](install-client.md#appairer-et-approuver-un-appareil) donne les commandes. Les sous-commandes `device` sont locales au serveur, jamais des routes HTTP d'administration. Le code enregistré expire après 15 minutes s'il n'est pas utilisé ; l'appairage en attente peut être annulé avec `device cancel --id ID --data-dir /data`. Le parcours manuel par invitation reste disponible.
 
 Pour un appareil perdu ou compromis, exécuter `device revoke --name NOM --data-dir /data` dans le conteneur. Les nouvelles requêtes sont refusées ; une requête déjà autorisée peut terminer son traitement. Voir la [révocation et récupération](device-auth.md#revocation-et-recuperation) avant d'appairer un remplacement.
 
 ## Sauvegardes et maintenance
+
+La base privée contient aussi la clé Ed25519 d'authenticité des réponses. `mysync-server server-key --data-dir DOSSIER` affiche sa partie publique, à transmettre aux clients par un canal fiable. Conserver cette clé avec les sauvegardes SQLite ; sa perte ou sa rotation impose de mettre à jour explicitement la clé épinglée de chaque client. La [migration des profils existants](device-auth.md#authenticite-des-reponses-et-migration) ne réinitialise ni les appareils TPM ni les fichiers.
+
+L'état client est publié atomiquement une fois par passe modifiée, avec sérialisation tamponnée et synchronisation du fichier et du dossier parent. Un petit journal privé `config.state.journal` conserve durablement les mutations terminées entre deux publications. Il est rejoué au redémarrage ; ne pas le supprimer lors d'une récupération ou le séparer de `config.state.json` dans une sauvegarde. Une passe sans changement ne réécrit pas l'état.
 
 Sauvegarder de façon cohérente le répertoire de données privé, qui contient la base SQLite et les blobs, ainsi que les éléments de configuration nécessaires à la restauration. Éviter une copie brute de SQLite pendant les écritures : arrêter le serveur le temps d'une copie des fichiers, ou utiliser une méthode de sauvegarde SQLite cohérente. Tester régulièrement la restauration sur un hôte isolé. Conserver les sauvegardes et la clé privée hors du dépôt et du répertoire de releases. MySyncFiles ne remplace pas ces sauvegardes : les écrasements ordinaires n'ont pas d'historique restaurable.
 

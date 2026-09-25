@@ -3,7 +3,7 @@
 COMPOSE_SERVER = docker compose --env-file deploy/.env -f deploy/compose.yaml
 COMPOSE_DOCS = docker compose --env-file deploy/.env.example -f deploy/compose.yaml --profile docs
 
-.PHONY: help check-config install start stop logs docs docs-stop docs-check docs-build
+.PHONY: help check-config install start stop logs pair docs docs-stop docs-check docs-build
 
 help:
 	@printf '%s\n' \
@@ -11,6 +11,7 @@ help:
 		'make start       Démarrer le serveur' \
 		'make stop        Arrêter le serveur sans supprimer les données' \
 		'make logs        Suivre les journaux du serveur' \
+		'make pair        Appairer un client par son code temporaire' \
 		'make docs        Voir la documentation sur http://127.0.0.1:8000' \
 		'make docs-stop   Arrêter la prévisualisation' \
 		'make docs-check  Construire et vérifier la documentation' \
@@ -36,6 +37,9 @@ stop:
 
 logs:
 	$(COMPOSE_SERVER) logs -f server
+
+pair: check-config
+	$(COMPOSE_SERVER) run --rm server device pair --data-dir /data
 
 docs:
 	$(COMPOSE_DOCS) up -d --build docs

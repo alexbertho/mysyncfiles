@@ -331,15 +331,60 @@ impl TestServer {
     async fn start(router: Router) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let router = router.route(
-            "/v1/auth/session",
-            post(|| async {
-                Json(mysyncfiles::auth_protocol::Session {
-                    token: "test-session".into(),
-                    expires_at: mysyncfiles::auth_protocol::now() + 900,
-                })
-            }),
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        common::register_origin(
+            &format!("http://{address}"),
+            hex::encode(signing_key.verifying_key().to_bytes()),
         );
+        let router = router
+            .route(
+                "/v1/auth/session",
+                post(|| async {
+                    Json(mysyncfiles::auth_protocol::Session {
+                        token: "test-session".into(),
+                        expires_at: mysyncfiles::auth_protocol::now() + 900,
+                    })
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let signing_key = signing_key.clone();
+                    async move {
+                        let proof = request
+                            .headers()
+                            .get(mysyncfiles::auth_protocol::PROOF_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_owned();
+                        let response = next.run(request).await;
+                        let (mut parts, body) = response.into_parts();
+                        // The fake origin deliberately signs malformed streaming bodies
+                        // too, so response bounds remain tested after authentication.
+                        let json = parts
+                            .headers
+                            .get("content-type")
+                            .is_some_and(|v| v == "application/json");
+                        let (body, digest_bytes) = if json {
+                            let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap();
+                            (axum::body::Body::from(bytes.clone()), bytes)
+                        } else {
+                            (body, axum::body::Bytes::new())
+                        };
+                        let signed = mysyncfiles::origin_auth::ResponseProof::sign(
+                            &signing_key,
+                            &proof,
+                            parts.status.as_u16(),
+                            Some(&digest_bytes),
+                        )
+                        .unwrap();
+                        parts.headers.insert(
+                            mysyncfiles::origin_auth::RESPONSE_HEADER,
+                            signed.parse().unwrap(),
+                        );
+                        axum::response::Response::from_parts(parts, body)
+                    }
+                },
+            ));
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });

@@ -4,6 +4,7 @@
 /backups/
 /keys/
 *.state.json
+*.state.journal
 *.enrollment.json
 *.key
 *.p12

@@ -17,24 +17,47 @@ use openssl::{
     x509::{X509, X509StoreContext, store::X509StoreBuilder},
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc, time::Duration};
 
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn read_signed_body(body: Body) -> Result<axum::body::Bytes, ApiError> {
-    tokio::time::timeout(
-        REQUEST_BODY_TIMEOUT,
-        to_bytes(body, crate::model::UPLOAD_CHUNK_BYTES as usize),
-    )
-    .await
-    .map_err(|_| ApiError(StatusCode::REQUEST_TIMEOUT, "request body timed out".into()))?
-    .map_err(|_| {
-        ApiError(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "invalid or oversized request body".into(),
-        )
-    })
+    read_body(body, crate::model::UPLOAD_CHUNK_BYTES as usize).await
+}
+
+async fn read_body(body: Body, limit: usize) -> Result<axum::body::Bytes, ApiError> {
+    tokio::time::timeout(REQUEST_BODY_TIMEOUT, to_bytes(body, limit))
+        .await
+        .map_err(|_| ApiError(StatusCode::REQUEST_TIMEOUT, "request body timed out".into()))?
+        .map_err(|_| {
+            ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid or oversized request body".into(),
+            )
+        })
+}
+
+/// Admission must precede JSON extraction, including on failed invitations.
+pub async fn enrollment_middleware(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let _permit = state
+        .enrollment_limit
+        .try_acquire()
+        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "enrollment busy".into()))?;
+    let limit = if request.uri().path() == "/v1/enroll/ready" {
+        128
+    } else {
+        256 * 1024
+    };
+    let (parts, body) = request.into_parts();
+    let bytes = read_body(body, limit).await?;
+    Ok(next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await)
 }
 
 fn check_active_session(
@@ -124,6 +147,77 @@ pub fn invite(state: &ServerState, name: &str) -> Result<String> {
     Ok(token)
 }
 
+/// A human-readable code carries no authority until a local administrator
+/// registers it. The enrollment protocol still requires TPM proof and approval.
+pub fn pairing_code() -> Result<String> {
+    let mut bytes = [0u8; 13];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("random generation: {e}"))?;
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut code = String::with_capacity(23);
+    for (index, bit) in (0..100).step_by(5).enumerate() {
+        if index != 0 && index % 5 == 0 {
+            code.push('-');
+        }
+        let byte = bit / 8;
+        let shift = bit % 8;
+        let value =
+            ((bytes[byte] as u16) << 8) | bytes.get(byte + 1).copied().unwrap_or_default() as u16;
+        let digit = ((value >> (11 - shift)) & 31) as usize;
+        code.push(ALPHABET[digit] as char);
+    }
+    Ok(code)
+}
+
+pub fn normalize_pairing_code(code: &str) -> Result<String> {
+    let value: String = code
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            other => other,
+        })
+        .collect();
+    ensure!(
+        value.len() == 20
+            && value
+                .bytes()
+                .all(|c| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&c)),
+        "pairing code must contain 20 Base32 characters"
+    );
+    Ok(value)
+}
+
+pub fn register_pair(state: &ServerState, name: &str, code: &str) -> Result<String> {
+    let code = normalize_pairing_code(code)?;
+    let hash = hash(&code);
+    {
+        let db = state.db.lock().unwrap();
+        let existing: Option<(String, String, Option<i64>, i64)> = db
+            .query_row(
+                "SELECT e.id,d.name,e.approved_at,e.expires_at FROM device_enrollments e JOIN devices d ON d.id=e.device_id WHERE e.invitation_hash=?1",
+                [&hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        if let Some((id, old_name, approved, expires)) = existing {
+            ensure!(
+                old_name == name && approved.is_none() && expires > now(),
+                "pairing code is already used or expired"
+            );
+            return Ok(id);
+        }
+    }
+    insert_invitation(state, name, &code)
+}
+
+pub fn enrollment_by_id(state: &ServerState, id: &str) -> Result<DeviceEnrollment> {
+    list(state)?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .context("enrollment no longer exists")
+}
+
 pub fn invite_to_file(state: &ServerState, name: &str, path: &Path) -> Result<()> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let token = random_secret()?;
@@ -136,7 +230,7 @@ pub fn invite_to_file(state: &ServerState, name: &str, path: &Path) -> Result<()
         writeln!(file, "{token}")?;
         file.sync_all()?;
         // Publish the invitation only after its private export is durable.
-        insert_invitation(state, name, &token)
+        insert_invitation(state, name, &token).map(|_| ())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(path);
@@ -144,7 +238,7 @@ pub fn invite_to_file(state: &ServerState, name: &str, path: &Path) -> Result<()
     result
 }
 
-fn insert_invitation(state: &ServerState, name: &str, token: &str) -> Result<()> {
+fn insert_invitation(state: &ServerState, name: &str, token: &str) -> Result<String> {
     ensure!(
         !name.trim().is_empty() && name.len() <= 255,
         "invalid device name"
@@ -177,10 +271,45 @@ fn insert_invitation(state: &ServerState, name: &str, token: &str) -> Result<()>
         !occupied,
         "device already enrolled or an invitation is pending"
     );
+    let enrollment_id = uuid::Uuid::new_v4().to_string();
     tx.execute("INSERT INTO device_enrollments(id,device_id,invitation_hash,expires_at) VALUES(?1,?2,?3,?4)",
-        params![uuid::Uuid::new_v4().to_string(),id,hash(token),now()+900])?;
+        params![enrollment_id,id,hash(token),now()+900])?;
     tx.commit()?;
-    Ok(())
+    Ok(enrollment_id)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairReadyRequest {
+    code: String,
+}
+
+pub async fn pair_ready(
+    State(state): State<Arc<ServerState>>,
+    Json(request): Json<PairReadyRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !state.allow_pair_ready() {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "pairing checks are busy".into(),
+        ));
+    }
+    let code = normalize_pairing_code(&request.code)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid pairing code".into()))?;
+    let db = state.db.lock().unwrap();
+    let row: Option<(i64, Option<i64>)> = db
+        .query_row(
+            "SELECT expires_at,approved_at FROM device_enrollments WHERE invitation_hash=?1",
+            [hash(code)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(ApiError::internal)?;
+    Ok(match row {
+        None => StatusCode::ACCEPTED,
+        Some((expires, approved)) if expires <= now() || approved.is_some() => StatusCode::GONE,
+        Some(_) => StatusCode::NO_CONTENT,
+    })
 }
 
 #[derive(Serialize)]
@@ -352,10 +481,6 @@ pub async fn enroll_start(
     State(state): State<Arc<ServerState>>,
     Json(request): Json<EnrollStart>,
 ) -> Result<Json<EnrollChallenge>, ApiError> {
-    let _permit = state
-        .enrollment_limit
-        .try_acquire()
-        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "enrollment busy".into()))?;
     let (roots, id) = {
         let db = state.db.lock().unwrap();
         let roots = setting(&db, "ek_roots")
@@ -550,6 +675,71 @@ pub async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn enrollment_admission_precedes_body_reads_and_releases_on_timeout() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let temp = tempfile::tempdir()?;
+        let state = crate::server::open(temp.path())?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let router = crate::server::router(state.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut held = Vec::new();
+        for route in ["start", "finish", "start", "finish"] {
+            let mut socket = tokio::net::TcpStream::connect(address).await?;
+            socket.write_all(format!("POST /v1/enroll/{route} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n{{").as_bytes()).await?;
+            held.push(socket);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.enrollment_limit.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        for route in ["start", "finish", "ready"] {
+            let mut socket = tokio::net::TcpStream::connect(address).await?;
+            socket.write_all(format!("POST /v1/enroll/{route} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+            let mut response = [0; 256];
+            let n =
+                tokio::time::timeout(Duration::from_secs(2), socket.read(&mut response)).await??;
+            assert!(std::str::from_utf8(&response[..n])?.starts_with("HTTP/1.1 429"));
+        }
+        tokio::time::pause();
+        tokio::time::advance(REQUEST_BODY_TIMEOUT).await;
+        for mut socket in held {
+            let mut response = String::new();
+            socket.read_to_string(&mut response).await?;
+            assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        }
+        tokio::time::resume();
+        assert_eq!(state.enrollment_limit.available_permits(), 4);
+        let http = reqwest::Client::new();
+        for route in ["start", "finish"] {
+            let url = format!("http://{address}/v1/enroll/{route}");
+            assert_eq!(
+                http.post(&url)
+                    .header("content-type", "application/json")
+                    .body("{")
+                    .send()
+                    .await?
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                http.post(&url)
+                    .header("content-type", "application/json")
+                    .body(vec![b' '; 256 * 1024 + 1])
+                    .send()
+                    .await?
+                    .status(),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+        assert_eq!(state.enrollment_limit.available_permits(), 4);
+        task.abort();
+        Ok(())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn signed_body_has_a_deadline_and_a_byte_limit() {

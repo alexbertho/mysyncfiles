@@ -4,6 +4,10 @@
 
 ## Réconciliation et conflits
 
+Le manifeste et les réponses de mutations sont vérifiés avec la clé serveur épinglée, puis les téléchargements sont comparés aux hashes authentifiés. Une signature absente ou invalide arrête la synchronisation avant d'appliquer les métadonnées concernées. Les copies déplacées dont la taille, l'identité, les dates de modification ou de changement varient pendant le hash restent conservées, même si le digest correspond encore à une lecture antérieure.
+
+La surveillance ignore les ouvertures et lectures du scanner ainsi que l'entretien des dossiers `.mysync-staging/` et `.mysync-conflicts/`. Les créations, écritures, suppressions et renommages dans le miroir continuent de déclencher une passe ; déplacer une copie de conflit vers le miroir déclenche également une synchronisation.
+
 Le client compare le manifeste serveur, son état local et le contenu du miroir. Le serveur tranche les révisions ; lors d'une divergence, les données locales écartées restent dans `.mysync-conflicts/`. `.mysync-staging/` sert aux téléchargements temporaires. Ces dossiers restent locaux et ne sont pas synchronisés.
 
 Les opérations sur le miroir refusent les liens symboliques et restent confinées par des descripteurs de répertoire, même si l'arborescence change pendant un transfert. Le client continue par interrogation toutes les 15 secondes si la surveillance native échoue. Les noms non UTF-8, dossiers vides, permissions et attributs étendus ne sont pas synchronisés ; un renommage équivaut à une suppression puis un ajout.
@@ -22,4 +26,4 @@ La configuration et l'état du client résident hors du miroir, dans le réperto
 
 ## Service et mises à jour
 
-Après [l'activation de l'appairage](install-client.md#activer-la-synchronisation), `systemctl --user` pilote le service. Le démon contrôle les mises à jour au démarrage puis toutes les six heures ; une erreur de mise à jour ne bloque pas la synchronisation. Le manifeste signé, la cible, la taille et le SHA-256 sont contrôlés avant le remplacement atomique de `~/.local/bin/mysync`. La publication et l'installation locale sont verrouillées pour éviter une rétrogradation concurrente. Une installation sous `/usr/bin` n'est pas remplacée automatiquement.
+Après [l'activation de l'appairage](install-client.md#activer-la-synchronisation-manuelle), `systemctl --user` pilote le service. Le démon contrôle les mises à jour au démarrage puis toutes les six heures ; une erreur de mise à jour ne bloque pas la synchronisation. Le manifeste signé, la cible, la taille et le SHA-256 sont contrôlés avant le remplacement atomique de `~/.local/bin/mysync`. La publication et l'installation locale sont verrouillées pour éviter une rétrogradation concurrente. Une installation sous `/usr/bin` n'est pas remplacée automatiquement.
