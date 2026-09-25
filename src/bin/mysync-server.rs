@@ -80,6 +80,11 @@ enum DeviceCommand {
         #[arg(long)]
         ek_roots: PathBuf,
     },
+    /// Print the public origin configured by the administrator
+    PublicUrl {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Create a single-use, 15-minute TPM enrollment invitation
     Invite {
         #[arg(long)]
@@ -202,6 +207,12 @@ async fn main() -> Result<()> {
                     &ek_roots,
                 )?;
                 println!("TPM trust configured");
+            }
+            DeviceCommand::PublicUrl { data_dir } => {
+                println!(
+                    "{}",
+                    mysyncfiles::device_auth::public_url(server::open(data_dir)?.as_ref())?
+                );
             }
             DeviceCommand::Invite {
                 data_dir,

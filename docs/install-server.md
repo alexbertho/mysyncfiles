@@ -32,6 +32,8 @@ curl -fsS http://127.0.0.1:8484/v1/health
 
 `make install` valide la configuration Compose, l'existence des dossiers et leurs chemins absolus, puis construit l'image. `make start` refait ces vérifications et lance le serveur, qui initialise SQLite dans le dossier de données. Le point de santé est accessible uniquement sur la boucle locale de l'hôte. Pour consulter les journaux ou arrêter sans effacer les données : `make logs` et `make stop`.
 
+Pour déployer ensuite des modifications du serveur et de la documentation, utiliser `make deploy` après avoir configuré l'origine publique avec `device auth-configure`. La commande exécute les tests avant de reconstruire et de relancer le serveur ; voir le [détail du déploiement](operations.md#publier-la-documentation).
+
 Les commandes directes `docker compose -f deploy/compose.yaml ...` restent disponibles. Ne jamais lancer deux serveurs sur la même base SQLite.
 
 ## Exposer une origine HTTPS

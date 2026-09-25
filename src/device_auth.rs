@@ -106,6 +106,12 @@ fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
         })
         .optional()?)
 }
+
+pub fn public_url(state: &ServerState) -> Result<String> {
+    let db = state.db.lock().unwrap();
+    setting(&db, "public_url")?.context("public URL is not configured; run device auth-configure")
+}
+
 pub fn configure(state: &ServerState, public_url: &str, roots: &Path) -> Result<()> {
     let url = reqwest::Url::parse(public_url)?;
     ensure!(

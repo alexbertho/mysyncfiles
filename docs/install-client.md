@@ -6,7 +6,7 @@ Sauvegarder les fichiers importants avant la première synchronisation. Choisir 
 
 ## Installer le binaire signé
 
-Remplacer le domaine d'exemple par l'origine HTTPS du serveur. Dans un terminal :
+Dans la documentation source, remplacer le domaine d'exemple par l'origine HTTPS du serveur. La documentation publiée par `make docs-build` ou `make deploy` utilise automatiquement l'origine configurée par l'administrateur. Dans un terminal :
 
 ```sh
 curl -fsS --proto '=https' --max-redirs 0 https://sync.example.org/install.sh | sh
