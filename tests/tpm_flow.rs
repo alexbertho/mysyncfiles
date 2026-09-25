@@ -493,9 +493,19 @@ async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
     let pending_config = config.clone();
     let pending_root = root.clone();
     let origin = server.url.clone();
+    let origin_key = server.state.public_key();
     let tcti = simulator.tcti.clone();
     let setup = tokio::spawn(async move {
-        client::setup_with_tcti(&pending_config, origin, pending_root, None, None, tcti).await
+        client::setup_with_tcti(
+            &pending_config,
+            origin,
+            origin_key,
+            pending_root,
+            None,
+            None,
+            tcti,
+        )
+        .await
     });
     let pair_path = config.with_extension("pairing.json");
     let code = tokio::time::timeout(Duration::from_secs(5), async {
@@ -531,6 +541,7 @@ async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
     let resumed = client::setup_with_tcti(
         &config,
         server.url.clone(),
+        server.state.public_key(),
         root.clone(),
         None,
         None,
@@ -543,6 +554,7 @@ async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
     let cleared = client::setup_with_tcti(
         &config,
         server.url.clone(),
+        server.state.public_key(),
         root,
         None,
         None,
@@ -562,8 +574,18 @@ async fn cancelled_pairing_discards_the_local_code() -> Result<()> {
     let root = local.path().join("mirror");
     let pending_config = config.clone();
     let origin = server.url.clone();
+    let origin_key = server.state.public_key();
     let setup = tokio::spawn(async move {
-        client::setup_with_tcti(&pending_config, origin, root, None, None, "unused".into()).await
+        client::setup_with_tcti(
+            &pending_config,
+            origin,
+            origin_key,
+            root,
+            None,
+            None,
+            "unused".into(),
+        )
+        .await
     });
     let pair_path = config.with_extension("pairing.json");
     let code = tokio::time::timeout(Duration::from_secs(5), async {
@@ -903,6 +925,7 @@ async fn tpm_enrollment_request_binding_replay_and_revocation() -> Result<()> {
     let root = local.path().join("mirror");
     std::fs::create_dir(&root)?;
     let config = ClientConfig {
+        server_public_key: server.state.public_key(),
         server: server.url.clone(),
         identity: Some(key.clone()),
         root: root.clone(),
@@ -1078,6 +1101,7 @@ async fn client_enrollment_is_resumable() -> Result<()> {
             let enrolled = client::enroll_with_tcti(
                 &path,
                 server.url.clone(),
+                server.state.public_key(),
                 root.clone(),
                 invitation.clone(),
                 None,
@@ -1141,6 +1165,7 @@ async fn client_enrolls_with_external_ek_certificate() -> Result<()> {
         client::enroll_with_tcti(
             &config,
             server.url.clone(),
+            server.state.public_key(),
             root.clone(),
             invitation.clone(),
             Some(untrusted_path),
@@ -1153,6 +1178,7 @@ async fn client_enrolls_with_external_ek_certificate() -> Result<()> {
     let enrolled = client::enroll_with_tcti(
         &config,
         server.url.clone(),
+        server.state.public_key(),
         root.clone(),
         invitation.clone(),
         Some(cert_path.clone()),
@@ -1164,6 +1190,7 @@ async fn client_enrolls_with_external_ek_certificate() -> Result<()> {
     let repeated = client::enroll_with_tcti(
         &config,
         server.url.clone(),
+        server.state.public_key(),
         root.clone(),
         invitation,
         Some(cert_path),

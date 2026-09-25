@@ -208,11 +208,16 @@ impl TestServer {
         let state = server::open(data)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}", listener.local_addr()?);
+        register_origin(&url, state.public_key());
         let roots = dir.path().join("roots.pem");
         std::fs::write(&roots, ca.pem()?)?;
         device_auth::configure(&state, &url, &roots)?;
         let router = server::router(state.clone());
-        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let task = tokio::spawn(async move {
+            axum::serve(server::api_listener(listener), router)
+                .await
+                .unwrap()
+        });
         Ok(Self {
             state,
             url,
@@ -262,11 +267,28 @@ impl TestServer {
 pub fn config(url: &str, root: &Path, identity: Identity) -> ClientConfig {
     ClientConfig {
         server: url.into(),
+        server_public_key: origins()
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .unwrap_or_default(),
         identity: Some(identity),
         root: root.into(),
         auto_update: false,
         update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
     }
+}
+
+fn origins() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static ORIGINS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    ORIGINS.get_or_init(Default::default)
+}
+
+pub fn register_origin(url: &str, key: String) {
+    origins().lock().unwrap().insert(url.into(), key);
 }
 pub async fn configure_client(
     path: &Path,

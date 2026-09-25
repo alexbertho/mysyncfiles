@@ -22,6 +22,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print the origin public key to convey to clients through a trusted channel
+    ServerKey {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Create the server data directory and database
     Init {
         #[arg(long)]
@@ -131,9 +136,11 @@ async fn pair(data_dir: PathBuf) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("device pair requires an interactive terminal");
     }
+    let state = server::open(data_dir)?;
+    println!("Server public key: {}", state.public_key());
+    println!("Give this key directly to the client before entering its pairing code.");
     let name = prompt_line("Device name: ")?;
     let code = rpassword::prompt_password("Code shown by the client: ")?;
-    let state = server::open(data_dir)?;
     let id = mysyncfiles::device_auth::register_pair(&state, &name, &code)?;
     println!("Waiting for the client's TPM proof (up to 15 minutes)...");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
@@ -172,6 +179,7 @@ async fn pair(data_dir: PathBuf) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::ServerKey { data_dir } => println!("{}", server::open(data_dir)?.public_key()),
         Command::Init { data_dir } => {
             server::open(&data_dir)?;
             println!("server initialized at {}", data_dir.display());

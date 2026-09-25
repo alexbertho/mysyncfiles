@@ -207,6 +207,7 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         configs.push(ClientConfig {
+            server_public_key: String::new(),
             server: format!("http://{}", listener.local_addr()?),
             identity: None,
             root: temp.path().into(),
@@ -277,6 +278,7 @@ async fn update_keeps_installed_client_when_signed_candidate_cannot_run() -> Res
         let installed = temp.path().join("mysync");
         std::fs::write(&installed, "old binary")?;
         let config = ClientConfig {
+            server_public_key: String::new(),
             server: format!("http://{address}"),
             identity: None,
             root: temp.path().into(),
@@ -336,6 +338,7 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
     let installed = temp.path().join("mysync");
     executable(&installed, "0.1.0")?;
     let config = ClientConfig {
+        server_public_key: String::new(),
         server: format!("http://{address}"),
         identity: None,
         root: temp.path().to_path_buf(),
@@ -407,6 +410,7 @@ async fn update_rejects_unsigned_metadata() -> Result<()> {
     let installed = temp.path().join("mysync");
     std::fs::write(&installed, "old binary")?;
     let config = ClientConfig {
+        server_public_key: String::new(),
         server: format!("http://{address}"),
         identity: None,
         root: temp.path().to_path_buf(),

@@ -35,6 +35,7 @@ const UPLOAD_SESSION_SECONDS: i64 = 24 * 60 * 60;
 const MAX_UPLOAD_SESSIONS_PER_DEVICE: i64 = 16;
 
 pub struct ServerState {
+    pub(crate) origin_key: ed25519_dalek::SigningKey,
     data_dir: PathBuf,
     releases_dir: Option<crate::local_fs::Mirror>,
     pub(crate) db: Mutex<Connection>,
@@ -45,6 +46,9 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    pub fn public_key(&self) -> String {
+        hex::encode(self.origin_key.verifying_key().to_bytes())
+    }
     pub(crate) fn allow_pair_ready(&self) -> bool {
         let mut rate = self.pair_ready_rate.lock().unwrap();
         if rate.0.elapsed() >= Duration::from_secs(1) {
@@ -218,6 +222,7 @@ pub fn open_with_releases(
     )?;
     crate::device_auth::initialize(&conn)?;
     Ok(Arc::new(ServerState {
+        origin_key: crate::origin_auth::load_key(&conn)?,
         data_dir,
         releases_dir: releases_dir
             .as_deref()
@@ -1034,20 +1039,42 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::device_auth::middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::origin_auth::middleware,
         ));
-    Router::new()
-        .merge(protected)
-        .route("/v1/health", get(health))
-        .route("/install.sh", get(client_installer))
-        .route("/v1/updates/{target}/{file}", get(client_release))
+    let enrollment = Router::new()
         .route("/v1/enroll/start", post(crate::device_auth::enroll_start))
         .route("/v1/enroll/finish", post(crate::device_auth::enroll_finish))
         .route(
             "/v1/enroll/ready",
             post(crate::device_auth::pair_ready).layer(axum::extract::DefaultBodyLimit::max(128)),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::device_auth::enrollment_middleware,
+        ));
+    Router::new()
+        .merge(protected)
+        .merge(enrollment)
+        .route("/v1/health", get(health))
+        .route("/install.sh", get(client_installer))
+        .route("/v1/updates/{target}/{file}", get(client_release))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
+}
+
+/// Apply the production socket policy to every accepted API connection.
+pub fn api_listener(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = SocketAddr> {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            eprintln!("cannot enable TCP_NODELAY: {error}");
+        }
+    })
 }
 
 pub async fn serve(
@@ -1080,8 +1107,25 @@ pub async fn serve(
             _ = tokio::signal::ctrl_c() => {},
         }
     };
-    axum::serve(listener, router(state))
+    axum::serve(api_listener(listener), router(state))
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    #[tokio::test]
+    async fn accepted_api_sockets_disable_nagle() -> Result<()> {
+        use axum::serve::Listener;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let mut listener = api_listener(listener);
+        let (connection, (socket, _)) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        let _connection = connection?;
+        assert!(socket.nodelay()?);
+        Ok(())
+    }
 }

@@ -44,6 +44,10 @@ Pour un appareil perdu ou compromis, exécuter `device revoke --name NOM --data-
 
 ## Sauvegardes et maintenance
 
+La base privée contient aussi la clé Ed25519 d'authenticité des réponses. `mysync-server server-key --data-dir DOSSIER` affiche sa partie publique, à transmettre aux clients par un canal fiable. Conserver cette clé avec les sauvegardes SQLite ; sa perte ou sa rotation impose de mettre à jour explicitement la clé épinglée de chaque client. La [migration des profils existants](device-auth.md#authenticite-des-reponses-et-migration) ne réinitialise ni les appareils TPM ni les fichiers.
+
+L'état client est publié atomiquement une fois par passe modifiée, avec sérialisation tamponnée et synchronisation du fichier et du dossier parent. Un petit journal privé `config.state.journal` conserve durablement les mutations terminées entre deux publications. Il est rejoué au redémarrage ; ne pas le supprimer lors d'une récupération ou le séparer de `config.state.json` dans une sauvegarde. Une passe sans changement ne réécrit pas l'état.
+
 Sauvegarder de façon cohérente le répertoire de données privé, qui contient la base SQLite et les blobs, ainsi que les éléments de configuration nécessaires à la restauration. Éviter une copie brute de SQLite pendant les écritures : arrêter le serveur le temps d'une copie des fichiers, ou utiliser une méthode de sauvegarde SQLite cohérente. Tester régulièrement la restauration sur un hôte isolé. Conserver les sauvegardes et la clé privée hors du dépôt et du répertoire de releases. MySyncFiles ne remplace pas ces sauvegardes : les écrasements ordinaires n'ont pas d'historique restaurable.
 
 `make logs`, `make stop` et `make start` pilotent le serveur sans supprimer les volumes. Les commandes directes `docker compose -f deploy/compose.yaml ...` restent utilisables. Ne pas démarrer deux serveurs sur la même base.

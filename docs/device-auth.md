@@ -67,6 +67,8 @@ Le serveur accepte uniquement les identités TPM approuvées. Il n'a pas besoin 
 
 ## Appairage et approbation
 
+Avant le code d'appairage, `mysync setup` demande la clé publique du serveur. `make pair` l'affiche dès son lancement. L'administrateur transmet cette clé directement au client par un canal fiable ; une valeur obtenue seulement via le proxy HTTPS ne suffit pas. On peut aussi la fournir avec `--server-public-key CLE_HEX`. La clé épinglée est conservée dans le profil et dans les demandes d'appairage en attente.
+
 Le parcours interactif recommandé est `mysync setup` sur le client et `make pair` sur le serveur. Le client génère un code aléatoire de 100 bits, affiché en quatre groupes de cinq caractères et enregistré dans un fichier privé. `make pair` l'enregistre sous forme de hash dans SQLite avec un nom d'appareil et une durée de 15 minutes. La route publique `/v1/enroll/ready` indique seulement si ce code a été enregistré ; elle ne peut approuver aucun appareil. Le serveur ne vérifie la chaîne EK et ne crée le défi TPM qu'après cet enregistrement local.
 
 Après la preuve TPM, le client et la commande serveur affichent l'empreinte complète de la clé. L'administrateur la compare par un canal fiable et confirme dans le terminal serveur. Le client attend alors l'approbation, effectue une première synchronisation et vérifie les conflits avant l'activation du service. Un code divulgué ou une confirmation d'empreinte faite sans comparaison peut conduire à approuver le mauvais appareil ; le code ne remplace pas la vérification humaine.
@@ -74,7 +76,7 @@ Après la preuve TPM, le client et la commande serveur affichent l'empreinte com
 Le parcours manuel avec invitation reste disponible :
 
 1. L'administrateur crée une invitation avec `device invite --name NOM --output FICHIER`. Elle contient 256 bits aléatoires, n'est stockée que sous forme de hash en base et expire après 15 minutes. Utiliser un nom distinct par appareil et transmettre le fichier de manière confidentielle.
-2. Le client lance `mysync enroll --server URL --dir DOSSIER --invitation-stdin < FICHIER`. Il conserve sa clé et le défi dans `config.enrollment.json` privé, hors du miroir. Une nouvelle tentative reprend la même clé au lieu de consommer l'invitation avec une nouvelle identité.
+2. Le client lance `mysync enroll --server URL --server-public-key CLE_HEX --dir DOSSIER --invitation-stdin < FICHIER`. Il conserve sa clé et le défi dans `config.enrollment.json` privé, hors du miroir. Une nouvelle tentative reprend la même clé au lieu de consommer l'invitation avec une nouvelle identité.
 3. Le serveur vérifie le certificat EK, réserve l'invitation à une seule clé puis vérifie la réponse d'activation. L'appareil reste sans accès aux fichiers pendant l'attente d'approbation (24 heures maximum).
 4. L'administrateur exécute `device pending`, compare l'empreinte affichée avec celle du client par un canal fiable, puis `device approve --id ID --fingerprint EMPREINTE`. Une empreinte fournie uniquement par le serveur ne suffit pas pour cette comparaison.
 5. Le client exécute `mysync enroll-activate`. Il vérifie l'accès approuvé, remplace sa configuration privée, efface le fichier d'appairage en attente et synchronise. Les étapes d'[installation et d'activation du service](install-client.md#activer-la-synchronisation-manuelle) dépendent du mode d'installation du client.
@@ -100,6 +102,29 @@ Une requête signée à `POST /v1/auth/session` obtient une session de 15 minute
 Le serveur accepte un horodatage compris entre 60 secondes dans le passé et 30 secondes dans le futur. Il conserve chaque nonce utilisé 120 secondes dans une table SQLite partagée, y compris entre redémarrages. Les horloges doivent être synchronisées. Les transferts utilisent des blocs d'au plus 8 Mio; les modifications de corps, query, méthode, jeton ou destination invalident la preuve. Les attributs de clé et le statut de révocation sont vérifiés pour les requêtes authentifiées.
 
 La signature, la session, la fraîcheur et le rejeu sont contrôlés avant de lire le corps. Le nonce est alors réservé, même si le transfert échoue : une nouvelle tentative exige une nouvelle preuve. Au plus huit requêtes signées sont admises simultanément, avec 30 secondes pour lire chaque corps. Le SHA-256 du corps et la validité de la session/appairage sont revérifiés avant le traitement. Les tests couvrent aussi les corps inachevés, la saturation de cette limite et une révocation pendant un transfert.
+
+## Authenticité des réponses et migration
+
+Le serveur signe les réponses de l'API authentifiée avec une clé Ed25519 propre à cette installation. Cette clé est générée une seule fois dans la base privée, indépendamment de la clé de signature des releases. La réponse porte `x-mysync-origin` : une enveloppe JSON en base64url contenant le SHA-256 de la preuve TPM de la requête, le statut HTTP, le SHA-256 du corps JSON et la signature. Le message signé est `mysync/origin-response/v1\n` suivi du tableau JSON `[request_sha256,status,body_sha256]`. Le nonce TPM frais lie chaque réponse à une seule requête, même après redémarrage du client. Le client vérifie la signature et le corps avant d'utiliser les révisions, suppressions, listes ou résultats de mutations. Les téléchargements restent diffusés en flux : leur statut est signé avec un digest de corps `null`, puis leurs octets sont vérifiés contre la taille et le SHA-256 du manifeste authentifié.
+
+Le proxy doit conserver `x-mysync-origin` et le corps exact des réponses, sans cache ni transformations. Il peut lire les fichiers et interrompre les échanges, mais il ne peut pas fournir une révision ou des octets acceptés comme provenant du serveur. Un serveur compromis reste hors de cette garantie. L'installation initiale du logiciel et la transmission de la clé publique exigent toujours un canal fiable.
+
+Pour un profil existant, mettre à jour le serveur avant le client, puis obtenir la clé depuis le terminal administrateur :
+
+```sh
+docker compose -f deploy/compose.yaml run --rm server server-key --data-dir /data
+```
+
+Après transmission indépendante de cette clé, l'enregistrer explicitement côté client :
+
+```sh
+mysync trust-server --public-key CLE_HEX
+mysync sync
+```
+
+Cette opération conserve l'identité TPM, le miroir et son état. Un client sans clé épinglée, face à un ancien serveur sans signatures ou avec une clé différente refuse de synchroniser ; aucune découverte automatique de confiance n'est effectuée. Sauvegarder la base privée avec la clé serveur. Une restauration avec une nouvelle clé exige une nouvelle transmission fiable et `trust-server` sur chaque client. Les appairages encore en attente créés avec l'ancien protocole doivent être annulés puis repris ; les profils déjà activés ne nécessitent pas un nouvel appairage TPM.
+
+Les routes publiques d'appairage partagent quatre admissions, acquises avant toute lecture du corps. Chaque corps dispose de 30 secondes au total et d'au plus 256 Kio (`ready` : 128 octets). La saturation répond immédiatement avec HTTP 429 ; le délai dépassé avec HTTP 408. La limite couvre aussi les invitations invalides et les erreurs JSON. Les contrôles de connexion et de débit au proxy restent utiles pour borner les connexions avant leur arrivée à l'application.
 
 ## Tests et validation
 

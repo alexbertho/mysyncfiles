@@ -23,11 +23,13 @@ Configurer ensuite le proxy HTTPS et les autorités EK constructeur, puis [publi
 curl -fsS --proto '=https' --max-redirs 0 https://sync.example.org/install.sh | sh
 ```
 
-L'installateur affiche un code. Sur le serveur, l'administrateur lance :
+L'installateur demande la clé publique du serveur, puis affiche un code. Sur le serveur, l'administrateur lance :
 
 ```sh
 make pair
 ```
+
+Cette commande affiche la clé publique à transmettre directement au client par un canal fiable. Le client l'enregistre pour vérifier les réponses du serveur, même derrière un proxy TLS. Pour un profil existant, suivre la [migration de la clé serveur](docs/device-auth.md#authenticite-des-reponses-et-migration).
 
 Après comparaison de l'empreinte TPM, le client effectue une première synchronisation et démarre le service s'il n'y a pas de conflit. Le [guide client](docs/install-client.md) couvre la reprise, le cas du certificat EK externe et le parcours manuel. Une première exécution du script suppose que l'origine HTTPS sert le bon script ; la signature protège le binaire téléchargé, pas un script distant compromis.
 

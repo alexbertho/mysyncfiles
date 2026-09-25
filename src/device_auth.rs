@@ -23,18 +23,41 @@ use std::{path::Path, sync::Arc, time::Duration};
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn read_signed_body(body: Body) -> Result<axum::body::Bytes, ApiError> {
-    tokio::time::timeout(
-        REQUEST_BODY_TIMEOUT,
-        to_bytes(body, crate::model::UPLOAD_CHUNK_BYTES as usize),
-    )
-    .await
-    .map_err(|_| ApiError(StatusCode::REQUEST_TIMEOUT, "request body timed out".into()))?
-    .map_err(|_| {
-        ApiError(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "invalid or oversized request body".into(),
-        )
-    })
+    read_body(body, crate::model::UPLOAD_CHUNK_BYTES as usize).await
+}
+
+async fn read_body(body: Body, limit: usize) -> Result<axum::body::Bytes, ApiError> {
+    tokio::time::timeout(REQUEST_BODY_TIMEOUT, to_bytes(body, limit))
+        .await
+        .map_err(|_| ApiError(StatusCode::REQUEST_TIMEOUT, "request body timed out".into()))?
+        .map_err(|_| {
+            ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid or oversized request body".into(),
+            )
+        })
+}
+
+/// Admission must precede JSON extraction, including on failed invitations.
+pub async fn enrollment_middleware(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let _permit = state
+        .enrollment_limit
+        .try_acquire()
+        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "enrollment busy".into()))?;
+    let limit = if request.uri().path() == "/v1/enroll/ready" {
+        128
+    } else {
+        256 * 1024
+    };
+    let (parts, body) = request.into_parts();
+    let bytes = read_body(body, limit).await?;
+    Ok(next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await)
 }
 
 fn check_active_session(
@@ -458,10 +481,6 @@ pub async fn enroll_start(
     State(state): State<Arc<ServerState>>,
     Json(request): Json<EnrollStart>,
 ) -> Result<Json<EnrollChallenge>, ApiError> {
-    let _permit = state
-        .enrollment_limit
-        .try_acquire()
-        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "enrollment busy".into()))?;
     let (roots, id) = {
         let db = state.db.lock().unwrap();
         let roots = setting(&db, "ek_roots")
@@ -656,6 +675,71 @@ pub async fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn enrollment_admission_precedes_body_reads_and_releases_on_timeout() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let temp = tempfile::tempdir()?;
+        let state = crate::server::open(temp.path())?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let router = crate::server::router(state.clone());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut held = Vec::new();
+        for route in ["start", "finish", "start", "finish"] {
+            let mut socket = tokio::net::TcpStream::connect(address).await?;
+            socket.write_all(format!("POST /v1/enroll/{route} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n{{").as_bytes()).await?;
+            held.push(socket);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.enrollment_limit.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        for route in ["start", "finish", "ready"] {
+            let mut socket = tokio::net::TcpStream::connect(address).await?;
+            socket.write_all(format!("POST /v1/enroll/{route} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+            let mut response = [0; 256];
+            let n =
+                tokio::time::timeout(Duration::from_secs(2), socket.read(&mut response)).await??;
+            assert!(std::str::from_utf8(&response[..n])?.starts_with("HTTP/1.1 429"));
+        }
+        tokio::time::pause();
+        tokio::time::advance(REQUEST_BODY_TIMEOUT).await;
+        for mut socket in held {
+            let mut response = String::new();
+            socket.read_to_string(&mut response).await?;
+            assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        }
+        tokio::time::resume();
+        assert_eq!(state.enrollment_limit.available_permits(), 4);
+        let http = reqwest::Client::new();
+        for route in ["start", "finish"] {
+            let url = format!("http://{address}/v1/enroll/{route}");
+            assert_eq!(
+                http.post(&url)
+                    .header("content-type", "application/json")
+                    .body("{")
+                    .send()
+                    .await?
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                http.post(&url)
+                    .header("content-type", "application/json")
+                    .body(vec![b' '; 256 * 1024 + 1])
+                    .send()
+                    .await?
+                    .status(),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+        assert_eq!(state.enrollment_limit.available_permits(), 4);
+        task.abort();
+        Ok(())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn signed_body_has_a_deadline_and_a_byte_limit() {

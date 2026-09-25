@@ -270,12 +270,13 @@ if [ "$setup_available" = 1 ] && [ -t 1 ] && [ -r /dev/tty ]; then
     IFS= read -r mirror_dir </dev/tty || die 'Cannot read the folder from the terminal.'
     [ -n "$mirror_dir" ] || mirror_dir="$HOME/Sync"
     set -- setup --server "$SERVER_URL" --dir "$mirror_dir"
+    [ -z "${MYSYNC_SERVER_PUBLIC_KEY:-}" ] || set -- "$@" --server-public-key "$MYSYNC_SERVER_PUBLIC_KEY"
     [ -z "${MYSYNC_EK_CERT:-}" ] || set -- "$@" --ek-cert "$MYSYNC_EK_CERT"
     if [ -n "${MYSYNC_EK_CHAIN:-}" ]; then
         [ -r "$MYSYNC_EK_CHAIN" ] || die 'MYSYNC_EK_CHAIN is not readable by this user.'
         set -- "$@" --ek-chain "$MYSYNC_EK_CHAIN"
     fi
-    "$destination" "$@" || die 'Pairing or first synchronization is incomplete. Rerun this installer or mysync setup to resume; the service remains stopped.'
+    "$destination" "$@" </dev/tty || die 'Pairing or first synchronization is incomplete. Rerun this installer or mysync setup to resume; the service remains stopped.'
     if [ "$service_ready" = 1 ]; then
         systemctl --user daemon-reload || die 'Synchronization succeeded, but the user service manager could not reload.'
         systemctl --user enable --now mysync.service || die 'Synchronization succeeded, but the user service could not start. Check systemctl --user status mysync.service.'

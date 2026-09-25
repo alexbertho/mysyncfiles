@@ -24,6 +24,9 @@ use crate::model::{
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub server: String,
+    /// Obtained from the administrator over an independently trusted channel.
+    #[serde(default)]
+    pub server_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<crate::tpm::Identity>,
     pub root: PathBuf,
@@ -46,7 +49,7 @@ struct LocalState {
     entries: BTreeMap<String, Seen>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct Seen {
     revision: i64,
     sha256: Option<String>,
@@ -74,6 +77,22 @@ pub struct Api {
     base: String,
     signer: crate::tpm::RequestSigner,
     session: tokio::sync::Mutex<Option<crate::auth_protocol::Session>>,
+    origin_key: ed25519_dalek::VerifyingKey,
+}
+
+struct AuthenticatedResponse {
+    response: reqwest::Response,
+    proof: crate::origin_auth::ResponseProof,
+}
+
+impl AuthenticatedResponse {
+    fn status(&self) -> StatusCode {
+        self.response.status()
+    }
+    fn error_for_status(self) -> Result<Self> {
+        self.response.error_for_status_ref()?;
+        Ok(self)
+    }
 }
 
 const CONTROL_JSON_LIMIT: usize = 64 * 1024;
@@ -82,6 +101,25 @@ const JSON_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Never let a server choose our allocation size, including for chunked bodies.
 async fn bounded_json<T: DeserializeOwned>(response: reqwest::Response, limit: usize) -> Result<T> {
+    json_body(response, limit, None).await
+}
+
+async fn authenticated_json<T: DeserializeOwned>(
+    response: AuthenticatedResponse,
+    limit: usize,
+) -> Result<T> {
+    let digest = response
+        .proof
+        .body_sha256
+        .context("unsigned JSON body from origin")?;
+    json_body(response.response, limit, Some(&digest)).await
+}
+
+async fn json_body<T: DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+    digest: Option<&str>,
+) -> Result<T> {
     let response = response.error_for_status()?;
     if response
         .content_length()
@@ -98,6 +136,11 @@ async fn bounded_json<T: DeserializeOwned>(response: reqwest::Response, limit: u
                 bail!("API JSON response exceeds {limit} bytes");
             }
             bytes.extend_from_slice(&chunk);
+        }
+        if let Some(expected) = digest {
+            if crate::auth_protocol::hash(&bytes) != expected {
+                bail!("origin response body integrity check failed");
+            }
         }
         Ok(serde_json::from_slice(&bytes)?)
     })
@@ -157,12 +200,14 @@ fn private_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&temp)?;
-        serde_json::to_writer_pretty(&mut file, value)?;
+        let file = options.open(&temp)?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, value)?;
         use std::io::Write;
-        file.flush()?;
-        file.sync_all()?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
         std::fs::rename(&temp, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
@@ -181,22 +226,134 @@ pub fn load_config(path: &Path) -> Result<ClientConfig> {
     Ok(config)
 }
 
+/// Explicit local trust change; never fetch a trust anchor through the proxy.
+pub async fn trust_server(config_path: &Path, public_key: &str) -> Result<()> {
+    let key = crate::origin_auth::public_key(public_key)?;
+    let _lock = acquire_lock(config_path).await?;
+    let mut config = load_config(config_path)?;
+    config.server_public_key = hex::encode(key.to_bytes());
+    private_write_json(config_path, &config)
+}
+
 fn load_state(config_path: &Path) -> Result<LocalState> {
     let path = state_path(config_path);
-    match std::fs::read(&path) {
-        Ok(contents) => serde_json::from_slice(&contents).context("reading local sync state"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LocalState::default()),
-        Err(error) => Err(error.into()),
+    let mut state: LocalState = match std::fs::read(&path) {
+        Ok(contents) => serde_json::from_slice(&contents).context("reading local sync state")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LocalState::default(),
+        Err(error) => return Err(error.into()),
+    };
+    match std::fs::File::open(journal_path(config_path)) {
+        Ok(file) => {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(file);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                reader.read_until(b'\n', &mut line)?;
+                // A torn final append has not been acknowledged as durable.
+                if line.last() != Some(&b'\n') {
+                    break;
+                }
+                let (path, seen): (String, Seen) =
+                    serde_json::from_slice(&line).context("reading local sync journal")?;
+                state.entries.insert(path, seen);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
+    Ok(state)
 }
 
 fn save_state(config_path: &Path, state: &LocalState) -> Result<()> {
     private_write_json(&state_path(config_path), state)
 }
 
+fn journal_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("state.journal")
+}
+
+// One full snapshot per pass. Only mutations need small, individually durable
+// records: cancellation must not forget an acknowledged upload or replacement.
+struct Checkpoint<'a> {
+    config_path: &'a Path,
+    state: LocalState,
+    dirty: bool,
+    journal: Option<std::fs::File>,
+}
+
+impl<'a> Checkpoint<'a> {
+    fn open(config_path: &'a Path) -> Result<Self> {
+        let mut checkpoint = Self {
+            config_path,
+            state: load_state(config_path)?,
+            dirty: journal_path(config_path).exists(),
+            journal: None,
+        };
+        // Compact recovered records (and discard any incomplete tail) before
+        // appending again. Replaying after snapshot publication is idempotent.
+        checkpoint.finish()?;
+        Ok(checkpoint)
+    }
+
+    fn record(&mut self, path: String, seen: Seen, mutation: bool) -> Result<()> {
+        if self.state.entries.get(&path) == Some(&seen) {
+            return Ok(());
+        }
+        if mutation {
+            use std::{io::Write, os::unix::fs::OpenOptionsExt};
+            if self.journal.is_none() {
+                let path = journal_path(self.config_path);
+                let file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&path)?;
+                file.sync_all()?;
+                sync_parent(&path)?;
+                self.journal = Some(file);
+            }
+            let mut bytes = serde_json::to_vec(&(&path, &seen))?;
+            bytes.push(b'\n');
+            let file = self.journal.as_mut().unwrap();
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        self.state.entries.insert(path, seen);
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.dirty {
+            save_state(self.config_path, &self.state)?;
+            self.journal = None;
+            let path = journal_path(self.config_path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => sync_parent(&path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.dirty = false;
+        }
+        Ok(())
+    }
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 impl Api {
     pub fn new(config: &ClientConfig) -> Result<Self> {
         validate_server_url(&config.server)?;
+        let origin_key = crate::origin_auth::public_key(&config.server_public_key)
+            .context("missing or invalid pinned server key; obtain it from the administrator and run mysync trust-server --public-key KEY")?;
         if config.identity.is_none() {
             bail!("TPM identity is missing; enroll this device first");
         }
@@ -207,6 +364,7 @@ impl Api {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
+            origin_key,
             http,
             base: config.server.trim_end_matches('/').to_owned(),
             signer: crate::tpm::RequestSigner::new(
@@ -243,6 +401,28 @@ impl Api {
         Ok(())
     }
 
+    async fn execute_signed(&self, request: reqwest::Request) -> Result<AuthenticatedResponse> {
+        let request_proof = request
+            .headers()
+            .get(crate::auth_protocol::PROOF_HEADER)
+            .context("missing outgoing request proof")?
+            .to_str()?
+            .to_owned();
+        let response = self.http.execute(request).await?;
+        let encoded = response
+            .headers()
+            .get(crate::origin_auth::RESPONSE_HEADER)
+            .context("origin response signature missing")?
+            .to_str()?;
+        let proof = crate::origin_auth::ResponseProof::verify(
+            encoded,
+            &self.origin_key,
+            &request_proof,
+            response.status().as_u16(),
+        )?;
+        Ok(AuthenticatedResponse { response, proof })
+    }
+
     pub async fn authenticate(&self) -> Result<()> {
         self.session_token().await?;
         Ok(())
@@ -251,11 +431,12 @@ impl Api {
     pub async fn is_approved(&self) -> Result<bool> {
         let mut request = self.http.post(self.url("/v1/auth/session")).build()?;
         self.sign_request(&mut request, "").await?;
-        let response = self.http.execute(request).await?;
+        let response = self.execute_signed(request).await?;
         if response.status() == StatusCode::FORBIDDEN {
             return Ok(false);
         }
-        let _: crate::auth_protocol::Session = bounded_json(response, CONTROL_JSON_LIMIT).await?;
+        let _: crate::auth_protocol::Session =
+            authenticated_json(response, CONTROL_JSON_LIMIT).await?;
         Ok(true)
     }
 
@@ -269,24 +450,24 @@ impl Api {
         }
         let mut request = self.http.post(self.url("/v1/auth/session")).build()?;
         self.sign_request(&mut request, "").await?;
-        let response = self.http.execute(request).await?;
+        let response = self.execute_signed(request).await?;
         if response.status() == StatusCode::FORBIDDEN {
             bail!("device awaits administrator approval or was revoked");
         }
         let created: crate::auth_protocol::Session =
-            bounded_json(response, CONTROL_JSON_LIMIT).await?;
+            authenticated_json(response, CONTROL_JSON_LIMIT).await?;
         let token = created.token.clone();
         *session = Some(created);
         Ok(token)
     }
 
-    async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    async fn send(&self, builder: reqwest::RequestBuilder) -> Result<AuthenticatedResponse> {
         let request = builder.build()?;
         for attempt in 0..2 {
             let token = self.session_token().await?;
             let mut request = request.try_clone().context("request cannot be retried")?;
             self.sign_request(&mut request, &token).await?;
-            let response = self.http.execute(request).await?;
+            let response = self.execute_signed(request).await?;
             if response.status() != StatusCode::UNAUTHORIZED || attempt == 1 {
                 return Ok(response);
             }
@@ -300,7 +481,7 @@ impl Api {
     }
 
     pub async fn manifest(&self) -> Result<Manifest> {
-        bounded_json(
+        authenticated_json(
             self.send(self.http.get(self.url("/v1/manifest"))).await?,
             LIST_JSON_LIMIT,
         )
@@ -339,7 +520,9 @@ impl Api {
         if response.status() == StatusCode::CONFLICT {
             return Ok(None);
         }
-        Ok(Some(bounded_json(response, CONTROL_JSON_LIMIT).await?))
+        Ok(Some(
+            authenticated_json(response, CONTROL_JSON_LIMIT).await?,
+        ))
     }
 
     async fn upload_chunked(
@@ -361,7 +544,7 @@ impl Api {
         if response.status() == StatusCode::CONFLICT {
             return Ok(None);
         }
-        let mut progress: UploadProgress = bounded_json(response, CONTROL_JSON_LIMIT).await?;
+        let mut progress: UploadProgress = authenticated_json(response, CONTROL_JSON_LIMIT).await?;
         if progress.offset < 0 || progress.offset > size {
             bail!("server returned an invalid upload offset");
         }
@@ -384,7 +567,7 @@ impl Api {
                 )
                 .await?
                 .error_for_status()?;
-            let next: UploadProgress = bounded_json(response, CONTROL_JSON_LIMIT).await?;
+            let next: UploadProgress = authenticated_json(response, CONTROL_JSON_LIMIT).await?;
             if next.id != progress.id || next.offset != progress.offset + length as i64 {
                 bail!("server returned an invalid upload offset");
             }
@@ -399,7 +582,9 @@ impl Api {
         if response.status() == StatusCode::CONFLICT {
             return Ok(None);
         }
-        Ok(Some(bounded_json(response, CONTROL_JSON_LIMIT).await?))
+        Ok(Some(
+            authenticated_json(response, CONTROL_JSON_LIMIT).await?,
+        ))
     }
 
     async fn delete(&self, path: &str, base: i64) -> Result<Option<Entry>> {
@@ -413,7 +598,9 @@ impl Api {
         if response.status() == StatusCode::CONFLICT {
             return Ok(None);
         }
-        Ok(Some(bounded_json(response, CONTROL_JSON_LIMIT).await?))
+        Ok(Some(
+            authenticated_json(response, CONTROL_JSON_LIMIT).await?,
+        ))
     }
 
     async fn download(&self, entry: &Entry, file: std::fs::File) -> Result<bool> {
@@ -433,7 +620,7 @@ impl Api {
         if response.status() == StatusCode::CONFLICT {
             return Ok(false);
         }
-        let response = response.error_for_status()?;
+        let response = response.error_for_status()?.response;
         if response
             .content_length()
             .is_some_and(|size| size != expected_size)
@@ -463,7 +650,7 @@ impl Api {
     }
 
     pub async fn trash(&self) -> Result<Vec<TrashItem>> {
-        bounded_json(
+        authenticated_json(
             self.send(self.http.get(self.url("/v1/trash"))).await?,
             LIST_JSON_LIMIT,
         )
@@ -471,7 +658,7 @@ impl Api {
     }
 
     pub async fn restore(&self, id: i64) -> Result<Entry> {
-        bounded_json(
+        authenticated_json(
             self.send(
                 self.http
                     .post(self.url("/v1/trash/restore"))
@@ -510,6 +697,7 @@ struct PendingEnrollment {
 #[derive(Deserialize, Serialize)]
 struct PairingRequest {
     server: String,
+    server_public_key: String,
     root: PathBuf,
     code: String,
 }
@@ -598,6 +786,7 @@ async fn wait_for_approval(
 pub async fn setup(
     config_path: &Path,
     server: String,
+    server_public_key: String,
     root: PathBuf,
     ek_cert: Option<PathBuf>,
     ek_chain: Option<PathBuf>,
@@ -605,6 +794,7 @@ pub async fn setup(
     setup_with_tcti(
         config_path,
         server,
+        server_public_key,
         root,
         ek_cert,
         ek_chain,
@@ -616,12 +806,15 @@ pub async fn setup(
 pub async fn setup_with_tcti(
     config_path: &Path,
     server: String,
+    server_public_key: String,
     root: PathBuf,
     ek_cert: Option<PathBuf>,
     ek_chain: Option<PathBuf>,
     tcti: String,
 ) -> Result<SetupOutcome> {
     validate_server_url(&server)?;
+    let server_public_key =
+        hex::encode(crate::origin_auth::public_key(&server_public_key)?.to_bytes());
     std::fs::create_dir_all(&root)?;
     let root = root.canonicalize()?;
     let parent = config_path
@@ -635,8 +828,11 @@ pub async fn setup_with_tcti(
     let pair_path = config_path.with_extension("pairing.json");
     if config_path.exists() {
         let config = load_config(config_path)?;
-        if config.server != server || config.root != root {
-            bail!("existing client profile has a different server or folder");
+        if config.server != server
+            || config.root != root
+            || config.server_public_key != server_public_key
+        {
+            bail!("existing client profile has a different server, key or folder");
         }
         let report = sync(config_path).await?;
         let conflicts = status(config_path).await?.conflicts;
@@ -651,7 +847,10 @@ pub async fn setup_with_tcti(
     }
     let request: PairingRequest = if pair_path.exists() {
         let request: PairingRequest = serde_json::from_slice(&std::fs::read(&pair_path)?)?;
-        if request.server != server || request.root != root {
+        if request.server != server
+            || request.root != root
+            || request.server_public_key != server_public_key
+        {
             bail!("another pairing is already pending");
         }
         request
@@ -661,6 +860,7 @@ pub async fn setup_with_tcti(
         }
         let request = PairingRequest {
             server: server.clone(),
+            server_public_key: server_public_key.clone(),
             root: root.clone(),
             code: crate::device_auth::pairing_code()?,
         };
@@ -689,6 +889,7 @@ pub async fn setup_with_tcti(
         let enrolled = enroll_with_tcti(
             config_path,
             server,
+            server_public_key,
             root,
             crate::device_auth::normalize_pairing_code(&request.code)?,
             ek_cert,
@@ -713,6 +914,7 @@ pub async fn setup_with_tcti(
 pub async fn enroll(
     config_path: &Path,
     server: String,
+    server_public_key: String,
     root: PathBuf,
     invitation: String,
     ek_cert: Option<PathBuf>,
@@ -721,6 +923,7 @@ pub async fn enroll(
     enroll_with_tcti(
         config_path,
         server,
+        server_public_key,
         root,
         invitation,
         ek_cert,
@@ -735,6 +938,7 @@ pub async fn enroll(
 pub async fn enroll_with_tcti(
     config_path: &Path,
     server: String,
+    server_public_key: String,
     root: PathBuf,
     invitation: String,
     ek_cert: Option<PathBuf>,
@@ -742,6 +946,9 @@ pub async fn enroll_with_tcti(
     tcti: String,
 ) -> Result<crate::auth_protocol::Enrollment> {
     use crate::auth_protocol::{EnrollChallenge, EnrollFinish, EnrollStart, Enrollment};
+    validate_server_url(&server)?;
+    let server_public_key =
+        hex::encode(crate::origin_auth::public_key(&server_public_key)?.to_bytes());
     let parent = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -763,7 +970,10 @@ pub async fn enroll_with_tcti(
         .transpose()?;
     let mut pending: PendingEnrollment = if pending_path.exists() {
         let value: PendingEnrollment = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
-        if value.config.root != root || value.config.server != server {
+        if value.config.root != root
+            || value.config.server != server
+            || value.config.server_public_key != server_public_key
+        {
             bail!("another enrollment is already pending");
         }
         value
@@ -783,6 +993,7 @@ pub async fn enroll_with_tcti(
         .await??;
         let config = ClientConfig {
             server,
+            server_public_key,
             identity: Some(identity),
             root,
             auto_update: true,
@@ -867,17 +1078,48 @@ pub async fn activate_enrollment(config_path: &Path) -> Result<SyncReport> {
 }
 
 fn hash_file(mut file: std::fs::File) -> Result<String> {
-    use std::io::Read;
+    hash_reader(&mut file, || {})
+}
+
+fn hash_reader(mut reader: impl std::io::Read, mut after_read: impl FnMut()) -> Result<String> {
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let size = file.read(&mut buffer)?;
+        let size = reader.read(&mut buffer)?;
         if size == 0 {
             break;
         }
         hash.update(&buffer[..size]);
+        after_read();
     }
     Ok(hex::encode(hash.finalize()))
+}
+
+fn file_stamp(file: &std::fs::File) -> Result<(u64, u64, u64, u64, i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata()?;
+    Ok((
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.nlink(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    ))
+}
+
+fn unchanged_capture(
+    file: &mut std::fs::File,
+    observed: Option<&String>,
+    after_read: impl FnMut(),
+) -> Result<bool> {
+    let before = file_stamp(file)?;
+    let digest = hash_reader(&mut *file, after_read)?;
+    // A digest can match even when an already-read region was edited. ctime
+    // also catches writers that restore mtime; atime is deliberately ignored.
+    Ok(before == file_stamp(file)? && Some(&digest) == observed)
 }
 
 fn scan(mirror: &Mirror) -> Result<BTreeMap<String, String>> {
@@ -976,10 +1218,10 @@ async fn apply_remote(
         }
         // Hash the displaced file after publication, not the stale pre-download
         // pathname. Edits made while downloading or just before capture survive.
-        let captured = backup
+        let mut captured = backup
             .read()?
             .ok_or_else(|| anyhow!("recovery copy disappeared"))?;
-        let changed = Some(hash_file(captured)?) != observed.cloned();
+        let changed = !unchanged_capture(&mut captured, observed, || {})?;
         if preserve_local || changed {
             eprintln!("conflict copy saved: {display}");
             report.conflicts += 1;
@@ -1003,7 +1245,8 @@ async fn sync_pass(
         .map(|entry| (entry.path.clone(), entry))
         .collect();
     let local = scan(mirror)?;
-    let mut state = load_state(config_path)?;
+    let mut checkpoint = Checkpoint::open(config_path)?;
+    let state = &checkpoint.state;
     let paths: BTreeSet<String> = remote
         .keys()
         .chain(local.keys())
@@ -1059,87 +1302,92 @@ async fn sync_pass(
             path.clone(),
         )
     });
-    let mut rescan = false;
-    for path in paths {
-        let server = remote.get(&path);
-        let observed = local.get(&path);
-        let prior = state.entries.get(&path);
-        if server.is_none() && prior.is_some() {
-            bail!("server lost metadata for {path}; refusing to guess how to reconcile it");
-        }
-        let remote_revision = server.map(|entry| entry.revision).unwrap_or(0);
-        let remote_sha = server.and_then(|entry| entry.sha256.as_ref());
-        if remote_revision > 0 && observed == remote_sha {
-            state.entries.insert(
-                path.clone(),
-                Seen {
-                    revision: remote_revision,
-                    sha256: remote_sha.cloned(),
-                },
-            );
-            save_state(config_path, &state)?;
-            continue;
-        }
-        let replaced_by_ancestor = replaced_paths.contains(&path);
-        if replaced_by_ancestor && server.is_none() {
-            continue; // The incoming ancestor captures this untracked subtree.
-        }
-        let remote_changed = replaced_by_ancestor
-            || prior
-                .map(|seen| seen.revision != remote_revision)
-                .unwrap_or(remote_revision != 0);
-        let local_changed = prior
-            .map(|seen| seen.sha256.as_ref() != observed)
-            .unwrap_or(observed.is_some());
-        if remote_changed {
-            let entry = server.expect("remote revision implies entry");
-            let preserve = local_changed && observed.is_some();
-            if !apply_remote(api, mirror, entry, observed, preserve, report).await? {
-                return Ok(true);
+    let result = async {
+        let mut rescan = false;
+        for path in paths {
+            let server = remote.get(&path);
+            let observed = local.get(&path);
+            let prior = checkpoint.state.entries.get(&path);
+            if server.is_none() && prior.is_some() {
+                bail!("server lost metadata for {path}; refusing to guess how to reconcile it");
             }
-            state.entries.insert(
-                path.clone(),
-                Seen {
-                    revision: entry.revision,
-                    sha256: entry.sha256.clone(),
-                },
-            );
-            save_state(config_path, &state)?;
-            if !entry.deleted && local.keys().any(|p| p.starts_with(&format!("{path}/"))) {
-                rescan = true; // Check all displaced directories on a fresh pass.
+            let remote_revision = server.map(|entry| entry.revision).unwrap_or(0);
+            let remote_sha = server.and_then(|entry| entry.sha256.as_ref());
+            if remote_revision > 0 && observed == remote_sha {
+                checkpoint.record(
+                    path.clone(),
+                    Seen {
+                        revision: remote_revision,
+                        sha256: remote_sha.cloned(),
+                    },
+                    false,
+                )?;
+                continue;
             }
-        } else if local_changed {
-            let base = prior.map(|seen| seen.revision).unwrap_or(0);
-            let result = if observed.is_some() {
-                let Some(file) = mirror.read(&path)? else {
+            let replaced_by_ancestor = replaced_paths.contains(&path);
+            if replaced_by_ancestor && server.is_none() {
+                continue; // The incoming ancestor captures this untracked subtree.
+            }
+            let remote_changed = replaced_by_ancestor
+                || prior
+                    .map(|seen| seen.revision != remote_revision)
+                    .unwrap_or(remote_revision != 0);
+            let local_changed = prior
+                .map(|seen| seen.sha256.as_ref() != observed)
+                .unwrap_or(observed.is_some());
+            if remote_changed {
+                let entry = server.expect("remote revision implies entry");
+                let preserve = local_changed && observed.is_some();
+                if !apply_remote(api, mirror, entry, observed, preserve, report).await? {
+                    return Ok(true);
+                }
+                checkpoint.record(
+                    path.clone(),
+                    Seen {
+                        revision: entry.revision,
+                        sha256: entry.sha256.clone(),
+                    },
+                    true,
+                )?;
+                if !entry.deleted && local.keys().any(|p| p.starts_with(&format!("{path}/"))) {
+                    rescan = true; // Check all displaced directories on a fresh pass.
+                }
+            } else if local_changed {
+                let base = prior.map(|seen| seen.revision).unwrap_or(0);
+                let result = if observed.is_some() {
+                    let Some(file) = mirror.read(&path)? else {
+                        return Ok(true);
+                    };
+                    api.upload(&path, base, file, observed.expect("local file exists"))
+                        .await?
+                } else if server.is_some_and(|entry| !entry.deleted) {
+                    api.delete(&path, base).await?
+                } else {
+                    continue;
+                };
+                let Some(entry) = result else {
                     return Ok(true);
                 };
-                api.upload(&path, base, file, observed.expect("local file exists"))
-                    .await?
-            } else if server.is_some_and(|entry| !entry.deleted) {
-                api.delete(&path, base).await?
-            } else {
-                continue;
-            };
-            let Some(entry) = result else {
-                return Ok(true);
-            };
-            if entry.deleted {
-                report.deleted_remote += 1;
-            } else {
-                report.uploaded += 1;
+                if entry.deleted {
+                    report.deleted_remote += 1;
+                } else {
+                    report.uploaded += 1;
+                }
+                checkpoint.record(
+                    path.clone(),
+                    Seen {
+                        revision: entry.revision,
+                        sha256: entry.sha256.clone(),
+                    },
+                    true,
+                )?;
             }
-            state.entries.insert(
-                path.clone(),
-                Seen {
-                    revision: entry.revision,
-                    sha256: entry.sha256.clone(),
-                },
-            );
-            save_state(config_path, &state)?;
         }
+        Ok(rescan)
     }
-    Ok(rescan)
+    .await;
+    checkpoint.finish()?;
+    result
 }
 
 async fn sync_passes(config_path: &Path, root: &Path, api: &Api) -> Result<SyncReport> {
@@ -1206,8 +1454,9 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
     let api = Api::new(&config)?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let watch_root = config.root.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if event.is_ok() {
+        if event.is_ok_and(|event| watch_event_requires_sync(&watch_root, &event)) {
             let _ = tx.try_send(());
         }
     })?;
@@ -1253,9 +1502,160 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
     }
 }
 
+fn watch_event_requires_sync(root: &Path, event: &notify::Event) -> bool {
+    if event.need_rescan() {
+        return true;
+    }
+    use notify::{
+        EventKind,
+        event::{AccessKind, AccessMode},
+    };
+    if matches!(event.kind, EventKind::Access(kind) if kind != AccessKind::Close(AccessMode::Write))
+    {
+        return false;
+    }
+    event.need_rescan()
+        || event.paths.is_empty()
+        || event.paths.iter().any(|path| {
+            path.strip_prefix(root).map_or(true, |relative| {
+                !relative.components().any(|part| {
+                    matches!(
+                        part.as_os_str().to_str(),
+                        Some(".mysync-staging" | ".mysync-conflicts")
+                    )
+                })
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_hash_detects_writes_to_an_already_read_region() -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recovery");
+        std::fs::write(&path, vec![0u8; 3 * 64 * 1024])?;
+        let writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+        let observed = hash_file(std::fs::File::open(&path)?)?;
+        let mut captured = std::fs::File::open(&path)?;
+        let mut wrote = false;
+        assert!(!unchanged_capture(&mut captured, Some(&observed), || {
+            if !wrote {
+                writer.write_all_at(b"late edit", 0).unwrap();
+                wrote = true;
+            }
+        })?);
+        assert!(wrote);
+        let new_hash = hash_file(std::fs::File::open(&path)?)?;
+        assert_ne!(new_hash, observed);
+        assert!(unchanged_capture(
+            &mut std::fs::File::open(&path)?,
+            Some(&new_hash),
+            || {}
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_recovers_mutations_and_torn_tail_without_rewriting_noop_state() -> Result<()> {
+        use std::{io::Write, os::unix::fs::MetadataExt};
+        let temp = tempfile::tempdir()?;
+        let config = temp.path().join("config.json");
+        let seen = Seen {
+            revision: 1,
+            sha256: Some("hash".into()),
+        };
+        let mut checkpoint = Checkpoint::open(&config)?;
+        checkpoint.record("a".into(), seen.clone(), true)?;
+        checkpoint.record(
+            "b".into(),
+            Seen {
+                revision: 2,
+                sha256: None,
+            },
+            true,
+        )?;
+        drop(checkpoint); // Simulated cancellation before snapshot publication.
+        assert!(!state_path(&config).exists());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal_path(&config))?
+            .write_all(b"[\"torn")?;
+        assert_eq!(load_state(&config)?.entries.len(), 2);
+        let mut recovered = Checkpoint::open(&config)?;
+        assert!(!journal_path(&config).exists());
+        let original = std::fs::metadata(state_path(&config))?;
+        recovered.record("a".into(), seen, false)?;
+        recovered.finish()?;
+        let after = std::fs::metadata(state_path(&config))?;
+        assert_eq!(
+            (original.ino(), original.mtime(), original.mtime_nsec()),
+            (after.ino(), after.mtime(), after.mtime_nsec())
+        );
+        // Crash after publication but before removal of the journal is safe too.
+        recovered.record(
+            "c".into(),
+            Seen {
+                revision: 3,
+                sha256: None,
+            },
+            true,
+        )?;
+        save_state(&config, &recovered.state)?;
+        drop(recovered);
+        assert_eq!(Checkpoint::open(&config)?.state.entries.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn watcher_keeps_user_mutations_and_filters_reads_and_housekeeping() {
+        use notify::{
+            Event, EventKind,
+            event::{AccessKind, AccessMode, CreateKind, Flag, ModifyKind, RenameMode},
+        };
+        let root = Path::new("/mirror");
+        for kind in [
+            AccessKind::Read,
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Close(AccessMode::Read),
+        ] {
+            assert!(!watch_event_requires_sync(
+                root,
+                &Event::new(EventKind::Access(kind)).add_path(root.join("file"))
+            ));
+        }
+        for kind in [
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Create(CreateKind::File),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        ] {
+            assert!(watch_event_requires_sync(
+                root,
+                &Event::new(kind).add_path(root.join("file"))
+            ));
+            for path in [
+                ".mysync-staging",
+                ".mysync-staging/file",
+                ".mysync-conflicts/file",
+            ] {
+                assert!(!watch_event_requires_sync(
+                    root,
+                    &Event::new(kind).add_path(root.join(path))
+                ));
+            }
+        }
+        let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(root.join(".mysync-conflicts/file"))
+            .add_path(root.join("restored"));
+        assert!(watch_event_requires_sync(root, &rename));
+        assert!(watch_event_requires_sync(
+            root,
+            &Event::new(EventKind::Other).set_flag(Flag::Rescan)
+        ));
+    }
 
     #[tokio::test]
     async fn json_body_deadline_does_not_wait_for_eof() -> Result<()> {

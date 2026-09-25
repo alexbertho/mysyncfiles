@@ -26,6 +26,8 @@ L'installateur transmet le même certificat à `mysync setup`. Pour des intermé
 
 ## Appairer et approuver un appareil
 
+Le client demande d'abord la clé publique du serveur. `make pair` l'affiche sur le terminal administrateur : la transmettre directement par un canal fiable et la saisir sur le client. Cette clé protège les fichiers contre la falsification des réponses par un proxy TLS. Pour éviter la saisie, utiliser `mysync setup --server-public-key CLE_HEX ...` ou transmettre `MYSYNC_SERVER_PUBLIC_KEY=CLE_HEX` à l'installateur. Pour les profils déjà activés, suivre la [migration](device-auth.md#authenticite-des-reponses-et-migration).
+
 Le client affiche un code à usage unique, puis attend. Sur l'hôte serveur, depuis le dépôt et avec `deploy/.env` configuré :
 
 ```sh
@@ -58,7 +60,7 @@ Sur le client, après réception du fichier d'invitation :
 
 ```sh
 ~/.local/bin/mysync enroll --server https://sync.example.org \
-  --dir "$HOME/Sync" --invitation-stdin < /chemin/prive/invitation
+  --server-public-key CLE_HEX --dir "$HOME/Sync" --invitation-stdin < /chemin/prive/invitation
 ```
 
 Ajouter `--ek-cert /chemin/prive/ek.der` si le certificat n'est pas stocké dans le TPM, et `--ek-chain` si des intermédiaires constructeur vérifiés sont nécessaires. Le client affiche un identifiant et une empreinte. L'administrateur compare l'empreinte reçue **directement du client** à celle affichée par le serveur, par un canal fiable :

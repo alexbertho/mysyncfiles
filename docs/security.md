@@ -10,6 +10,8 @@ Le serveur arbitre les révisions ; le client conserve dans `.mysync-conflicts/`
 
 ## Distribution et exploitation
 
+Les réponses de l'API sont signées par une clé serveur Ed25519 épinglée lors de l'installation et liée à chaque requête fraîche. Les tailles et hashes de fichiers sont ainsi authentifiés indépendamment du proxy TLS ; les téléchargements doivent correspondre à ces métadonnées. La clé publique est transmise directement par l'administrateur. Voir le [protocole et la migration des profils existants](device-auth.md#authenticite-des-reponses-et-migration).
+
 L'installateur et les mises à jour vérifient le manifeste signé et le hash du binaire. La première récupération du script d'installation exige néanmoins une origine HTTPS de confiance : la signature ne couvre pas un script distant compromis. Garder la clé privée de signature hors du serveur et du répertoire de releases. Les codes d'appairage, invitations manuelles, configurations clientes et données SQLite restent privés.
 
 Le proxy HTTPS n'est pas une autorité de confiance pour les fichiers ; il doit transmettre les requêtes sans modification ni cache des routes authentifiées. Le serveur borne les corps, réponses et transferts, mais ne dispose pas de quota global. Les listes trop volumineuses peuvent faire échouer une synchronisation ; aucun audit indépendant n'a encore été réalisé. Le [suivi de la revue de sécurité](security-review-followup.md) détaille les protections et les limites restantes.

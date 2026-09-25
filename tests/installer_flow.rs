@@ -37,7 +37,7 @@ impl InstallerFixture {
         executable(
             &binary,
             &format!(
-                "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'mysync 0.3.0';;\n  doctor) if [ \"${{MYSYNC_TEST_REQUIRE_EK_CERT:-}}\" = 1 ] && [ \"$2\" != --ek-cert ]; then echo 'EK cert missing' >&2; exit 1; fi; {};;\n  setup) printf '%s\\n' \"$*\" > \"$MYSYNC_TEST_SETUP_CALLED\"; exit \"${{MYSYNC_TEST_SETUP_EXIT:-0}}\";;\n  *) exit 1;;\nesac\n",
+                "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'mysync 0.3.0';;\n  doctor) if [ \"${{MYSYNC_TEST_REQUIRE_EK_CERT:-}}\" = 1 ] && [ \"$2\" != --ek-cert ]; then echo 'EK cert missing' >&2; exit 1; fi; {};;\n  setup) test -t 0 || exit 23; printf '%s\\n' \"$*\" > \"$MYSYNC_TEST_SETUP_CALLED\"; exit \"${{MYSYNC_TEST_SETUP_EXIT:-0}}\";;\n  *) exit 1;;\nesac\n",
                 if doctor_ok {
                     "echo 'TPM 2.0 is ready.'"
                 } else {
@@ -143,6 +143,7 @@ printf 200
             .env("MYSYNC_TEST_HTTP_STATUS", "200")
             .env("MYSYNC_TEST_SETUP_CALLED", self.root.join("setup-called"))
             .env("MYSYNC_TEST_SETUP_EXIT", setup_exit)
+            .env("MYSYNC_SERVER_PUBLIC_KEY", "test-origin-public-key")
             .env("MYSYNC_TEST_SYSTEMCTL_STATUS", "0")
             .env(
                 "MYSYNC_TEST_SYSTEMCTL_CALLED",
@@ -214,6 +215,7 @@ fn interactive_installer_starts_service_only_after_setup_succeeds() -> Result<()
     let setup = fs::read_to_string(success.root.join("setup-called"))?;
     assert!(setup.contains("setup --server https://sync.example.test"));
     assert!(setup.contains("--dir"));
+    assert!(setup.contains("--server-public-key test-origin-public-key"));
     assert!(success.root.join("systemctl-called").exists());
 
     let failed = InstallerFixture::new(true)?;
