@@ -74,6 +74,35 @@ offer_packages() {
     esac
 }
 
+if [ -e /dev/tpmrm0 ] && { [ ! -r /dev/tpmrm0 ] || [ ! -w /dev/tpmrm0 ]; }; then
+    device_group=$(stat -c %G /dev/tpmrm0 2>/dev/null || true)
+    device_mode=$(stat -c %A /dev/tpmrm0 2>/dev/null || true)
+    case "$device_group:$device_mode" in
+        tss:????rw*)
+            case " $(id -nG) " in
+                *' tss '*) die 'Cannot access /dev/tpmrm0 despite active tss group membership; check device permissions and ACLs.' ;;
+            esac
+            username=$(id -un)
+            case " $(id -nG "$username") " in
+                *' tss '*) die 'The tss group is already assigned; sign out and back in (or reboot), then rerun this installer.' ;;
+            esac
+            command -v sudo >/dev/null 2>&1 || die "Cannot access /dev/tpmrm0. Ask an administrator to run: usermod -aG tss $username; then sign out and back in."
+            [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] || die "Cannot access /dev/tpmrm0. Run sudo usermod -aG tss $username, sign out and back in, then retry."
+            printf 'Add %s to the tss group with sudo? [y/N] ' "$username" >/dev/tty
+            answer=
+            IFS= read -r answer </dev/tty || true
+            case "$answer" in
+                y|Y|yes|YES)
+                    sudo usermod -aG tss "$username" || die 'Could not update the tss group membership.'
+                    die 'Added the tss group. Sign out and back in (or reboot), then rerun this installer.'
+                    ;;
+                *) die "TPM access is required. Run sudo usermod -aG tss $username, sign out and back in, then retry." ;;
+            esac
+            ;;
+        *) die 'Cannot read and write /dev/tpmrm0; check its permissions and your active groups.' ;;
+    esac
+fi
+
 missing=
 for tool in python3 openssl; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
@@ -196,14 +225,15 @@ if ! reported=$("$tmp/mysync" --version 2>"$tmp/probe-error"); then
     fi
 fi
 [ "$reported" = "mysync $version" ] || die 'Signed client reports a different version.'
+"$tmp/mysync" setup --help >/dev/null 2>&1 || die 'The signed client release lacks the setup command; ask the administrator to publish a newer signed client.'
 ok 'Binary integrity and compatibility verified.'
 
 step 4 'Checking TPM 2.0 and EK certificate'
 if [ -n "${MYSYNC_EK_CERT:-}" ]; then
     [ -r "$MYSYNC_EK_CERT" ] || die 'MYSYNC_EK_CERT is not readable by this user.'
-    "$tmp/mysync" doctor --ek-cert "$MYSYNC_EK_CERT" || die 'TPM preflight failed; the supplied EK certificate must match this TPM.'
+    "$tmp/mysync" doctor --ek-cert "$MYSYNC_EK_CERT" || die 'TPM preflight failed; check the diagnostic above for TPM access or an EK certificate mismatch.'
 else
-    "$tmp/mysync" doctor || die 'TPM preflight failed; if the EK certificate is absent from TPM NV, obtain its DER certificate from the manufacturer and retry with MYSYNC_EK_CERT=/path/to/ek.der.'
+    "$tmp/mysync" doctor || die 'TPM preflight failed; check the diagnostic above. If the EK certificate is absent from TPM NV, supply its manufacturer DER certificate with MYSYNC_EK_CERT=/actual/path/ek.der.'
 fi
 
 step 5 'Installing client and background service'
@@ -223,16 +253,50 @@ if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode 
 PY
 done
 destination="$destination_dir/mysync"
-setup_available=0
 if [ -L "$destination" ]; then
     die "Refusing symbolic-link client binary: $destination"
 fi
 if [ -e "$destination" ]; then
     [ -f "$destination" ] && [ -x "$destination" ] || die "Existing client is not a regular executable: $destination"
-    warn "An existing client was left untouched: $destination"
-    say 'Use mysync update for signed upgrades; this bootstrap installer never downgrades a client.'
-    if cmp -s "$tmp/mysync" "$destination"; then
-        setup_available=1
+    if ! cmp -s "$tmp/mysync" "$destination"; then
+        existing_version=$("$destination" --version 2>/dev/null || true)
+        version_relation=$(python3 - "$existing_version" "$version" <<'PY'
+import re, sys
+
+installed = re.fullmatch(r'mysync ([0-9]+)\.([0-9]+)\.([0-9]+)', sys.argv[1])
+signed = re.fullmatch(r'([0-9]+)\.([0-9]+)\.([0-9]+)', sys.argv[2])
+if installed is None or signed is None:
+    print('unknown')
+else:
+    old = tuple(map(int, installed.groups()))
+    new = tuple(map(int, signed.groups()))
+    print('newer' if old > new else 'replaceable')
+PY
+)
+        case "$version_relation" in
+            newer) die "The installed client is newer than signed release $version; refusing to downgrade it." ;;
+            replaceable) ;;
+            *) die 'Cannot compare the installed client version with the signed release; leave the existing client untouched.' ;;
+        esac
+        [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] || die "The installed client differs from signed release $version. Back up $destination manually, move it aside, then rerun this installer in a terminal."
+        printf 'Back up the existing client and install signed MySyncFiles %s? [y/N] ' "$version" >/dev/tty
+        answer=
+        IFS= read -r answer </dev/tty || true
+        case "$answer" in
+            y|Y|yes|YES) ;;
+            *) die 'The existing client was left untouched.' ;;
+        esac
+        staged="$destination_dir/.mysync-install-$$"
+        [ ! -e "$staged" ] && [ ! -L "$staged" ] || die 'Temporary installation path already exists.'
+        install -m 755 "$tmp/mysync" "$staged" || die 'Cannot stage the signed client.'
+        backup_dir=$(mktemp -d "$destination.backup.XXXXXXXX") || die 'Cannot create a private backup directory.'
+        ln "$destination" "$backup_dir/mysync" || die 'Cannot preserve the existing client; nothing was replaced.'
+        mv -f -T -- "$staged" "$destination" || die 'Cannot replace the existing client; its backup was retained.'
+        staged=
+        ok "Installed signed client at $destination"
+        say "Previous client retained at $backup_dir/mysync"
+    else
+        ok "Signed client is already installed at $destination"
     fi
 else
     staged="$destination_dir/.mysync-install-$$"
@@ -242,7 +306,6 @@ else
     rm -f -- "$staged"
     staged=
     ok "Installed $destination"
-    setup_available=1
 fi
 
 cat > "$tmp/mysync.service" <<'MYSYNC_UNIT'
@@ -263,7 +326,7 @@ else
     ok 'Installed systemd user service (not started yet).'
 fi
 say
-if [ "$setup_available" = 1 ] && [ -t 1 ] && [ -r /dev/tty ]; then
+if [ -t 1 ] && [ -r /dev/tty ]; then
     step 6 'Pairing this client with the server'
     printf 'Folder to synchronize [%s/Sync]: ' "$HOME" >/dev/tty
     mirror_dir=
@@ -287,8 +350,5 @@ if [ "$setup_available" = 1 ] && [ -t 1 ] && [ -r /dev/tty ]; then
     say 'For startup without login: sudo loginctl enable-linger "$(id -un)"'
 else
     say "Next: run $destination setup --server $SERVER_URL --dir \"\$HOME/Sync\" in a terminal."
-    if [ "$setup_available" = 0 ]; then
-        say 'Update the existing client with mysync update before using the new setup command.'
-    fi
     say 'The user service remains stopped until setup succeeds.'
 fi

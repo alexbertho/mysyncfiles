@@ -22,13 +22,13 @@ Pour installer un client construit depuis les sources, exécuter `./deploy/insta
 
 ## Publier un client signé
 
-Le serveur distribue `/install.sh` et les routes publiques `/v1/updates/<cible>/latest.json`, `latest.sig` et `mysync-<version>-<cible>`. Le script est intégré à l'image serveur avec sa clé publique de release ; il vérifie la signature et le SHA-256 du binaire avant de l'exécuter. Il n'écrase pas une installation existante, qui utilise `mysync update`.
+Le serveur distribue `/install.sh` et les routes publiques `/v1/updates/<cible>/latest.json`, `latest.sig` et `mysync-<version>-<cible>`. Le script est intégré à l'image serveur avec sa clé publique de release ; il vérifie la signature et le SHA-256 du binaire et la présence de `mysync setup` avant de l'exécuter. Si un binaire déjà installé diffère de la release signée, l'installateur demande confirmation avant de conserver une copie et de le remplacer ; il refuse une version installée plus récente. `mysync update` reste disponible pour les profils clients déjà configurés.
 
 La publication est une opération administrateur distincte du build serveur, de la CI et du démarrage. Elle doit être effectuée avec la clé privée correspondant à la clé publique intégrée au client **et** au serveur :
 
 ```sh
 mysync-release publish --secret-key /chemin/prive/cle-signature \
-  --binary target/release/mysync --version 0.3.2 \
+  --binary target/release/mysync --version VERSION \
   --target linux-x86_64 --output-dir /srv/mysyncfiles-releases
 ```
 
