@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::{client::ClientConfig, release};
+use crate::release;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -75,13 +75,16 @@ fn installed_executable() -> Result<PathBuf> {
     Ok(executable)
 }
 
-async fn fetch_small(http: &Client, url: &str, limit: usize) -> Result<Vec<u8>> {
+async fn fetch_small(http: &Client, url: &str, limit: usize) -> Result<Option<Vec<u8>>> {
     let response = http
         .get(url)
         .timeout(Duration::from_secs(20))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let response = response.error_for_status()?;
     if response
         .content_length()
         .is_some_and(|size| size > limit as u64)
@@ -97,33 +100,45 @@ async fn fetch_small(http: &Client, url: &str, limit: usize) -> Result<Vec<u8>> 
         }
         bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
-pub async fn check_and_install(config: &ClientConfig) -> Result<UpdateOutcome> {
+pub async fn check_and_install(server: &str, public_key: &str) -> Result<UpdateOutcome> {
     let executable = installed_executable()?;
-    check_and_install_at(config, &executable, env!("CARGO_PKG_VERSION")).await
+    check_and_install_at(server, public_key, &executable, env!("CARGO_PKG_VERSION")).await
 }
 
 pub async fn check_and_install_at(
-    config: &ClientConfig,
+    server: &str,
+    public_key: &str,
     executable: &Path,
     current_version: &str,
 ) -> Result<UpdateOutcome> {
-    crate::client::validate_server_url(&config.server)?;
+    crate::auth_protocol::validate_server_url(server)?;
     let target = release::current_target().ok_or_else(|| anyhow!("unsupported client platform"))?;
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let base = format!(
-        "{}/v1/updates/{target}",
-        config.server.trim_end_matches('/')
-    );
-    let manifest_bytes = fetch_small(&http, &format!("{base}/latest.json"), 16 * 1024).await?;
-    let signature_bytes = fetch_small(&http, &format!("{base}/latest.sig"), 256).await?;
-    let signature = std::str::from_utf8(&signature_bytes)?;
-    let manifest = release::verify_manifest(&manifest_bytes, signature, &config.update_public_key)?;
+    let base = format!("{}/v1/updates/{target}", server.trim_end_matches('/'));
+    let manifest = if let Some(bytes) = fetch_small(
+        &http,
+        &format!("{base}/latest.signed.json"),
+        release::MAX_ENVELOPE_BYTES,
+    )
+    .await?
+    {
+        release::verify_envelope(&bytes, public_key)?
+    } else {
+        // Only absence permits v1 fallback; invalid signatures never do.
+        let bytes = fetch_small(&http, &format!("{base}/latest.json"), 16 * 1024)
+            .await?
+            .context("release manifest missing")?;
+        let signature = fetch_small(&http, &format!("{base}/latest.sig"), 256)
+            .await?
+            .context("release signature missing")?;
+        release::verify_manifest(&bytes, std::str::from_utf8(&signature)?, public_key)?
+    };
     if manifest.target != target {
         bail!("release target does not match this client");
     }

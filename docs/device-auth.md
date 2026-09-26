@@ -32,7 +32,7 @@ L'installateur distribué par le serveur effectue aussi un contrôle local avec 
 
 Les hiérarchies TPM utilisées doivent être accessibles avec leur autorisation vide par défaut; les mots de passe de hiérarchie personnalisés ne sont pas pris en charge. Ne pas effacer un TPM pour contourner cette limitation : il peut contenir d'autres clés, notamment celles utilisées pour déverrouiller des disques.
 
-Si les certificats intermédiaires EK ne sont pas présents dans le certificat stocké en NV ou fourni en DER, les fournir depuis une source constructeur vérifiée avec `mysync enroll --ek-chain /chemin/intermediaires.pem ...`. Le client n'effectue aucun téléchargement AIA implicite et le serveur n'utilise pas le magasin CA web du système.
+Pendant `mysync setup`, le client lit automatiquement les intermédiaires EK Intel PTT éventuellement présents dans les index TPM contigus de `0x01c00100` à `0x01c001ff`. Un certificat peut être réparti sur deux index et l'ordre des certificats n'est pas imposé. Si cette chaîne pointe vers d'autres certificats Intel, le client les récupère uniquement sur `https://tsci.intel.com/content/OnDieCA/certs/`, sans redirection et avec une taille bornée. Ces téléchargements contactent Intel et ne donnent aucune autorité aux certificats reçus : le serveur vérifie encore la chaîne complète contre ses racines EK explicitement configurées. Le serveur n'utilise pas le magasin CA web du système. Si le TPM ne fournit pas le premier index, aucun téléchargement AIA automatique n'a lieu. Pour les autres chaînes incomplètes, fournir les intermédiaires constructeur vérifiés avec `--ek-chain /chemin/intermediaires.pem` ; cette option remplace la lecture automatique des index.
 
 ### Certificat EK absent du TPM
 

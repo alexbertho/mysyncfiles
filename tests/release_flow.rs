@@ -15,8 +15,38 @@ use std::{
 };
 
 fn executable(path: &Path, version: &str) -> Result<()> {
-    std::fs::write(path, format!("#!/bin/sh\nprintf 'mysync {version}\\n'\n"))?;
+    std::fs::write(
+        path,
+        format!(
+            "#!/bin/sh\ncase \"$1:$2\" in\n  --version:) printf 'mysync {version}\\n';;\n  setup:--help) exit 0;;\n  *) exit 1;;\nesac\n"
+        ),
+    )?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[test]
+fn publishing_rejects_a_client_without_setup() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let signing_key = temp.path().join("signing.key");
+    release::generate_key(&signing_key)?;
+    let binary = temp.path().join("source-mysync");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\ncase \"$1\" in --version) echo 'mysync 0.3.3';; *) exit 2;; esac\n",
+    )?;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
+    let releases = temp.path().join("releases");
+    let error = release::publish(
+        &signing_key,
+        &binary,
+        "0.3.3",
+        release::current_target().unwrap(),
+        &releases,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("setup command"), "{error}");
+    assert!(!releases.exists());
     Ok(())
 }
 
@@ -220,12 +250,23 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
     }
     let newer = async {
         tokio::time::timeout(Duration::from_secs(10), started.notified()).await?;
-        let result = update::check_and_install_at(&configs[1], &installed, "0.1.0").await;
+        let result = update::check_and_install_at(
+            &configs[1].server,
+            &configs[1].update_public_key,
+            &installed,
+            "0.1.0",
+        )
+        .await;
         resume.notify_one();
         result
     };
     let (old, new) = tokio::join!(
-        update::check_and_install_at(&configs[0], &installed, "0.1.0"),
+        update::check_and_install_at(
+            &configs[0].server,
+            &configs[0].update_public_key,
+            &installed,
+            "0.1.0"
+        ),
         newer
     );
     assert_eq!(new?, UpdateOutcome::Installed("0.3.0".into()));
@@ -233,7 +274,13 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
     assert!(std::fs::read_to_string(&installed)?.contains("0.3.0"));
     // Also cover a stale daemon that starts its check after the newer install.
     assert_eq!(
-        update::check_and_install_at(&configs[0], &installed, "0.1.0").await?,
+        update::check_and_install_at(
+            &configs[0].server,
+            &configs[0].update_public_key,
+            &installed,
+            "0.1.0"
+        )
+        .await?,
         UpdateOutcome::Current
     );
     for task in tasks {
@@ -256,7 +303,7 @@ async fn update_keeps_installed_client_when_signed_candidate_cannot_run() -> Res
         std::fs::write(
             &binary,
             format!(
-                "#!/bin/sh\ncase \"$0\" in\n*/source-mysync) printf 'mysync {version}\\n';;\n*) {incompatible};;\nesac\n"
+                "#!/bin/sh\ncase \"$0:$1:$2\" in\n*/source-mysync:--version:) printf 'mysync {version}\\n';;\n*/source-mysync:setup:--help) exit 0;;\n*) {incompatible};;\nesac\n"
             ),
         )?;
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
@@ -286,9 +333,14 @@ async fn update_keeps_installed_client_when_signed_candidate_cannot_run() -> Res
             update_public_key: public_key,
         };
         assert!(
-            update::check_and_install_at(&config, &installed, "0.1.0")
-                .await
-                .is_err()
+            update::check_and_install_at(
+                &config.server,
+                &config.update_public_key,
+                &installed,
+                "0.1.0"
+            )
+            .await
+            .is_err()
         );
         assert_eq!(std::fs::read(&installed)?, b"old binary");
         assert!(!std::fs::read_dir(temp.path())?.any(|e| {
@@ -309,15 +361,7 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
     let public_key = release::generate_key(&signing_key)?;
     let binary = temp.path().join("source-mysync");
     let version = env!("CARGO_PKG_VERSION");
-    std::fs::write(
-        &binary,
-        format!("#!/bin/sh\nprintf 'mysync {version}\\n'\n"),
-    )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
-    }
+    executable(&binary, version)?;
     let target = release::current_target().unwrap();
     let releases = temp.path().join("releases");
     let manifest = release::publish(&signing_key, &binary, version, target, &releases)?;
@@ -357,19 +401,36 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
     fs2::FileExt::lock_exclusive(&lock)?;
     let previous = std::fs::read(&installed)?;
     assert!(
-        update::check_and_install_at(&config, &installed, "0.1.0")
-            .await
-            .is_err()
+        update::check_and_install_at(
+            &config.server,
+            &config.update_public_key,
+            &installed,
+            "0.1.0"
+        )
+        .await
+        .is_err()
     );
     assert_eq!(std::fs::read(&installed)?, previous);
     fs2::FileExt::unlock(&lock)?;
     assert_eq!(
-        update::check_and_install_at(&config, &installed, "0.1.0").await?,
+        update::check_and_install_at(
+            &config.server,
+            &config.update_public_key,
+            &installed,
+            "0.1.0"
+        )
+        .await?,
         UpdateOutcome::Installed(version.into())
     );
     assert_eq!(std::fs::read(&installed)?, std::fs::read(&binary)?);
     assert_eq!(
-        update::check_and_install_at(&config, &installed, version).await?,
+        update::check_and_install_at(
+            &config.server,
+            &config.update_public_key,
+            &installed,
+            version
+        )
+        .await?,
         UpdateOutcome::Current
     );
     task.abort();
@@ -383,20 +444,38 @@ async fn update_rejects_unsigned_metadata() -> Result<()> {
     let public_key = release::generate_key(&signing_key)?;
     let binary = temp.path().join("source-mysync");
     let version = env!("CARGO_PKG_VERSION");
-    std::fs::write(
-        &binary,
-        format!("#!/bin/sh\nprintf 'mysync {version}\\n'\n"),
-    )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
-    }
+    executable(&binary, version)?;
     let target = release::current_target().unwrap();
     let releases = temp.path().join("releases");
     release::publish(&signing_key, &binary, version, target, &releases)?;
+    let envelope_path = releases.join(target).join("latest.signed.json");
+    let mut invalid_envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&envelope_path)?)?;
+    invalid_envelope["signature"] = serde_json::Value::String("00".repeat(64));
+    std::fs::write(&envelope_path, serde_json::to_vec(&invalid_envelope)?)?;
     let signature_path = releases.join(target).join("latest.sig");
     let valid_signature = std::fs::read(&signature_path)?;
+    let state = server::open_with_releases(temp.path().join("data"), Some(releases.clone()))?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        axum::serve(listener, server::router(state)).await.unwrap();
+    });
+    let installed = temp.path().join("mysync");
+    std::fs::write(&installed, "old binary")?;
+    let server_url = format!("http://{address}");
+    assert!(
+        update::check_and_install_at(&server_url, &public_key, &installed, "0.1.0")
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&installed)?, b"old binary");
+    task.abort();
+
+    // Legacy fallback is accepted only after the envelope is absent.
+    std::fs::remove_file(&envelope_path)?;
+    // Exercise the legacy fallback explicitly; a present envelope has priority
+    // and must not be bypassed by a damaged legacy signature.
     std::fs::write(&signature_path, "bad signature\n")?;
     let artifact_path = releases
         .join(target)
@@ -418,9 +497,14 @@ async fn update_rejects_unsigned_metadata() -> Result<()> {
         update_public_key: public_key,
     };
     assert!(
-        update::check_and_install_at(&config, &installed, "0.1.0")
-            .await
-            .is_err()
+        update::check_and_install_at(
+            &config.server,
+            &config.update_public_key,
+            &installed,
+            "0.1.0"
+        )
+        .await
+        .is_err()
     );
     assert_eq!(std::fs::read(&installed)?, b"old binary");
     std::fs::write(&signature_path, valid_signature)?;
@@ -428,9 +512,14 @@ async fn update_rejects_unsigned_metadata() -> Result<()> {
     corrupted[0] ^= 1;
     std::fs::write(&artifact_path, corrupted)?;
     assert!(
-        update::check_and_install_at(&config, &installed, "0.1.0")
-            .await
-            .is_err()
+        update::check_and_install_at(
+            &config.server,
+            &config.update_public_key,
+            &installed,
+            "0.1.0"
+        )
+        .await
+        .is_err()
     );
     assert_eq!(std::fs::read(&installed)?, b"old binary");
     task.abort();

@@ -212,7 +212,9 @@ async fn main() -> Result<()> {
         }
         Command::Update => {
             let config = client::load_config(&config_path)?;
-            match mysyncfiles::update::check_and_install(&config).await? {
+            match mysyncfiles::update::check_and_install(&config.server, &config.update_public_key)
+                .await?
+            {
                 mysyncfiles::update::UpdateOutcome::Current => println!("client is up to date"),
                 mysyncfiles::update::UpdateOutcome::Installed(version) => {
                     println!("installed {version}; restart mysync.service if it is running")

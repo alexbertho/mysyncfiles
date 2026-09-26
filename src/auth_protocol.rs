@@ -1,7 +1,7 @@
 //! MySync proof-of-possession profile. This is not an OAuth/DPoP wire format.
 //! The signed transcript binds the entire externally visible request, including
 //! query and body, and uses a domain separator to prevent cross-protocol reuse.
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use openssl::{
     bn::BigNum,
@@ -213,4 +213,65 @@ pub struct Enrollment {
 pub struct Session {
     pub token: String,
     pub expires_at: i64,
+}
+
+pub(crate) fn validate_server_url(server: &str) -> Result<()> {
+    let url = reqwest::Url::parse(server).context("invalid server URL")?;
+    let host = url.host_str().unwrap_or_default();
+    let local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
+        bail!("server URL must use HTTPS (HTTP is allowed only on loopback)");
+    }
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        bail!("server URL must not contain credentials, a query, or a fragment");
+    }
+    if !matches!(url.path(), "" | "/") {
+        bail!("server URL must point to the origin root without a path prefix");
+    }
+    Ok(())
+}
+
+/// A human-readable code carries no authority until a local administrator
+/// registers it. The enrollment protocol still requires TPM proof and approval.
+pub fn pairing_code() -> Result<String> {
+    let mut bytes = [0u8; 13];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("random generation: {e}"))?;
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut code = String::with_capacity(23);
+    for (index, bit) in (0..100).step_by(5).enumerate() {
+        if index != 0 && index % 5 == 0 {
+            code.push('-');
+        }
+        let byte = bit / 8;
+        let shift = bit % 8;
+        let value =
+            ((bytes[byte] as u16) << 8) | bytes.get(byte + 1).copied().unwrap_or_default() as u16;
+        let digit = ((value >> (11 - shift)) & 31) as usize;
+        code.push(ALPHABET[digit] as char);
+    }
+    Ok(code)
+}
+
+pub fn normalize_pairing_code(code: &str) -> Result<String> {
+    let value: String = code
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            other => other,
+        })
+        .collect();
+    ensure!(
+        value.len() == 20
+            && value
+                .bytes()
+                .all(|c| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&c)),
+        "pairing code must contain 20 Base32 characters"
+    );
+    Ok(value)
 }

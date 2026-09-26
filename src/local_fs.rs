@@ -24,7 +24,8 @@ impl Directory {
     fn child(&self, name: &str, create: bool) -> Result<Option<Self>> {
         if create {
             match fs::mkdirat(&*self.0, name, Mode::from_raw_mode(0o700)) {
-                Ok(()) | Err(Errno::EXIST) => {}
+                Ok(()) => self.0.sync_all()?,
+                Err(Errno::EXIST) => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -43,6 +44,7 @@ impl Directory {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Mirror {
     root: Directory,
 }
@@ -68,7 +70,10 @@ impl LocalEntry {
     /// Kernel-atomic emptiness check: never recursively delete user contents.
     pub fn remove_empty_directory(&self) -> Result<bool> {
         match fs::unlinkat(&*self.directory.0, self.name.as_str(), AtFlags::REMOVEDIR) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                self.directory.0.sync_all()?;
+                Ok(true)
+            }
             Err(Errno::NOTEMPTY | Errno::EXIST) => Ok(false),
             Err(error) => Err(error.into()),
         }
@@ -100,12 +105,16 @@ impl LocalEntry {
             &*destination.directory.0,
             destination.name.as_str(),
             RenameFlags::NOREPLACE,
-        )
-        .map_err(Into::into)
+        )?;
+        // Both names must be durable before a checkpoint can acknowledge the
+        // move. Keep using the pinned descriptors, including after a rename.
+        destination.directory.0.sync_all()?;
+        self.directory.0.sync_all()
     }
 
     pub fn remove(&self) -> Result<()> {
         fs::unlinkat(&*self.directory.0, self.name.as_str(), AtFlags::empty())?;
+        self.directory.0.sync_all()?;
         Ok(())
     }
 }
@@ -120,6 +129,22 @@ pub(crate) struct DownloadFile {
 impl Drop for DownloadFile {
     fn drop(&mut self) {
         let _ = self.entry.remove();
+    }
+}
+
+/// A path that was not completely observed. Its previous state must be kept.
+#[derive(Clone, Debug)]
+pub struct ScanIssue {
+    pub path: String,
+    pub error: String,
+}
+
+impl ScanIssue {
+    pub fn affects(&self, path: &str) -> bool {
+        self.path.is_empty()
+            || self.path == path
+            || path.starts_with(&format!("{}/", self.path))
+            || self.path.starts_with(&format!("{path}/"))
     }
 }
 
@@ -164,51 +189,79 @@ impl Mirror {
         &self,
         conflicts: bool,
         mut visit: impl FnMut(String, File) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<Vec<ScanIssue>> {
+        let mut issues = Vec::new();
         let mut pending = vec![if conflicts {
             ".mysync-conflicts".to_owned()
         } else {
             String::new()
         }];
         while let Some(path) = pending.pop() {
-            let mut directory = Some(self.root.clone());
-            for part in path.split('/').filter(|p| !p.is_empty()) {
-                directory = match directory {
-                    Some(d) => d.child(part, false)?,
-                    None => None,
+            let result: Result<()> = (|| {
+                let mut directory = Some(self.root.clone());
+                for part in path.split('/').filter(|p| !p.is_empty()) {
+                    directory = match directory {
+                        Some(d) => d.child(part, false)?,
+                        None => None,
+                    };
+                }
+                let Some(directory) = directory else {
+                    return Ok(());
                 };
-            }
-            let Some(directory) = directory else { continue };
-            for item in fs::Dir::read_from(&*directory.0)? {
-                let item = item?;
-                let name = item.file_name().to_str().context("non-UTF-8 filename")?;
-                if name == "."
-                    || name == ".."
-                    || (!conflicts && matches!(name, ".mysync-conflicts" | ".mysync-staging"))
-                {
-                    continue;
+                for item in fs::Dir::read_from(&*directory.0)? {
+                    let item = item?;
+                    let raw = item.file_name();
+                    let name = raw.to_string_lossy();
+                    if name == "."
+                        || name == ".."
+                        || (!conflicts && matches!(&*name, ".mysync-conflicts" | ".mysync-staging"))
+                    {
+                        continue;
+                    }
+                    let relative = if path.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{path}/{name}")
+                    };
+                    let result: Result<()> = (|| {
+                        let name = raw.to_str().context("non-UTF-8 filename")?;
+                        if (!conflicts && !valid_path(&relative)) || relative.len() > 8192 {
+                            bail!("filename is not supported by the sync protocol");
+                        }
+                        let stat = match fs::statat(&*directory.0, name, AtFlags::SYMLINK_NOFOLLOW)
+                        {
+                            Ok(stat) => stat,
+                            Err(Errno::NOENT) => return Ok(()),
+                            Err(error) => return Err(error.into()),
+                        };
+                        match FileType::from_raw_mode(stat.st_mode) {
+                            FileType::Directory => pending.push(relative.clone()),
+                            FileType::RegularFile => {
+                                if let Some(file) = directory.entry(name.to_owned()).read()? {
+                                    visit(relative.clone(), file)?;
+                                }
+                            }
+                            _ => bail!("symlinks and non-regular files are not synchronized"),
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        issues.push(ScanIssue {
+                            path: relative,
+                            error: format!("{error:#}"),
+                        });
+                    }
                 }
-                let relative = if path.is_empty() {
-                    name.to_owned()
-                } else {
-                    format!("{path}/{name}")
-                };
-                let stat = fs::statat(&*directory.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
-                let kind = FileType::from_raw_mode(stat.st_mode);
-                if !matches!(kind, FileType::Directory | FileType::RegularFile) {
-                    continue;
-                }
-                if (!conflicts && !valid_path(&relative)) || relative.len() > 8192 {
-                    bail!("invalid filename in sync folder: {relative}");
-                }
-                if kind == FileType::Directory {
-                    pending.push(relative);
-                } else if let Some(file) = directory.entry(name.to_owned()).read()? {
-                    visit(relative, file)?;
-                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                issues.push(ScanIssue {
+                    path,
+                    error: format!("{error:#}"),
+                });
             }
         }
-        Ok(())
+        Ok(issues)
     }
 
     fn staging(&self) -> Result<Directory> {
@@ -268,5 +321,31 @@ impl Mirror {
             format!(".mysync-conflicts/{parent}/{name}")
         };
         Ok((directory.entry(name), display))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_reports_one_bad_entry_and_keeps_scanning() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("valid.txt"), b"valid")?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("missing-target", temp.path().join("bad-link"))?;
+
+        let mirror = Mirror::open(temp.path())?;
+        let mut files = Vec::new();
+        let issues = mirror.visit_files(false, |path, _| {
+            files.push(path);
+            Ok(())
+        })?;
+        assert_eq!(files, vec!["valid.txt"]);
+        #[cfg(unix)]
+        assert!(issues.iter().any(|issue| issue.path == "bad-link"));
+        #[cfg(not(unix))]
+        assert!(issues.is_empty());
+        Ok(())
     }
 }

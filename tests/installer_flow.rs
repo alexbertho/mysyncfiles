@@ -47,7 +47,11 @@ impl InstallerFixture {
                 } else {
                     "echo 'TPM unavailable' >&2; exit 1"
                 },
-                if setup_ok { "exit 0" } else { "exit 2" }
+                if setup_ok {
+                    "exit 0"
+                } else {
+                    "case \"$0\" in */source-client) exit 0;; *) exit 2;; esac"
+                }
             ),
         )?;
         let releases_root = root.join("releases");
@@ -67,8 +71,14 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 file=${url##*/}
-if [ "${MYSYNC_TEST_HTTP_STATUS:-200}" != 200 ] && [ "$file" = latest.json ]; then
+if [ "${MYSYNC_TEST_HTTP_STATUS:-200}" != 200 ] && {
+    [ "$file" = latest.signed.json ] || [ "$file" = latest.json ] || [ "$file" = latest.sig ];
+}; then
     printf '%s' "$MYSYNC_TEST_HTTP_STATUS"
+    exit 0
+fi
+if [ ! -e "$MYSYNC_TEST_RELEASES/$file" ]; then
+    printf 404
     exit 0
 fi
 cp "$MYSYNC_TEST_RELEASES/$file" "$destination" || exit 22
@@ -78,7 +88,7 @@ printf 200
         executable(&mocks.join("tpm2_getcap"), "#!/bin/sh\nexit 0\n")?;
         executable(
             &mocks.join("systemctl"),
-            "#!/bin/sh\n: > \"$MYSYNC_TEST_SYSTEMCTL_CALLED\"\nexit \"${MYSYNC_TEST_SYSTEMCTL_STATUS:-99}\"\n",
+            "#!/bin/sh\nif [ \"$2\" = is-active ]; then exit 3; fi\n: > \"$MYSYNC_TEST_SYSTEMCTL_CALLED\"\nexit \"${MYSYNC_TEST_SYSTEMCTL_STATUS:-99}\"\n",
         )?;
         let template = include_str!("../deploy/install.sh");
         let script = root.join("install.sh");
@@ -337,6 +347,93 @@ fn installer_backs_up_an_older_or_different_same_version_client() -> Result<()> 
 }
 
 #[test]
+fn installer_archives_a_legacy_token_profile_before_pairing() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    let config_dir = fixture.home.join(".config/mysync");
+    let mirror = fixture.home.join("Sync");
+    fs::create_dir_all(&config_dir)?;
+    fs::create_dir_all(&mirror)?;
+    fs::write(mirror.join("local.txt"), "local content")?;
+    let profile = serde_json::to_vec(&serde_json::json!({
+        "server": "https://sync.example.test",
+        "root": mirror,
+        "token": "obsolete-secret"
+    }))?;
+    fs::write(config_dir.join("config.json"), &profile)?;
+    fs::write(config_dir.join("config.state.json"), b"old state")?;
+    fs::write(config_dir.join("config.state.journal"), b"old journal")?;
+
+    let output = fixture.run_interactive_with_input("0", true, b"y\n\n")?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!config_dir.join("config.json").exists());
+    assert!(!config_dir.join("config.state.json").exists());
+    assert!(!config_dir.join("config.state.journal").exists());
+    let backups: Vec<_> = fs::read_dir(&config_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("legacy-profile.")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read(backups[0].join("config.json"))?, profile);
+    assert_eq!(
+        fs::read(backups[0].join("config.state.json"))?,
+        b"old state"
+    );
+    assert_eq!(
+        fs::read(backups[0].join("config.state.journal"))?,
+        b"old journal"
+    );
+    assert_eq!(
+        fs::read_to_string(mirror.join("local.txt"))?,
+        "local content"
+    );
+    assert!(fixture.root.join("setup-called").exists());
+    assert!(fixture.root.join("systemctl-called").exists());
+    Ok(())
+}
+
+#[test]
+fn installer_leaves_legacy_profile_untouched_without_consent() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    let config_dir = fixture.home.join(".config/mysync");
+    fs::create_dir_all(&config_dir)?;
+    fs::write(config_dir.join("config.json"), b"{\"token\":\"old\"}")?;
+    fs::write(config_dir.join("config.state.json"), b"old state")?;
+
+    let output = fixture.run_interactive_with_input("0", true, b"\n")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("legacy token profile"));
+    assert_eq!(
+        fs::read(config_dir.join("config.json"))?,
+        b"{\"token\":\"old\"}"
+    );
+    assert_eq!(
+        fs::read(config_dir.join("config.state.json"))?,
+        b"old state"
+    );
+    assert!(!fixture.root.join("setup-called").exists());
+    assert!(!fixture.root.join("systemctl-called").exists());
+
+    let output = fixture.run("200")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Rerun this installer in a terminal"));
+    assert_eq!(
+        fs::read(config_dir.join("config.json"))?,
+        b"{\"token\":\"old\"}"
+    );
+    Ok(())
+}
+
+#[test]
 fn signed_installer_stages_unit_but_does_not_start_service() -> Result<()> {
     let fixture = InstallerFixture::new(true)?;
     let output = fixture.run("200")?;
@@ -409,6 +506,7 @@ fn piped_installer_still_pairs_in_an_interactive_terminal() -> Result<()> {
 #[test]
 fn signed_installer_rejects_bad_signature_binary_and_tpm() -> Result<()> {
     let invalid_signature = InstallerFixture::new(true)?;
+    fs::remove_file(invalid_signature.releases.join("latest.signed.json"))?;
     fs::write(
         invalid_signature.releases.join("latest.sig"),
         "00".repeat(64),
@@ -417,6 +515,16 @@ fn signed_installer_rejects_bad_signature_binary_and_tpm() -> Result<()> {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("signature is invalid"));
     invalid_signature.assert_not_installed();
+
+    let invalid_envelope = InstallerFixture::new(true)?;
+    fs::write(
+        invalid_envelope.releases.join("latest.signed.json"),
+        serde_json::json!({"manifest": "", "signature": "00".repeat(64)}).to_string(),
+    )?;
+    let output = invalid_envelope.run("200")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("signature is invalid"));
+    invalid_envelope.assert_not_installed();
 
     let invalid_binary = InstallerFixture::new(true)?;
     let artifact = format!("mysync-0.3.0-{}", release::current_target().unwrap());

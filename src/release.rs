@@ -5,7 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use fs2::FileExt;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,6 +16,27 @@ use uuid::Uuid;
 pub const PUBLIC_KEY_HEX: &str = include_str!("update_public_key.hex");
 pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const SIGNING_CONTEXT: &[u8] = b"MySyncFiles release manifest v1\n";
+pub const MAX_ENVELOPE_BYTES: usize = 32 * 1024;
+
+/// Preserve the exact signed bytes, independently of JSON serialization.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedRelease {
+    pub manifest: String,
+    pub signature: String,
+}
+
+pub fn verify_envelope(bytes: &[u8], public_key: &str) -> Result<ReleaseManifest> {
+    if bytes.len() > MAX_ENVELOPE_BYTES {
+        bail!("release envelope is too large");
+    }
+    let envelope: SignedRelease = serde_json::from_slice(bytes)?;
+    verify_manifest(
+        &B64.decode(envelope.manifest)?,
+        &envelope.signature,
+        public_key,
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseManifest {
@@ -39,6 +62,7 @@ pub fn current_target() -> Option<&'static str> {
 pub fn valid_release_file(file: &str) -> bool {
     file == "latest.json"
         || file == "latest.sig"
+        || file == "latest.signed.json"
         || (file.starts_with("mysync-")
             && file.len() <= 128
             && file
@@ -189,15 +213,48 @@ pub fn publish(
     {
         bail!("client binary version does not match the release version");
     }
+    let setup = std::process::Command::new(binary)
+        .args(["setup", "--help"])
+        .output()
+        .context("running client binary to verify the setup command")?;
+    if !setup.status.success() {
+        bail!("client binary lacks a working setup command");
+    }
     let signing_key = read_signing_key(signing_key_path)?;
     let release_dir = output_dir.join(target);
     std::fs::create_dir_all(&release_dir)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(release_dir.join(".publish.lock"))?;
+    if !lock.metadata()?.is_file() {
+        bail!("invalid release publication lock");
+    }
+    lock.lock_exclusive()
+        .context("locking release publication")?;
     let latest_path = release_dir.join("latest.json");
-    if let Ok(previous) = std::fs::read(&latest_path) {
-        let previous: ReleaseManifest = serde_json::from_slice(&previous)?;
-        if parsed_version <= previous.validate()? {
-            bail!("release version must be newer than the published version");
-        }
+    let envelope_path = release_dir.join("latest.signed.json");
+    let previous = match std::fs::read(&envelope_path) {
+        Ok(bytes) => Some(verify_envelope(
+            &bytes,
+            &hex::encode(signing_key.verifying_key().to_bytes()),
+        )?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::read(&latest_path) {
+            Ok(bytes) => Some(serde_json::from_slice::<ReleaseManifest>(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        },
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(previous) = previous
+        && parsed_version <= previous.validate()?
+    {
+        bail!("release version must be newer than the published version");
     }
     let artifact = format!("mysync-{version}-{target}");
     let artifact_path = release_dir.join(&artifact);
@@ -210,6 +267,7 @@ pub fn publish(
         options.mode(0o644);
     }
     let mut destination = options.open(&artifact_path)?;
+    let mut publishing = false;
     let result: Result<ReleaseManifest> = (|| {
         let mut hash = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
@@ -229,6 +287,7 @@ pub fn publish(
             destination.write_all(&buffer[..count])?;
         }
         destination.sync_all()?;
+        std::fs::File::open(&release_dir)?.sync_all()?;
         let manifest = ReleaseManifest {
             version: version.to_owned(),
             target: target.to_owned(),
@@ -240,6 +299,18 @@ pub fn publish(
         let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
         manifest_bytes.push(b'\n');
         let signature = signing_key.sign(&signed_payload(&manifest_bytes));
+        // From this point an I/O error may follow a successful rename. Keep the
+        // immutable artifact rather than risk deleting published content.
+        publishing = true;
+        atomic_write(
+            &envelope_path,
+            &serde_json::to_vec(&SignedRelease {
+                manifest: B64.encode(&manifest_bytes),
+                signature: hex::encode(signature.to_bytes()),
+            })?,
+        )?;
+        // Compatibility for installed v1 clients. New clients use the atomic
+        // envelope exclusively when it is available.
         atomic_write(
             &release_dir.join("latest.sig"),
             format!("{}\n", hex::encode(signature.to_bytes())).as_bytes(),
@@ -247,7 +318,7 @@ pub fn publish(
         atomic_write(&latest_path, &manifest_bytes)?;
         Ok(manifest)
     })();
-    if result.is_err() {
+    if result.is_err() && !publishing {
         let _ = std::fs::remove_file(artifact_path);
     }
     result
