@@ -12,6 +12,9 @@ theme:
 plugins:
   - search
 
+hooks:
+  - mkdocs_hooks.py
+
 validation:
   nav:
     omitted_files: warn

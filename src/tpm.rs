@@ -8,15 +8,15 @@ use std::{io::Read, path::Path, str::FromStr};
 use tokio::sync::{mpsc, oneshot};
 use tss_esapi::{
     Context, TctiNameConf,
-    abstraction::{AsymmetricAlgorithmSelection, ek},
+    abstraction::{AsymmetricAlgorithmSelection, ek, nv},
     attributes::{ObjectAttributesBuilder, SessionAttributesBuilder},
     constants::SessionType,
-    handles::{AuthHandle, KeyHandle, SessionHandle},
+    handles::{AuthHandle, KeyHandle, NvIndexTpmHandle, SessionHandle},
     interface_types::{
         algorithm::{EccSchemeAlgorithm, HashingAlgorithm, PublicAlgorithm},
         ecc::EccCurve,
         key_bits::RsaKeyBits,
-        resource_handles::Hierarchy,
+        resource_handles::{Hierarchy, NvAuth},
         session_handles::{AuthSession, PolicySession},
     },
     structures::{
@@ -161,6 +161,65 @@ fn context(tcti: &str) -> Result<Context> {
 }
 
 const MAX_EK_CERT_BYTES: u64 = 16 * 1024;
+const INTEL_EK_CHAIN_NV_INDEX: u32 = 0x01c00100;
+const INTEL_EK_CHAIN_NV_LAST_INDEX: u32 = 0x01c001ff;
+const MAX_EK_CHAIN_NV_BYTES: usize = 128 * 1024;
+const MAX_EK_CHAIN_NV_CERTIFICATES: usize = 64;
+
+/// Intel PTT may store its per-device issuing certificates as concatenated DER
+/// across the TCG EK chain NV index range. Treat the bytes as untrusted: the
+/// server verifies the selected chain against its configured manufacturer roots.
+fn certificates_from_nv_chain(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_EK_CHAIN_NV_BYTES,
+        "TPM EK chain is empty or too large"
+    );
+    let mut certificates = Vec::new();
+    let mut offset = 0;
+    while offset + 2 <= bytes.len() {
+        if bytes[offset] != 0x30 {
+            offset += 1;
+            continue;
+        }
+        let (header, length) = match bytes[offset + 1] {
+            n @ 0..=127 => (2, n as usize),
+            0x81 if offset + 3 <= bytes.len() => (3, bytes[offset + 2] as usize),
+            0x82 if offset + 4 <= bytes.len() => (
+                4,
+                u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize,
+            ),
+            _ => {
+                offset += 1;
+                continue;
+            }
+        };
+        let Some(end) = offset.checked_add(header + length) else {
+            bail!("invalid TPM EK chain length");
+        };
+        if length < 128 || end > bytes.len() || header + length > MAX_EK_CERT_BYTES as usize {
+            offset += 1;
+            continue;
+        }
+        let candidate = &bytes[offset..end];
+        if let Ok(cert) = X509::from_der(candidate)
+            && cert.to_der()? == candidate
+        {
+            ensure!(
+                certificates.len() < MAX_EK_CHAIN_NV_CERTIFICATES,
+                "too many TPM EK chain certificates"
+            );
+            certificates.push(candidate.to_vec());
+            offset = end;
+            continue;
+        }
+        offset += 1;
+    }
+    ensure!(
+        !certificates.is_empty(),
+        "TPM EK chain contains no DER certificates"
+    );
+    Ok(certificates)
+}
 
 /// Read an explicitly supplied manufacturer certificate without unbounded I/O.
 /// Trust in its issuer is established by the server, not by this parser.
@@ -296,10 +355,10 @@ pub fn doctor_with_certificate(tcti: &str, external: Option<&[u8]>) -> Result<&'
         ),
         ("ecc", AsymmetricAlgorithmSelection::Ecc(EccCurve::NistP256)),
     ] {
-        if let Ok(certificate) = ek::retrieve_ek_pubcert(&mut ctx, selection) {
-            if matching_ek(&mut ctx, selection, &certificate).is_ok() {
-                return Ok(kind);
-            }
+        if let Ok(certificate) = ek::retrieve_ek_pubcert(&mut ctx, selection)
+            && matching_ek(&mut ctx, selection, &certificate).is_ok()
+        {
+            return Ok(kind);
         }
     }
     bail!("TPM 2.0 is reachable, but no readable RSA-2048 or P-256 EK certificate was found")
@@ -369,6 +428,48 @@ fn signing_template() -> Result<Public> {
         .build()?)
 }
 impl Identity {
+    /// Read optional manufacturer intermediates from the contiguous TCG NV
+    /// index range. A missing first index is normal for TPMs without a chain.
+    pub fn ek_intermediates(&self) -> Result<Vec<Vec<u8>>> {
+        let mut ctx = context(&self.tcti)?;
+        let indices = nv::list(&mut ctx)?;
+        let mut bytes = Vec::new();
+        for number in INTEL_EK_CHAIN_NV_INDEX..=INTEL_EK_CHAIN_NV_LAST_INDEX {
+            let index = NvIndexTpmHandle::new(number)?;
+            let Some((public, _)) = indices
+                .iter()
+                .find(|(public, _)| public.nv_index() == index)
+            else {
+                break;
+            };
+            ensure!(
+                public.data_size() > 0 && public.data_size() <= MAX_EK_CHAIN_NV_BYTES - bytes.len(),
+                "TPM EK chain NV indices are empty or too large"
+            );
+            let auth = if public.attributes().owner_read() {
+                NvAuth::Owner
+            } else if public.attributes().auth_read() {
+                let handle =
+                    ctx.execute_without_session(|ctx| ctx.tr_from_tpm_public(index.into()))?;
+                NvAuth::NvIndex(handle.into())
+            } else {
+                bail!("TPM EK chain NV index is not readable without a hierarchy password");
+            };
+            let part = ctx
+                .execute_with_nullauth_session(|ctx| nv::read_full(ctx, auth, index))
+                .with_context(|| format!("reading TPM EK chain NV index {number:#010x}"))?;
+            ensure!(
+                part.len() == public.data_size(),
+                "TPM EK chain NV index size changed during reading"
+            );
+            bytes.extend_from_slice(&part);
+        }
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        certificates_from_nv_chain(&bytes)
+    }
+
     pub fn ek_certificate(&self) -> Result<Vec<u8>> {
         let mut ctx = context(&self.tcti)?;
         let alg = algorithm(&self.ek_kind)?;

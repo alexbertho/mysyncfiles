@@ -106,6 +106,12 @@ fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
         })
         .optional()?)
 }
+
+pub fn public_url(state: &ServerState) -> Result<String> {
+    let db = state.db.lock().unwrap();
+    setting(&db, "public_url")?.context("public URL is not configured; run device auth-configure")
+}
+
 pub fn configure(state: &ServerState, public_url: &str, roots: &Path) -> Result<()> {
     let url = reqwest::Url::parse(public_url)?;
     ensure!(
@@ -147,46 +153,7 @@ pub fn invite(state: &ServerState, name: &str) -> Result<String> {
     Ok(token)
 }
 
-/// A human-readable code carries no authority until a local administrator
-/// registers it. The enrollment protocol still requires TPM proof and approval.
-pub fn pairing_code() -> Result<String> {
-    let mut bytes = [0u8; 13];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("random generation: {e}"))?;
-    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    let mut code = String::with_capacity(23);
-    for (index, bit) in (0..100).step_by(5).enumerate() {
-        if index != 0 && index % 5 == 0 {
-            code.push('-');
-        }
-        let byte = bit / 8;
-        let shift = bit % 8;
-        let value =
-            ((bytes[byte] as u16) << 8) | bytes.get(byte + 1).copied().unwrap_or_default() as u16;
-        let digit = ((value >> (11 - shift)) & 31) as usize;
-        code.push(ALPHABET[digit] as char);
-    }
-    Ok(code)
-}
-
-pub fn normalize_pairing_code(code: &str) -> Result<String> {
-    let value: String = code
-        .chars()
-        .filter(|c| *c != '-')
-        .map(|c| match c.to_ascii_uppercase() {
-            'O' => '0',
-            'I' | 'L' => '1',
-            other => other,
-        })
-        .collect();
-    ensure!(
-        value.len() == 20
-            && value
-                .bytes()
-                .all(|c| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&c)),
-        "pairing code must contain 20 Base32 characters"
-    );
-    Ok(value)
-}
+pub use crate::auth_protocol::{normalize_pairing_code, pairing_code};
 
 pub fn register_pair(state: &ServerState, name: &str, code: &str) -> Result<String> {
     let code = normalize_pairing_code(code)?;

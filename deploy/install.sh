@@ -74,6 +74,35 @@ offer_packages() {
     esac
 }
 
+if [ -e /dev/tpmrm0 ] && { [ ! -r /dev/tpmrm0 ] || [ ! -w /dev/tpmrm0 ]; }; then
+    device_group=$(stat -c %G /dev/tpmrm0 2>/dev/null || true)
+    device_mode=$(stat -c %A /dev/tpmrm0 2>/dev/null || true)
+    case "$device_group:$device_mode" in
+        tss:????rw*)
+            case " $(id -nG) " in
+                *' tss '*) die 'Cannot access /dev/tpmrm0 despite active tss group membership; check device permissions and ACLs.' ;;
+            esac
+            username=$(id -un)
+            case " $(id -nG "$username") " in
+                *' tss '*) die 'The tss group is already assigned; sign out and back in (or reboot), then rerun this installer.' ;;
+            esac
+            command -v sudo >/dev/null 2>&1 || die "Cannot access /dev/tpmrm0. Ask an administrator to run: usermod -aG tss $username; then sign out and back in."
+            [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] || die "Cannot access /dev/tpmrm0. Run sudo usermod -aG tss $username, sign out and back in, then retry."
+            printf 'Add %s to the tss group with sudo? [y/N] ' "$username" >/dev/tty
+            answer=
+            IFS= read -r answer </dev/tty || true
+            case "$answer" in
+                y|Y|yes|YES)
+                    sudo usermod -aG tss "$username" || die 'Could not update the tss group membership.'
+                    die 'Added the tss group. Sign out and back in (or reboot), then rerun this installer.'
+                    ;;
+                *) die "TPM access is required. Run sudo usermod -aG tss $username, sign out and back in, then retry." ;;
+            esac
+            ;;
+        *) die 'Cannot read and write /dev/tpmrm0; check its permissions and your active groups.' ;;
+    esac
+fi
+
 missing=
 for tool in python3 openssl; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
@@ -108,10 +137,47 @@ fetch() {
     [ "$status" = 200 ] || die "Server returned HTTP $status for $address (redirects are not allowed)."
 }
 
+fetch_optional() {
+    address=$1 destination=$2 limit=$3 timeout=$4
+    status=$(curl --silent --show-error --proto '=https' --max-redirs 0 \
+        --connect-timeout 10 --max-time "$timeout" --max-filesize "$limit" \
+        --output "$destination" --write-out '%{http_code}' "$address") || die "Download failed: $address"
+    case "$status" in
+        200) return 0 ;;
+        404) rm -f -- "$destination"; return 1 ;;
+        *) die "Server returned HTTP $status for $address (redirects are not allowed)." ;;
+    esac
+}
+
 step 2 'Downloading signed release metadata'
 base="$SERVER_URL/v1/updates/$target"
-fetch "$base/latest.json" "$tmp/latest.json" 16384 30
-fetch "$base/latest.sig" "$tmp/latest.sig" 256 30
+if fetch_optional "$base/latest.signed.json" "$tmp/latest.signed.json" 32768 30; then
+    if ! python3 - "$tmp" "$PUBLIC_KEY_HEX" <<'PY'
+import base64, binascii, json, pathlib, re, sys
+
+directory, key = pathlib.Path(sys.argv[1]), sys.argv[2]
+try:
+    envelope = json.loads((directory / 'latest.signed.json').read_bytes())
+    if not isinstance(envelope, dict) or set(envelope) != {'manifest', 'signature'}:
+        raise ValueError('release envelope has unexpected fields')
+    manifest = base64.b64decode(envelope['manifest'], validate=True)
+    signature = envelope['signature']
+    if len(manifest) > 16384 or not isinstance(signature, str) or not re.fullmatch(r'[0-9a-fA-F]{128}', signature):
+        raise ValueError('invalid release envelope contents')
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', key):
+        raise ValueError('invalid embedded release public key')
+except (OSError, ValueError, TypeError, binascii.Error, json.JSONDecodeError) as error:
+    raise SystemExit(f'Invalid release envelope: {error}')
+(directory / 'latest.json').write_bytes(manifest)
+(directory / 'latest.sig').write_text(signature + '\n', encoding='ascii')
+PY
+    then
+        die 'Cannot prepare release signature verification.'
+    fi
+else
+    fetch "$base/latest.json" "$tmp/latest.json" 16384 30
+    fetch "$base/latest.sig" "$tmp/latest.sig" 256 30
+fi
 
 if ! python3 - "$tmp" "$PUBLIC_KEY_HEX" "$target" <<'PY'
 import json, pathlib, re, sys
@@ -196,19 +262,20 @@ if ! reported=$("$tmp/mysync" --version 2>"$tmp/probe-error"); then
     fi
 fi
 [ "$reported" = "mysync $version" ] || die 'Signed client reports a different version.'
+"$tmp/mysync" setup --help >/dev/null 2>&1 || die 'The signed client release lacks the setup command; ask the administrator to publish a newer signed client.'
 ok 'Binary integrity and compatibility verified.'
 
 step 4 'Checking TPM 2.0 and EK certificate'
 if [ -n "${MYSYNC_EK_CERT:-}" ]; then
     [ -r "$MYSYNC_EK_CERT" ] || die 'MYSYNC_EK_CERT is not readable by this user.'
-    "$tmp/mysync" doctor --ek-cert "$MYSYNC_EK_CERT" || die 'TPM preflight failed; the supplied EK certificate must match this TPM.'
+    "$tmp/mysync" doctor --ek-cert "$MYSYNC_EK_CERT" || die 'TPM preflight failed; check the diagnostic above for TPM access or an EK certificate mismatch.'
 else
-    "$tmp/mysync" doctor || die 'TPM preflight failed; if the EK certificate is absent from TPM NV, obtain its DER certificate from the manufacturer and retry with MYSYNC_EK_CERT=/path/to/ek.der.'
+    "$tmp/mysync" doctor || die 'TPM preflight failed; check the diagnostic above. If the EK certificate is absent from TPM NV, supply its manufacturer DER certificate with MYSYNC_EK_CERT=/actual/path/ek.der.'
 fi
 
 step 5 'Installing client and background service'
 destination_dir="$HOME/.local/bin"
-unit_dir="$HOME/.config/systemd/user"
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 for directory in "$destination_dir" "$unit_dir"; do
     [ ! -L "$directory" ] || die "Refusing symbolic-link installation directory: $directory"
     if [ ! -e "$directory" ]; then
@@ -222,17 +289,58 @@ if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode 
     raise SystemExit(f'Unsafe installation directory: {directory}')
 PY
 done
+
+command -v flock >/dev/null 2>&1 || die 'The flock utility is required to serialize client installation and updates.'
+update_lock="$destination_dir/.mysync-update.lock"
+[ ! -L "$update_lock" ] || die "Refusing symbolic-link client update lock: $update_lock"
+exec 9>"$update_lock" || die "Cannot open client update lock: $update_lock"
+chmod 600 "$update_lock" || die "Cannot protect client update lock: $update_lock"
+flock -x 9 || die 'Cannot acquire the client update lock.'
 destination="$destination_dir/mysync"
-setup_available=0
 if [ -L "$destination" ]; then
     die "Refusing symbolic-link client binary: $destination"
 fi
 if [ -e "$destination" ]; then
     [ -f "$destination" ] && [ -x "$destination" ] || die "Existing client is not a regular executable: $destination"
-    warn "An existing client was left untouched: $destination"
-    say 'Use mysync update for signed upgrades; this bootstrap installer never downgrades a client.'
-    if cmp -s "$tmp/mysync" "$destination"; then
-        setup_available=1
+    if ! cmp -s "$tmp/mysync" "$destination"; then
+        existing_version=$("$destination" --version 2>/dev/null || true)
+        version_relation=$(python3 - "$existing_version" "$version" <<'PY'
+import re, sys
+
+installed = re.fullmatch(r'mysync ([0-9]+)\.([0-9]+)\.([0-9]+)', sys.argv[1])
+signed = re.fullmatch(r'([0-9]+)\.([0-9]+)\.([0-9]+)', sys.argv[2])
+if installed is None or signed is None:
+    print('unknown')
+else:
+    old = tuple(map(int, installed.groups()))
+    new = tuple(map(int, signed.groups()))
+    print('newer' if old > new else 'replaceable')
+PY
+)
+        case "$version_relation" in
+            newer) die "The installed client is newer than signed release $version; refusing to downgrade it." ;;
+            replaceable) ;;
+            *) die 'Cannot compare the installed client version with the signed release; leave the existing client untouched.' ;;
+        esac
+        [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] || die "The installed client differs from signed release $version. Back up $destination manually, move it aside, then rerun this installer in a terminal."
+        printf 'Back up the existing client and install signed MySyncFiles %s? [y/N] ' "$version" >/dev/tty
+        answer=
+        IFS= read -r answer </dev/tty || true
+        case "$answer" in
+            y|Y|yes|YES) ;;
+            *) die 'The existing client was left untouched.' ;;
+        esac
+        staged="$destination_dir/.mysync-install-$$"
+        [ ! -e "$staged" ] && [ ! -L "$staged" ] || die 'Temporary installation path already exists.'
+        install -m 755 "$tmp/mysync" "$staged" || die 'Cannot stage the signed client.'
+        backup_dir=$(mktemp -d "$destination.backup.XXXXXXXX") || die 'Cannot create a private backup directory.'
+        ln "$destination" "$backup_dir/mysync" || die 'Cannot preserve the existing client; nothing was replaced.'
+        mv -f -T -- "$staged" "$destination" || die 'Cannot replace the existing client; its backup was retained.'
+        staged=
+        ok "Installed signed client at $destination"
+        say "Previous client retained at $backup_dir/mysync"
+    else
+        ok "Signed client is already installed at $destination"
     fi
 else
     staged="$destination_dir/.mysync-install-$$"
@@ -242,7 +350,6 @@ else
     rm -f -- "$staged"
     staged=
     ok "Installed $destination"
-    setup_available=1
 fi
 
 cat > "$tmp/mysync.service" <<'MYSYNC_UNIT'
@@ -263,7 +370,63 @@ else
     ok 'Installed systemd user service (not started yet).'
 fi
 say
-if [ "$setup_available" = 1 ] && [ -t 1 ] && [ -r /dev/tty ]; then
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mysync"
+config_file="$config_dir/config.json"
+legacy_profile=0
+if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+    legacy_profile=$(python3 - "$config_file" <<'PY'
+import json, os, pathlib, stat, sys
+
+path = pathlib.Path(sys.argv[1])
+info = path.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+    raise SystemExit('Existing client profile must be a regular file owned by this user.')
+with path.open('rb') as source:
+    profile = json.load(source)
+if not isinstance(profile, dict):
+    raise SystemExit('Existing client profile is not a JSON object.')
+if 'token' in profile and profile.get('identity') is not None:
+    raise SystemExit('Client profile mixes a legacy token with a TPM identity; review it manually.')
+print('1' if 'token' in profile else '0')
+PY
+) || die 'Cannot inspect the existing client profile; it was left untouched.'
+fi
+if [ "$legacy_profile" = 1 ]; then
+    [ ! -L "$config_dir" ] || die "Refusing symbolic-link client config directory: $config_dir"
+    for file in "$config_file" "$config_dir/config.state.json" "$config_dir/config.state.journal"; do
+        if [ -e "$file" ] || [ -L "$file" ]; then
+            [ ! -L "$file" ] && [ -f "$file" ] || die "Refusing non-regular legacy client file: $file"
+        fi
+    done
+    for file in "$config_dir/config.pairing.json" "$config_dir/config.enrollment.json"; do
+        [ ! -e "$file" ] && [ ! -L "$file" ] || die "A TPM pairing is already pending; review $file before replacing the legacy profile."
+    done
+    if systemctl --user is-active --quiet mysync.service; then
+        die 'Stop the running mysync user service before archiving its legacy profile.'
+    fi
+    [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] || die 'A legacy token profile was found. Rerun this installer in a terminal to archive it before TPM pairing.'
+    warn 'A legacy token profile cannot be used for TPM pairing.'
+    say 'The old profile and local revision state can be moved to a private backup; the sync folder stays in place.'
+    say 'Back up important files in the sync folder before continuing with the first synchronization.'
+    printf 'Archive the legacy profile and continue with TPM pairing? [y/N] ' >/dev/tty
+    answer=
+    IFS= read -r answer </dev/tty || true
+    case "$answer" in
+        y|Y|yes|YES) ;;
+        *) die 'The legacy profile and local revision state were left untouched.' ;;
+    esac
+    profile_backup=$(mktemp -d "$config_dir/legacy-profile.XXXXXXXX") || die 'Cannot create a private legacy profile backup.'
+    for file in "$config_dir/config.state.json" "$config_dir/config.state.journal" "$config_file"; do
+        if [ -e "$file" ]; then
+            mv -T -- "$file" "$profile_backup/${file##*/}" || die "Could not archive $file; inspect $profile_backup before retrying."
+        fi
+    done
+    ok "Legacy profile and state saved in $profile_backup"
+    say 'Choose the existing sync folder at the next prompt.'
+fi
+
+if [ -t 1 ] && [ -r /dev/tty ]; then
     step 6 'Pairing this client with the server'
     printf 'Folder to synchronize [%s/Sync]: ' "$HOME" >/dev/tty
     mirror_dir=
@@ -287,8 +450,5 @@ if [ "$setup_available" = 1 ] && [ -t 1 ] && [ -r /dev/tty ]; then
     say 'For startup without login: sudo loginctl enable-linger "$(id -un)"'
 else
     say "Next: run $destination setup --server $SERVER_URL --dir \"\$HOME/Sync\" in a terminal."
-    if [ "$setup_available" = 0 ]; then
-        say 'Update the existing client with mysync update before using the new setup command.'
-    fi
     say 'The user service remains stopped until setup succeeds.'
 fi

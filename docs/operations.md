@@ -1,6 +1,6 @@
 # Déploiement et publication
 
-Le [guide d'installation serveur](install-server.md) couvre la préparation de `deploy/.env`, des volumes et du proxy HTTPS. Cette page décrit les opérations qui suivent le premier démarrage. Les chemins, noms et domaines ci-dessous sont des exemples à adapter ; les secrets restent hors du dépôt et des fichiers servis publiquement.
+Le [guide d'installation serveur](install-server.md) couvre la préparation de `deploy/.env`, des volumes et du proxy HTTPS. Cette page décrit les opérations qui suivent le premier démarrage. Les chemins et noms ci-dessous sont des exemples à adapter. Dans le dépôt source, le domaine est aussi un exemple ; le site publié utilise l'origine configurée par l'administrateur. Les secrets restent hors du dépôt et des fichiers servis publiquement.
 
 ## Construire et installer depuis les sources
 
@@ -22,17 +22,17 @@ Pour installer un client construit depuis les sources, exécuter `./deploy/insta
 
 ## Publier un client signé
 
-Le serveur distribue `/install.sh` et les routes publiques `/v1/updates/<cible>/latest.json`, `latest.sig` et `mysync-<version>-<cible>`. Le script est intégré à l'image serveur avec sa clé publique de release ; il vérifie la signature et le SHA-256 du binaire avant de l'exécuter. Il n'écrase pas une installation existante, qui utilise `mysync update`.
+Le serveur distribue `/install.sh` et les routes publiques `/v1/updates/<cible>/latest.signed.json`, `latest.json`, `latest.sig` et `mysync-<version>-<cible>`. L'enveloppe `latest.signed.json` associe atomiquement le manifeste signé ; les deux anciens fichiers restent publiés pour les clients déjà installés. Les clients récents ne retombent sur le format précédent que si l'enveloppe répond `404`, jamais si sa signature est invalide. Le script est intégré à l'image serveur avec sa clé publique de release ; il vérifie la signature et le SHA-256 du binaire et la présence de `mysync setup` avant de l'exécuter. L'outil de publication vérifie aussi que le binaire annonce la bonne version et accepte `setup --help` avant de le signer. Si un binaire déjà installé diffère de la release signée, l'installateur demande confirmation avant de conserver une copie et de le remplacer ; il refuse une version installée plus récente. `mysync update` reste disponible pour les profils clients déjà configurés.
 
 La publication est une opération administrateur distincte du build serveur, de la CI et du démarrage. Elle doit être effectuée avec la clé privée correspondant à la clé publique intégrée au client **et** au serveur :
 
 ```sh
 mysync-release publish --secret-key /chemin/prive/cle-signature \
-  --binary target/release/mysync --version 0.3.2 \
+  --binary target/release/mysync --version VERSION \
   --target linux-x86_64 --output-dir /srv/mysyncfiles-releases
 ```
 
-Publier séparément `linux-x86_64` et `linux-aarch64` avec des binaires construits et testés sur l'architecture correspondante. La version annoncée doit correspondre à `mysync --version` et dépasser celle déjà publiée. `--output-dir` désigne la racine montée dans `/releases` ; l'outil crée le sous-dossier de la cible. Le dépôt source ne garantit pas qu'un artefact signé soit disponible sur un serveur donné. Publier `latest.json` peut déclencher les mises à jour automatiques : vérifier au préalable les bibliothèques natives et le TPM des clients concernés.
+Publier séparément `linux-x86_64` et `linux-aarch64` avec des binaires construits et testés sur l'architecture correspondante. La version annoncée doit correspondre à `mysync --version` et dépasser celle déjà publiée. `--output-dir` désigne la racine montée dans `/releases` ; l'outil crée le sous-dossier de la cible. Le dépôt source ne garantit pas qu'un artefact signé soit disponible sur un serveur donné. La publication de `latest.signed.json` peut déclencher les mises à jour automatiques : vérifier au préalable les bibliothèques natives et le TPM des clients concernés.
 
 Garder la clé privée hors du conteneur et du répertoire public de releases, idéalement hors ligne sur un poste de publication distinct. Un fork génère sa propre clé avec `mysync-release keygen --secret-key /chemin/prive/cle-signature`, remplace `src/update_public_key.hex`, puis reconstruit client et serveur avant publication. La rotation de la clé publique n'est pas automatisée : les anciens clients doivent être réinstallés par un canal fiable. Voir les [garanties de distribution](security.md#distribution-et-exploitation).
 
@@ -50,6 +50,8 @@ L'état client est publié atomiquement une fois par passe modifiée, avec séri
 
 Sauvegarder de façon cohérente le répertoire de données privé, qui contient la base SQLite et les blobs, ainsi que les éléments de configuration nécessaires à la restauration. Éviter une copie brute de SQLite pendant les écritures : arrêter le serveur le temps d'une copie des fichiers, ou utiliser une méthode de sauvegarde SQLite cohérente. Tester régulièrement la restauration sur un hôte isolé. Conserver les sauvegardes et la clé privée hors du dépôt et du répertoire de releases. MySyncFiles ne remplace pas ces sauvegardes : les écrasements ordinaires n'ont pas d'historique restaurable.
 
+`make test` vérifie l'installateur, le formatage Rust, les tests Rust, le rendu des URL de documentation et le build MkDocs. Si les bibliothèques TPM manquent sur l'hôte, les tests Rust passent dans `deploy/Dockerfile.tpm-dev`. `make deploy` lance ces contrôles, valide `deploy/.env`, reconstruit l'image, génère la documentation avec l'origine configurée, recrée le service serveur et copie `site/` vers `/var/www/mysyncfiles/docs/` (ou `MYSYNC_DOCS_DIR`). Il faut Docker Compose, Rust, Python 3, `rsync` et `sudo` sur l'hôte de déploiement. Cette commande ne publie pas de binaire client signé. `make clean` supprime seulement `target/` et `site/` ; les données privées, releases et fichiers déjà déployés restent en place.
+
 `make logs`, `make stop` et `make start` pilotent le serveur sans supprimer les volumes. Les commandes directes `docker compose -f deploy/compose.yaml ...` restent utilisables. Ne pas démarrer deux serveurs sur la même base.
 
 L'appartenance au groupe `docker` accorde des privilèges élevés sur l'hôte. Réserver les commandes Compose aux administrateurs autorisés.
@@ -60,10 +62,10 @@ La documentation se prévisualise indépendamment avec `make docs` sur `http://1
 
 La prévisualisation MkDocs est réservée au poste local. Pour servir la documentation sur l'origine HTTPS du serveur à `/docs/`, construire des fichiers statiques, puis les faire servir par le proxy existant. Cette opération ne change ni l'API, ni l'origine configurée pour les clients TPM.
 
-Depuis la racine du dépôt, fournir l'URL publique **avec le slash final** au build. La valeur est utilisée pour les liens canoniques et le sitemap ; elle n'est pas enregistrée dans le dépôt public :
+Depuis la racine du dépôt, générer le site après `device auth-configure`. `make docs-build` lit l'origine HTTPS enregistrée par l'administrateur dans la base serveur. Elle sert aux commandes d'installation, aux liens canoniques et au sitemap ; elle n'est pas enregistrée dans le dépôt public :
 
 ```sh
-MYSYNC_DOCS_SITE_URL=https://sync.example.org/docs/ make docs-build
+make docs-build
 ```
 
 `site/` est généré localement et ignoré par Git. Sur l'hôte du proxy, installer les fichiers dans le répertoire réservé à la documentation :
@@ -81,4 +83,4 @@ sudo systemctl reload nginx
 curl -fsSI https://sync.example.org/docs/
 ```
 
-`/docs` redirige vers `/docs/` pour que les liens relatifs fonctionnent. Les autres chemins continuent vers le serveur MySyncFiles, avec leurs règles de cache et d'authentification actuelles. Pour mettre les pages à jour, reconstruire avec la même URL puis recopier `site/` ; il n'est pas nécessaire de redémarrer le serveur ou le service de prévisualisation. Ne pas exposer `site/` depuis le répertoire de données privé du serveur.
+`/docs` redirige vers `/docs/` pour que les liens relatifs fonctionnent. Les autres chemins continuent vers le serveur MySyncFiles, avec leurs règles de cache et d'authentification actuelles. Pour mettre les pages à jour sans redémarrer le serveur, reconstruire avec `make docs-build` puis recopier `site/`. `make deploy` effectue ces opérations après les tests et la reconstruction du serveur. Ne pas exposer `site/` depuis le répertoire de données privé du serveur.

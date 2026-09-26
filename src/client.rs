@@ -1,23 +1,25 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::SeekFrom,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
-use futures_util::StreamExt;
 use notify::{RecursiveMode, Watcher};
-use reqwest::{Client, Method, StatusCode};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::local_fs::Mirror;
-use crate::model::{
-    BeginUpload, Entry, Manifest, RestoreRequest, TrashItem, UPLOAD_CHUNK_BYTES, UploadProgress,
+pub use crate::local_fs::ScanIssue;
+use crate::model::Entry;
+
+mod api;
+mod enrollment;
+pub use api::Api;
+pub use enrollment::{
+    SetupOutcome, activate_enrollment, enroll, enroll_with_tcti, setup, setup_with_tcti,
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -57,6 +59,7 @@ struct Seen {
 
 #[derive(Default)]
 pub struct SyncReport {
+    pub issues: Vec<ScanIssue>,
     pub uploaded: usize,
     pub downloaded: usize,
     pub deleted_local: usize,
@@ -65,87 +68,12 @@ pub struct SyncReport {
 }
 
 pub struct Status {
+    pub issues: Vec<ScanIssue>,
     pub local_files: usize,
     pub remote_files: usize,
     pub pending_local: usize,
     pub conflicts: usize,
     pub generation: i64,
-}
-
-pub struct Api {
-    http: Client,
-    base: String,
-    signer: crate::tpm::RequestSigner,
-    session: tokio::sync::Mutex<Option<crate::auth_protocol::Session>>,
-    origin_key: ed25519_dalek::VerifyingKey,
-}
-
-struct AuthenticatedResponse {
-    response: reqwest::Response,
-    proof: crate::origin_auth::ResponseProof,
-}
-
-impl AuthenticatedResponse {
-    fn status(&self) -> StatusCode {
-        self.response.status()
-    }
-    fn error_for_status(self) -> Result<Self> {
-        self.response.error_for_status_ref()?;
-        Ok(self)
-    }
-}
-
-const CONTROL_JSON_LIMIT: usize = 64 * 1024;
-const LIST_JSON_LIMIT: usize = 32 * 1024 * 1024;
-const JSON_TIMEOUT: Duration = Duration::from_secs(30);
-
-// Never let a server choose our allocation size, including for chunked bodies.
-async fn bounded_json<T: DeserializeOwned>(response: reqwest::Response, limit: usize) -> Result<T> {
-    json_body(response, limit, None).await
-}
-
-async fn authenticated_json<T: DeserializeOwned>(
-    response: AuthenticatedResponse,
-    limit: usize,
-) -> Result<T> {
-    let digest = response
-        .proof
-        .body_sha256
-        .context("unsigned JSON body from origin")?;
-    json_body(response.response, limit, Some(&digest)).await
-}
-
-async fn json_body<T: DeserializeOwned>(
-    response: reqwest::Response,
-    limit: usize,
-    digest: Option<&str>,
-) -> Result<T> {
-    let response = response.error_for_status()?;
-    if response
-        .content_length()
-        .is_some_and(|size| size > limit as u64)
-    {
-        bail!("API JSON response exceeds {limit} bytes");
-    }
-    tokio::time::timeout(JSON_TIMEOUT, async {
-        let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if chunk.len() > limit - bytes.len() {
-                bail!("API JSON response exceeds {limit} bytes");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        if let Some(expected) = digest {
-            if crate::auth_protocol::hash(&bytes) != expected {
-                bail!("origin response body integrity check failed");
-            }
-        }
-        Ok(serde_json::from_slice(&bytes)?)
-    })
-    .await
-    .context("API JSON response timed out")?
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
@@ -349,739 +277,10 @@ fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-impl Api {
-    pub fn new(config: &ClientConfig) -> Result<Self> {
-        validate_server_url(&config.server)?;
-        let origin_key = crate::origin_auth::public_key(&config.server_public_key)
-            .context("missing or invalid pinned server key; obtain it from the administrator and run mysync trust-server --public-key KEY")?;
-        if config.identity.is_none() {
-            bail!("TPM identity is missing; enroll this device first");
-        }
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        Ok(Self {
-            origin_key,
-            http,
-            base: config.server.trim_end_matches('/').to_owned(),
-            signer: crate::tpm::RequestSigner::new(
-                config.identity.clone().context("TPM identity is missing")?,
-            )?,
-            session: tokio::sync::Mutex::new(None),
-        })
-    }
-
-    async fn sign_request(&self, request: &mut reqwest::Request, token: &str) -> Result<()> {
-        let bytes = match request.body() {
-            None => &[][..],
-            Some(body) => body
-                .as_bytes()
-                .context("signed requests require a bounded body")?,
-        };
-        let claims = crate::auth_protocol::Claims::new(
-            self.signer.device(),
-            request.method().as_str(),
-            request.url().as_str(),
-            bytes,
-            token,
-        )?;
-        let proof = self.signer.proof(claims).await?;
-        request
-            .headers_mut()
-            .insert(crate::auth_protocol::PROOF_HEADER, proof.parse()?);
-        if !token.is_empty() {
-            request.headers_mut().insert(
-                reqwest::header::AUTHORIZATION,
-                format!("MySync {token}").parse()?,
-            );
-        }
-        Ok(())
-    }
-
-    async fn execute_signed(&self, request: reqwest::Request) -> Result<AuthenticatedResponse> {
-        let request_proof = request
-            .headers()
-            .get(crate::auth_protocol::PROOF_HEADER)
-            .context("missing outgoing request proof")?
-            .to_str()?
-            .to_owned();
-        let response = self.http.execute(request).await?;
-        let encoded = response
-            .headers()
-            .get(crate::origin_auth::RESPONSE_HEADER)
-            .context("origin response signature missing")?
-            .to_str()?;
-        let proof = crate::origin_auth::ResponseProof::verify(
-            encoded,
-            &self.origin_key,
-            &request_proof,
-            response.status().as_u16(),
-        )?;
-        Ok(AuthenticatedResponse { response, proof })
-    }
-
-    pub async fn authenticate(&self) -> Result<()> {
-        self.session_token().await?;
-        Ok(())
-    }
-
-    pub async fn is_approved(&self) -> Result<bool> {
-        let mut request = self.http.post(self.url("/v1/auth/session")).build()?;
-        self.sign_request(&mut request, "").await?;
-        let response = self.execute_signed(request).await?;
-        if response.status() == StatusCode::FORBIDDEN {
-            return Ok(false);
-        }
-        let _: crate::auth_protocol::Session =
-            authenticated_json(response, CONTROL_JSON_LIMIT).await?;
-        Ok(true)
-    }
-
-    async fn session_token(&self) -> Result<String> {
-        let mut session = self.session.lock().await;
-        if let Some(current) = session
-            .as_ref()
-            .filter(|s| s.expires_at > crate::auth_protocol::now() + 30)
-        {
-            return Ok(current.token.clone());
-        }
-        let mut request = self.http.post(self.url("/v1/auth/session")).build()?;
-        self.sign_request(&mut request, "").await?;
-        let response = self.execute_signed(request).await?;
-        if response.status() == StatusCode::FORBIDDEN {
-            bail!("device awaits administrator approval or was revoked");
-        }
-        let created: crate::auth_protocol::Session =
-            authenticated_json(response, CONTROL_JSON_LIMIT).await?;
-        let token = created.token.clone();
-        *session = Some(created);
-        Ok(token)
-    }
-
-    async fn send(&self, builder: reqwest::RequestBuilder) -> Result<AuthenticatedResponse> {
-        let request = builder.build()?;
-        for attempt in 0..2 {
-            let token = self.session_token().await?;
-            let mut request = request.try_clone().context("request cannot be retried")?;
-            self.sign_request(&mut request, &token).await?;
-            let response = self.execute_signed(request).await?;
-            if response.status() != StatusCode::UNAUTHORIZED || attempt == 1 {
-                return Ok(response);
-            }
-            *self.session.lock().await = None;
-        }
-        unreachable!()
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base)
-    }
-
-    pub async fn manifest(&self) -> Result<Manifest> {
-        authenticated_json(
-            self.send(self.http.get(self.url("/v1/manifest"))).await?,
-            LIST_JSON_LIMIT,
-        )
-        .await
-    }
-
-    async fn upload(
-        &self,
-        path: &str,
-        base: i64,
-        local: std::fs::File,
-        expected_sha: &str,
-    ) -> Result<Option<Entry>> {
-        let size = i64::try_from(local.metadata()?.len())?;
-        if size > UPLOAD_CHUNK_BYTES {
-            return self
-                .upload_chunked(path, base, local, size, expected_sha)
-                .await;
-        }
-        let mut bytes = Vec::new();
-        tokio::fs::File::from_std(local)
-            .take(UPLOAD_CHUNK_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        if bytes.len() > UPLOAD_CHUNK_BYTES as usize {
-            bail!("local file grew during upload; retry sync");
-        }
-        let response = self
-            .send(
-                self.http
-                    .request(Method::PUT, self.url("/v1/file"))
-                    .query(&[("path", path), ("base_revision", &base.to_string())])
-                    .body(bytes),
-            )
-            .await?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(None);
-        }
-        Ok(Some(
-            authenticated_json(response, CONTROL_JSON_LIMIT).await?,
-        ))
-    }
-
-    async fn upload_chunked(
-        &self,
-        path: &str,
-        base: i64,
-        local: std::fs::File,
-        size: i64,
-        expected_sha: &str,
-    ) -> Result<Option<Entry>> {
-        let response = self
-            .send(self.http.post(self.url("/v1/uploads")).json(&BeginUpload {
-                path: path.to_owned(),
-                base_revision: base,
-                size,
-                sha256: expected_sha.to_owned(),
-            }))
-            .await?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(None);
-        }
-        let mut progress: UploadProgress = authenticated_json(response, CONTROL_JSON_LIMIT).await?;
-        if progress.offset < 0 || progress.offset > size {
-            bail!("server returned an invalid upload offset");
-        }
-        while progress.offset < size {
-            let length = (size - progress.offset).min(UPLOAD_CHUNK_BYTES) as u64;
-            let mut file = tokio::fs::File::from_std(local.try_clone()?);
-            file.seek(SeekFrom::Start(progress.offset as u64)).await?;
-            let mut bytes = Vec::new();
-            file.take(length).read_to_end(&mut bytes).await?;
-            if bytes.len() != length as usize {
-                bail!("local file changed during upload");
-            }
-            let response = self
-                .send(
-                    self.http
-                        .put(self.url(&format!("/v1/uploads/{}", progress.id)))
-                        .query(&[("offset", progress.offset)])
-                        .header(reqwest::header::CONTENT_LENGTH, length.to_string())
-                        .body(bytes),
-                )
-                .await?
-                .error_for_status()?;
-            let next: UploadProgress = authenticated_json(response, CONTROL_JSON_LIMIT).await?;
-            if next.id != progress.id || next.offset != progress.offset + length as i64 {
-                bail!("server returned an invalid upload offset");
-            }
-            progress = next;
-        }
-        let response = self
-            .send(
-                self.http
-                    .post(self.url(&format!("/v1/uploads/{}/commit", progress.id))),
-            )
-            .await?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(None);
-        }
-        Ok(Some(
-            authenticated_json(response, CONTROL_JSON_LIMIT).await?,
-        ))
-    }
-
-    async fn delete(&self, path: &str, base: i64) -> Result<Option<Entry>> {
-        let response = self
-            .send(
-                self.http
-                    .request(Method::DELETE, self.url("/v1/file"))
-                    .query(&[("path", path), ("base_revision", &base.to_string())]),
-            )
-            .await?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(None);
-        }
-        Ok(Some(
-            authenticated_json(response, CONTROL_JSON_LIMIT).await?,
-        ))
-    }
-
-    async fn download(&self, entry: &Entry, file: std::fs::File) -> Result<bool> {
-        let expected_size = u64::try_from(entry.size.context("download size missing")?)
-            .context("negative download size")?;
-        let response = self
-            .send(
-                self.http
-                    .get(self.url("/v1/file"))
-                    .timeout(Duration::from_secs(60 * 60))
-                    .query(&[
-                        ("path", entry.path.as_str()),
-                        ("revision", &entry.revision.to_string()),
-                    ]),
-            )
-            .await?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(false);
-        }
-        let response = response.error_for_status()?.response;
-        if response
-            .content_length()
-            .is_some_and(|size| size != expected_size)
-        {
-            bail!("download length does not match manifest");
-        }
-        let mut file = tokio::fs::File::from_std(file);
-        let mut stream = response.bytes_stream();
-        let mut hash = Sha256::new();
-        let mut size = 0_u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            size = size
-                .checked_add(chunk.len() as u64)
-                .context("download size overflow")?;
-            if size > expected_size {
-                bail!("download exceeds manifest size for {}", entry.path);
-            }
-            hash.update(&chunk);
-            file.write_all(&chunk).await?;
-        }
-        file.sync_all().await?;
-        if Some(hex::encode(hash.finalize())) != entry.sha256 || size != expected_size {
-            bail!("download integrity check failed for {}", entry.path);
-        }
-        Ok(true)
-    }
-
-    pub async fn trash(&self) -> Result<Vec<TrashItem>> {
-        authenticated_json(
-            self.send(self.http.get(self.url("/v1/trash"))).await?,
-            LIST_JSON_LIMIT,
-        )
-        .await
-    }
-
-    pub async fn restore(&self, id: i64) -> Result<Entry> {
-        authenticated_json(
-            self.send(
-                self.http
-                    .post(self.url("/v1/trash/restore"))
-                    .json(&RestoreRequest { id }),
-            )
-            .await?,
-            CONTROL_JSON_LIMIT,
-        )
-        .await
-    }
-}
-
-pub(crate) fn validate_server_url(server: &str) -> Result<()> {
-    let url = reqwest::Url::parse(server).context("invalid server URL")?;
-    let host = url.host_str().unwrap_or_default();
-    let local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
-    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
-        bail!("server URL must use HTTPS (HTTP is allowed only on loopback)");
-    }
-    if url.query().is_some()
-        || url.fragment().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        bail!("server URL must not contain credentials, a query, or a fragment");
-    }
-    Ok(())
-}
-
-#[derive(Deserialize, Serialize)]
-struct PendingEnrollment {
-    config: ClientConfig,
-    challenge: Option<crate::auth_protocol::EnrollChallenge>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct PairingRequest {
-    server: String,
-    server_public_key: String,
-    root: PathBuf,
-    code: String,
-}
-
-pub struct SetupOutcome {
-    pub report: SyncReport,
-    pub conflicts: usize,
-}
-
-async fn wait_for_pair_ready(
-    server: &str,
-    code: &str,
-    deadline: tokio::time::Instant,
-) -> Result<bool> {
-    validate_server_url(server)?;
-    let http = Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let url = format!("{}/v1/enroll/ready", server.trim_end_matches('/'));
-    let mut interval = Duration::from_secs(5);
-    loop {
-        match http
-            .post(&url)
-            .json(&serde_json::json!({"code": code}))
-            .send()
-            .await
-        {
-            Ok(response) if response.status() == StatusCode::NO_CONTENT => return Ok(true),
-            Ok(response) if response.status() == StatusCode::GONE => return Ok(false),
-            Ok(response) if response.status() == StatusCode::ACCEPTED => {
-                interval = Duration::from_secs(5);
-            }
-            Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
-                interval = Duration::from_secs(30);
-            }
-            Ok(response) => bail!("pairing readiness failed: HTTP {}", response.status()),
-            Err(_) => interval = std::cmp::min(interval * 2, Duration::from_secs(30)),
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for administrator; rerun setup to resume")
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-async fn wait_for_approval(
-    config_path: &Path,
-    server: &str,
-    code: &str,
-    deadline: tokio::time::Instant,
-) -> Result<bool> {
-    let pending_path = config_path.with_extension("enrollment.json");
-    let pending: PendingEnrollment = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
-    let api = Api::new(&pending.config)?;
-    let ready_url = format!("{}/v1/enroll/ready", server.trim_end_matches('/'));
-    loop {
-        if api.is_approved().await? {
-            return Ok(true);
-        }
-        let response = api
-            .http
-            .post(&ready_url)
-            .json(&serde_json::json!({"code": code}))
-            .send()
-            .await?;
-        if response.status() == StatusCode::GONE {
-            if api.is_approved().await? {
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-        if response.status() != StatusCode::NO_CONTENT
-            && response.status() != StatusCode::TOO_MANY_REQUESTS
-        {
-            bail!("pairing status failed: HTTP {}", response.status());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for administrator approval; rerun setup to resume")
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-}
-
-pub async fn setup(
-    config_path: &Path,
-    server: String,
-    server_public_key: String,
-    root: PathBuf,
-    ek_cert: Option<PathBuf>,
-    ek_chain: Option<PathBuf>,
-) -> Result<SetupOutcome> {
-    setup_with_tcti(
-        config_path,
-        server,
-        server_public_key,
-        root,
-        ek_cert,
-        ek_chain,
-        crate::tpm::default_tcti(),
-    )
-    .await
-}
-
-pub async fn setup_with_tcti(
-    config_path: &Path,
-    server: String,
-    server_public_key: String,
-    root: PathBuf,
-    ek_cert: Option<PathBuf>,
-    ek_chain: Option<PathBuf>,
-    tcti: String,
-) -> Result<SetupOutcome> {
-    validate_server_url(&server)?;
-    let server_public_key =
-        hex::encode(crate::origin_auth::public_key(&server_public_key)?.to_bytes());
-    std::fs::create_dir_all(&root)?;
-    let root = root.canonicalize()?;
-    let parent = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    if parent.canonicalize()?.starts_with(&root) {
-        bail!("config must be outside the synchronized folder");
-    }
-    let pair_path = config_path.with_extension("pairing.json");
-    if config_path.exists() {
-        let config = load_config(config_path)?;
-        if config.server != server
-            || config.root != root
-            || config.server_public_key != server_public_key
-        {
-            bail!("existing client profile has a different server, key or folder");
-        }
-        let report = sync(config_path).await?;
-        let conflicts = status(config_path).await?.conflicts;
-        if pair_path.exists() {
-            std::fs::remove_file(pair_path)?;
-        }
-        return Ok(SetupOutcome { report, conflicts });
-    }
-    let pair_lock = acquire_lock(config_path).await?;
-    if config_path.exists() {
-        bail!("client was configured by another setup process; rerun setup");
-    }
-    let request: PairingRequest = if pair_path.exists() {
-        let request: PairingRequest = serde_json::from_slice(&std::fs::read(&pair_path)?)?;
-        if request.server != server
-            || request.root != root
-            || request.server_public_key != server_public_key
-        {
-            bail!("another pairing is already pending");
-        }
-        request
-    } else {
-        if config_path.with_extension("enrollment.json").exists() {
-            bail!("a manual enrollment is already pending");
-        }
-        let request = PairingRequest {
-            server: server.clone(),
-            server_public_key: server_public_key.clone(),
-            root: root.clone(),
-            code: crate::device_auth::pairing_code()?,
-        };
-        private_write_json(&pair_path, &request)?;
-        request
-    };
-    drop(pair_lock);
-    println!("Pairing code: {}", request.code);
-    println!("Ask the administrator to run `make pair` on the server. Waiting...");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
-    let pending_path = config_path.with_extension("enrollment.json");
-    let already_approved = if pending_path.exists() {
-        let pending: PendingEnrollment = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
-        Api::new(&pending.config)?.is_approved().await?
-    } else {
-        false
-    };
-    if !already_approved {
-        if !wait_for_pair_ready(&server, &request.code, deadline).await? {
-            if pending_path.exists() {
-                std::fs::remove_file(&pending_path)?;
-            }
-            std::fs::remove_file(&pair_path)?;
-            bail!("pairing code expired or was cancelled; rerun setup for a new code");
-        }
-        let enrolled = enroll_with_tcti(
-            config_path,
-            server,
-            server_public_key,
-            root,
-            crate::device_auth::normalize_pairing_code(&request.code)?,
-            ek_cert,
-            ek_chain,
-            tcti,
-        )
-        .await?;
-        println!("TPM fingerprint: {}", enrolled.fingerprint);
-        println!("Waiting for administrator fingerprint confirmation...");
-        if !wait_for_approval(config_path, &request.server, &request.code, deadline).await? {
-            std::fs::remove_file(&pending_path)?;
-            std::fs::remove_file(&pair_path)?;
-            bail!("pairing was cancelled or expired; rerun setup for a new code");
-        }
-    }
-    let report = activate_enrollment(config_path).await?;
-    let conflicts = status(config_path).await?.conflicts;
-    std::fs::remove_file(pair_path)?;
-    Ok(SetupOutcome { report, conflicts })
-}
-
-pub async fn enroll(
-    config_path: &Path,
-    server: String,
-    server_public_key: String,
-    root: PathBuf,
-    invitation: String,
-    ek_cert: Option<PathBuf>,
-    ek_chain: Option<PathBuf>,
-) -> Result<crate::auth_protocol::Enrollment> {
-    enroll_with_tcti(
-        config_path,
-        server,
-        server_public_key,
-        root,
-        invitation,
-        ek_cert,
-        ek_chain,
-        crate::tpm::default_tcti(),
-    )
-    .await
-}
-
-/// Enroll through a specific TPM transport. Certificate verification on the
-/// server is unchanged; simulated TPMs require an explicitly trusted test CA.
-pub async fn enroll_with_tcti(
-    config_path: &Path,
-    server: String,
-    server_public_key: String,
-    root: PathBuf,
-    invitation: String,
-    ek_cert: Option<PathBuf>,
-    ek_chain: Option<PathBuf>,
-    tcti: String,
-) -> Result<crate::auth_protocol::Enrollment> {
-    use crate::auth_protocol::{EnrollChallenge, EnrollFinish, EnrollStart, Enrollment};
-    validate_server_url(&server)?;
-    let server_public_key =
-        hex::encode(crate::origin_auth::public_key(&server_public_key)?.to_bytes());
-    let parent = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    std::fs::create_dir_all(&root)?;
-    let root = root.canonicalize()?;
-    if parent.canonicalize()?.starts_with(&root) {
-        bail!("config must be outside the synchronized folder");
-    }
-    let _lock = acquire_lock(config_path).await?;
-    if config_path.exists() {
-        bail!("config already exists; enrollment requires a fresh client profile");
-    }
-    let pending_path = config_path.with_extension("enrollment.json");
-    let external_certificate = ek_cert
-        .as_deref()
-        .map(crate::tpm::read_ek_certificate)
-        .transpose()?;
-    let mut pending: PendingEnrollment = if pending_path.exists() {
-        let value: PendingEnrollment = serde_json::from_slice(&std::fs::read(&pending_path)?)?;
-        if value.config.root != root
-            || value.config.server != server
-            || value.config.server_public_key != server_public_key
-        {
-            bail!("another enrollment is already pending");
-        }
-        value
-    } else {
-        let creation_certificate = external_certificate.clone();
-        let identity = tokio::task::spawn_blocking(move || {
-            if let Some(certificate) = creation_certificate {
-                let kind = crate::tpm::certificate_kind(&certificate)?;
-                crate::tpm::Identity::create_with_certificate(&tcti, kind, Some(&certificate))
-                    .map(|(identity, _)| identity)
-            } else {
-                crate::tpm::Identity::create(&tcti, "rsa")
-                    .or_else(|_| crate::tpm::Identity::create(&tcti, "ecc"))
-                    .map(|(identity, _)| identity)
-            }
-        })
-        .await??;
-        let config = ClientConfig {
-            server,
-            server_public_key,
-            identity: Some(identity),
-            root,
-            auto_update: true,
-            update_public_key: default_update_public_key(),
-        };
-        Api::new(&config)?;
-        let pending = PendingEnrollment {
-            config,
-            challenge: None,
-        };
-        private_write_json(&pending_path, &pending)?;
-        pending
-    };
-    let api = Api::new(&pending.config)?;
-    if pending.challenge.is_none() {
-        let identity = pending
-            .config
-            .identity
-            .clone()
-            .context("missing pending TPM key")?;
-        let cert_identity = identity.clone();
-        let leaf = tokio::task::spawn_blocking(move || {
-            if let Some(certificate) = external_certificate {
-                cert_identity.ek_certificate_from(&certificate)
-            } else {
-                cert_identity.ek_certificate()
-            }
-        })
-        .await??;
-        let mut chain = vec![hex::encode(leaf)];
-        if let Some(path) = ek_chain {
-            for cert in openssl::x509::X509::stack_from_pem(&std::fs::read(path)?)? {
-                chain.push(hex::encode(cert.to_der()?));
-            }
-        }
-        let challenge: EnrollChallenge = bounded_json(
-            api.http
-                .post(api.url("/v1/enroll/start"))
-                .json(&EnrollStart {
-                    invitation,
-                    public: identity.public,
-                    ek_chain: chain,
-                })
-                .send()
-                .await?,
-            CONTROL_JSON_LIMIT,
-        )
-        .await?;
-        pending.config.identity.as_mut().unwrap().device = challenge.id.clone();
-        pending.challenge = Some(challenge);
-        private_write_json(&pending_path, &pending)?;
-    }
-    let identity = pending.config.identity.clone().unwrap();
-    let challenge = pending.challenge.clone().unwrap();
-    let id = challenge.id.clone();
-    let activation = tokio::task::spawn_blocking(move || identity.activate(&challenge)).await??;
-    let result: Enrollment = bounded_json(
-        api.http
-            .post(api.url("/v1/enroll/finish"))
-            .json(&EnrollFinish { id, activation })
-            .send()
-            .await?,
-        CONTROL_JSON_LIMIT,
-    )
-    .await?;
-    if result.fingerprint != pending.config.identity.as_ref().unwrap().fingerprint()? {
-        bail!("server returned an unexpected device fingerprint");
-    }
-    Ok(result)
-}
-
-pub async fn activate_enrollment(config_path: &Path) -> Result<SyncReport> {
-    let lock = acquire_lock(config_path).await?;
-    let pending_path = config_path.with_extension("enrollment.json");
-    let pending: PendingEnrollment =
-        serde_json::from_slice(&std::fs::read(&pending_path).context("no pending enrollment")?)?;
-    Api::new(&pending.config)?.authenticate().await?;
-    private_write_json(config_path, &pending.config)?;
-    std::fs::remove_file(pending_path)?;
-    drop(lock);
-    sync(config_path).await
-}
-
-fn hash_file(mut file: std::fs::File) -> Result<String> {
-    hash_reader(&mut file, || {})
-}
-
-fn hash_reader(mut reader: impl std::io::Read, mut after_read: impl FnMut()) -> Result<String> {
+fn hash_reader(
+    mut reader: impl std::io::Read,
+    mut after_read: impl FnMut() -> Result<()>,
+) -> Result<String> {
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -1090,12 +289,19 @@ fn hash_reader(mut reader: impl std::io::Read, mut after_read: impl FnMut()) -> 
             break;
         }
         hash.update(&buffer[..size]);
-        after_read();
+        after_read()?;
     }
     Ok(hex::encode(hash.finalize()))
 }
 
-fn file_stamp(file: &std::fs::File) -> Result<(u64, u64, u64, u64, i64, i64, i64, i64)> {
+#[cfg(test)]
+fn hash_file(mut file: std::fs::File) -> Result<String> {
+    hash_reader(&mut file, || Ok(()))
+}
+
+type FileStamp = (u64, u64, u64, u64, i64, i64, i64, i64);
+
+fn file_stamp(file: &std::fs::File) -> Result<FileStamp> {
     use std::os::unix::fs::MetadataExt;
     let m = file.metadata()?;
     Ok((
@@ -1113,22 +319,50 @@ fn file_stamp(file: &std::fs::File) -> Result<(u64, u64, u64, u64, i64, i64, i64
 fn unchanged_capture(
     file: &mut std::fs::File,
     observed: Option<&String>,
-    after_read: impl FnMut(),
+    mut after_read: impl FnMut(),
 ) -> Result<bool> {
     let before = file_stamp(file)?;
-    let digest = hash_reader(&mut *file, after_read)?;
+    let digest = hash_reader(&mut *file, || {
+        after_read();
+        Ok(())
+    })?;
     // A digest can match even when an already-read region was edited. ctime
     // also catches writers that restore mtime; atime is deliberately ignored.
     Ok(before == file_stamp(file)? && Some(&digest) == observed)
 }
 
-fn scan(mirror: &Mirror) -> Result<BTreeMap<String, String>> {
-    let mut found = BTreeMap::new();
-    mirror.visit_files(false, |path, file| {
-        found.insert(path, hash_file(file)?);
-        Ok(())
-    })?;
-    Ok(found)
+struct Scan {
+    files: BTreeMap<String, String>,
+    issues: Vec<ScanIssue>,
+}
+
+async fn scan(mirror: &Mirror) -> Result<Scan> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Cancel(Arc<AtomicBool>);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel = Cancel(cancelled.clone());
+    let mirror = mirror.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut files = BTreeMap::new();
+        let issues = mirror.visit_files(false, |path, file| {
+            let digest = hash_reader(file, || {
+                anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "scan cancelled");
+                Ok(())
+            })?;
+            files.insert(path, digest);
+            Ok(())
+        })?;
+        Ok(Scan { files, issues })
+    })
+    .await?
 }
 
 async fn apply_remote(
@@ -1180,9 +414,11 @@ async fn apply_remote(
             let captured = backup
                 .read()?
                 .ok_or_else(|| anyhow!("recovery copy disappeared"))?;
+            captured.sync_all()?;
             if let Some(temp) = &temp {
                 temp.file
                     .set_permissions(captured.metadata()?.permissions())?;
+                temp.file.sync_all()?;
             }
         }
         Some((backup, display))
@@ -1244,7 +480,19 @@ async fn sync_pass(
         .into_iter()
         .map(|entry| (entry.path.clone(), entry))
         .collect();
-    let local = scan(mirror)?;
+    let scanned = scan(mirror).await?;
+    let local = scanned.files;
+    let pass_issues = scanned.issues;
+    for issue in &pass_issues {
+        if !report
+            .issues
+            .iter()
+            .any(|previous| previous.path == issue.path && previous.error == issue.error)
+        {
+            report.issues.push(issue.clone());
+        }
+        eprintln!("sync skipped {:?}: {}", issue.path, issue.error);
+    }
     let mut checkpoint = Checkpoint::open(config_path)?;
     let state = &checkpoint.state;
     let paths: BTreeSet<String> = remote
@@ -1305,6 +553,9 @@ async fn sync_pass(
     let result = async {
         let mut rescan = false;
         for path in paths {
+            if pass_issues.iter().any(|issue| issue.affects(&path)) {
+                continue;
+            }
             let server = remote.get(&path);
             let observed = local.get(&path);
             let prior = checkpoint.state.entries.get(&path);
@@ -1354,12 +605,11 @@ async fn sync_pass(
                 }
             } else if local_changed {
                 let base = prior.map(|seen| seen.revision).unwrap_or(0);
-                let result = if observed.is_some() {
+                let result = if let Some(observed) = observed {
                     let Some(file) = mirror.read(&path)? else {
                         return Ok(true);
                     };
-                    api.upload(&path, base, file, observed.expect("local file exists"))
-                        .await?
+                    api.upload(&path, base, file, observed).await?
                 } else if server.is_some_and(|entry| !entry.deleted) {
                     api.delete(&path, base).await?
                 } else {
@@ -1414,7 +664,9 @@ pub async fn status(config_path: &Path) -> Result<Status> {
     let api = Api::new(&config)?;
     let manifest = api.manifest().await?;
     let mirror = Mirror::open(&config.root)?;
-    let local = scan(&mirror)?;
+    let scanned = scan(&mirror).await?;
+    let local = scanned.files;
+    let mut issues = scanned.issues;
     let state = load_state(config_path)?;
     let changed_files = local
         .iter()
@@ -1429,14 +681,19 @@ pub async fn status(config_path: &Path) -> Result<Status> {
     let deleted_files = state
         .entries
         .iter()
-        .filter(|(path, seen)| seen.sha256.is_some() && !local.contains_key(*path))
+        .filter(|(path, seen)| {
+            seen.sha256.is_some()
+                && !local.contains_key(*path)
+                && !issues.iter().any(|issue| issue.affects(path))
+        })
         .count();
     let mut conflicts = 0;
-    mirror.visit_files(true, |_, _| {
+    issues.extend(mirror.visit_files(true, |_, _| {
         conflicts += 1;
         Ok(())
-    })?;
+    })?);
     Ok(Status {
+        issues,
         local_files: local.len(),
         remote_files: manifest
             .entries
@@ -1455,13 +712,26 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let watch_root = config.root.clone();
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if event.is_ok_and(|event| watch_event_requires_sync(&watch_root, &event)) {
-            let _ = tx.try_send(());
-        }
-    })?;
-    if let Err(error) = watcher.watch(&config.root, RecursiveMode::Recursive) {
+    let mut watcher: Option<notify::RecommendedWatcher> =
+        match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if event.is_ok_and(|event| watch_event_requires_sync(&watch_root, &event)) {
+                let _ = tx.try_send(());
+            }
+        }) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                eprintln!(
+                    "filesystem watcher unavailable ({error}); continuing with 15-second polling"
+                );
+                None
+            }
+        };
+    let watch_error = watcher
+        .as_mut()
+        .and_then(|watcher| watcher.watch(&config.root, RecursiveMode::Recursive).err());
+    if let Some(error) = watch_error {
         eprintln!("filesystem watcher unavailable ({error}); continuing with 15-second polling");
+        drop(watcher.take());
     }
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1469,13 +739,19 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
     let mut update_interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
     update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let result = async {
+        let sync = async {
             let _lock = acquire_lock(config_path).await?;
             sync_passes(config_path, &config.root, &api).await
-        }
-        .await;
-        if let Err(error) = result {
-            eprintln!("sync failed: {error:#}");
+        };
+        tokio::pin!(sync);
+        tokio::select! {
+            result = &mut sync => {
+                if let Err(error) = result {
+                    eprintln!("sync failed: {error:#}");
+                }
+            }
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = terminate.recv() => return Ok(()),
         }
         tokio::select! {
             _ = interval.tick() => {},
@@ -1487,13 +763,19 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
                 while rx.try_recv().is_ok() {}
             },
             _ = update_interval.tick(), if config.auto_update => {
-                match crate::update::check_and_install(&config).await {
-                    Ok(crate::update::UpdateOutcome::Installed(version)) => {
-                        eprintln!("client updated to {version}; restarting service");
-                        return Ok(());
-                    }
-                    Ok(crate::update::UpdateOutcome::Current) => {}
-                    Err(error) => eprintln!("client update check failed: {error:#}"),
+                let update = crate::update::check_and_install(&config.server, &config.update_public_key);
+                tokio::pin!(update);
+                tokio::select! {
+                    result = &mut update => match result {
+                        Ok(crate::update::UpdateOutcome::Installed(version)) => {
+                            eprintln!("client updated to {version}; restarting service");
+                            return Ok(());
+                        }
+                        Ok(crate::update::UpdateOutcome::Current) => {}
+                        Err(error) => eprintln!("client update check failed: {error:#}"),
+                    },
+                    _ = tokio::signal::ctrl_c() => return Ok(()),
+                    _ = terminate.recv() => return Ok(()),
                 }
             },
             _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -1655,28 +937,5 @@ mod tests {
             root,
             &Event::new(EventKind::Other).set_flag(Flag::Rescan)
         ));
-    }
-
-    #[tokio::test]
-    async fn json_body_deadline_does_not_wait_for_eof() -> Result<()> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let url = format!("http://{}", listener.local_addr()?);
-        let router = axum::Router::new().fallback(|| async {
-            axum::body::Body::from_stream(futures_util::stream::pending::<
-                Result<Vec<u8>, std::io::Error>,
-            >())
-        });
-        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let response = Client::new().get(url).send().await?;
-        tokio::time::pause();
-        let start = tokio::time::Instant::now();
-        let result = bounded_json::<serde_json::Value>(response, CONTROL_JSON_LIMIT).await;
-        assert!(result.unwrap_err().to_string().contains("timed out"));
-        assert!(
-            start.elapsed() >= JSON_TIMEOUT
-                && start.elapsed() <= JSON_TIMEOUT + Duration::from_millis(10)
-        );
-        task.abort();
-        Ok(())
     }
 }

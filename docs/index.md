@@ -10,6 +10,14 @@ MySyncFiles synchronise un dossier entre des appareils Linux. Le serveur stocke 
 
 Le serveur n'a pas besoin de TPM. Chaque client a besoin d'un TPM 2.0 et d'un certificat EK constructeur vérifiable. Debian 13 et Arch Linux sont les systèmes clients testés.
 
+Après configuration de l'origine publique et publication d'une release signée, installer le client avec cette commande dans un terminal :
+
+```sh
+curl -fsS --proto '=https' --max-redirs 0 https://sync.example.org/install.sh | sh
+```
+
+Dans la documentation publiée avec `make docs-build` ou `make deploy`, le domaine de cette commande est remplacé par l'origine HTTPS configurée par l'administrateur.
+
 ## Repères
 
 | Terme | Sens |

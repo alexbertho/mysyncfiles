@@ -143,6 +143,33 @@ impl Simulator {
         )?;
         Ok(())
     }
+    fn install_chain(&self, certificates: &[Vec<u8>]) -> Result<()> {
+        self.install_chain_parts(&[certificates.concat()])
+    }
+    fn install_chain_parts(&self, parts: &[Vec<u8>]) -> Result<()> {
+        for (offset, bytes) in parts.iter().enumerate() {
+            let path = self._dir.path().join(format!("ek-chain-{offset}.der"));
+            std::fs::write(&path, bytes)?;
+            let index = format!("0x{:08x}", 0x01c00100 + offset);
+            self.tool(
+                "tpm2_nvdefine",
+                &[
+                    &index,
+                    "-C",
+                    "o",
+                    "-s",
+                    &bytes.len().to_string(),
+                    "-a",
+                    "ownerread|ownerwrite|authread",
+                ],
+            )?;
+            self.tool(
+                "tpm2_nvwrite",
+                &[&index, "-C", "o", "-i", path.to_str().unwrap()],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[test]
@@ -281,6 +308,30 @@ impl Certificate {
                 .build()?,
         )?;
         builder.sign(&key, MessageDigest::sha256())?;
+        Ok(Self {
+            key,
+            certificate: builder.build(),
+        })
+    }
+    fn intermediate(&self) -> Result<Self> {
+        let key = PKey::from_rsa(Rsa::generate(2048)?)?;
+        let mut name = X509NameBuilder::new()?;
+        name.append_entry_by_text("CN", "MySync ephemeral intermediate CA")?;
+        let name = name.build();
+        let mut builder = X509::builder()?;
+        builder.set_version(2)?;
+        let serial = openssl::bn::BigNum::from_u32(3)?.to_asn1_integer()?;
+        builder.set_serial_number(&serial)?;
+        builder.set_subject_name(&name)?;
+        builder.set_issuer_name(self.certificate.subject_name())?;
+        builder.set_pubkey(&key)?;
+        let start = Asn1Time::days_from_now(0)?;
+        let end = Asn1Time::days_from_now(2)?;
+        builder.set_not_before(&start)?;
+        builder.set_not_after(&end)?;
+        builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
+        builder.append_extension(KeyUsage::new().critical().key_cert_sign().build()?)?;
+        builder.sign(&self.key, MessageDigest::sha256())?;
         Ok(Self {
             key,
             certificate: builder.build(),
@@ -562,6 +613,96 @@ async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
     )
     .await?;
     assert_eq!(cleared.conflicts, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_replaces_an_expired_resumed_pairing_code_in_one_run() -> Result<()> {
+    let ca = Certificate::ca()?;
+    let simulator = Simulator::start()?;
+    simulator.certify_ek(&ca, "rsa")?;
+    let server = Server::start(&ca).await?;
+    let local = tempfile::tempdir()?;
+    let config = local.path().join("config.json");
+    let root = local.path().join("mirror");
+    std::fs::create_dir(&root)?;
+    let old_code = device_auth::pairing_code()?;
+    let old_id = device_auth::register_pair(&server.state, "stale-client", &old_code)?;
+    server.db()?.execute(
+        "UPDATE device_enrollments SET expires_at=1 WHERE id=?1",
+        [&old_id],
+    )?;
+    let pair_path = config.with_extension("pairing.json");
+    std::fs::write(
+        &pair_path,
+        serde_json::to_vec(&serde_json::json!({
+            "server": server.url,
+            "server_public_key": server.state.public_key(),
+            "root": root,
+            "code": old_code,
+        }))?,
+    )?;
+    let (identity, _) = Identity::create(&simulator.tcti, "rsa")?;
+    std::fs::write(
+        config.with_extension("enrollment.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "config": ClientConfig {
+                server: server.url.clone(),
+                server_public_key: server.state.public_key(),
+                identity: Some(identity),
+                root: root.clone(),
+                auto_update: true,
+                update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
+            },
+            "challenge": null,
+        }))?,
+    )?;
+    let origin = server.url.clone();
+    let origin_key = server.state.public_key();
+    let pending_config = config.clone();
+    let pending_root = root.clone();
+    let tcti = simulator.tcti.clone();
+    let setup = tokio::spawn(async move {
+        client::setup_with_tcti(
+            &pending_config,
+            origin,
+            origin_key,
+            pending_root,
+            None,
+            None,
+            tcti,
+        )
+        .await
+    });
+    let new_code = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&pair_path) {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let code = value["code"].as_str().unwrap();
+                if code != old_code {
+                    break Ok::<String, anyhow::Error>(code.to_owned());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let new_id = device_auth::register_pair(&server.state, "resumed-client", &new_code)?;
+    let fingerprint = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let entry = device_auth::enrollment_by_id(&server.state, &new_id)?;
+            if entry.status == "pending-approval" {
+                break Ok::<String, anyhow::Error>(entry.fingerprint.unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    device_auth::approve(&server.state, &new_id, &fingerprint)?;
+    let outcome = tokio::time::timeout(Duration::from_secs(30), setup).await???;
+    assert_eq!(outcome.conflicts, 0);
+    assert!(config.exists());
+    assert!(!pair_path.exists());
     Ok(())
 }
 
@@ -1078,6 +1219,76 @@ async fn tpm_attestation_requires_trusted_valid_ek_and_one_key_per_invitation() 
     );
     device_auth::invite(&server.state, "cancelled")?;
     assert!(device_auth::cancel(&server.state, &key.device).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_enrolls_with_embedded_ek_intermediates() -> Result<()> {
+    let root_ca = Certificate::ca()?;
+    let issuing_ca = root_ca.intermediate()?;
+    let simulator = Simulator::start()?;
+    simulator.certify_ek(&issuing_ca, "rsa")?;
+    let embedded = vec![
+        issuing_ca.certificate.to_der()?,
+        root_ca.certificate.to_der()?,
+    ];
+    simulator.install_chain(&embedded)?;
+    let (identity, _) = Identity::create(&simulator.tcti, "rsa")?;
+    assert_eq!(identity.ek_intermediates()?, embedded);
+
+    let server = Server::start(&root_ca).await?;
+    let local = tempfile::tempdir()?;
+    let mirror = local.path().join("mirror");
+    std::fs::create_dir(&mirror)?;
+    let config = local.path().join("config.json");
+    let invitation = device_auth::invite(&server.state, "embedded-chain")?;
+    let enrolled = client::enroll_with_tcti(
+        &config,
+        server.url.clone(),
+        server.state.public_key(),
+        mirror,
+        invitation,
+        None,
+        None,
+        simulator.tcti.clone(),
+    )
+    .await?;
+    assert_eq!(enrolled.status, "pending-approval");
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_enrolls_with_ek_chain_split_across_nv_indices() -> Result<()> {
+    let root_ca = Certificate::ca()?;
+    let issuing_ca = root_ca.intermediate()?;
+    let simulator = Simulator::start()?;
+    simulator.certify_ek(&issuing_ca, "rsa")?;
+    let root_der = root_ca.certificate.to_der()?;
+    let issuer_der = issuing_ca.certificate.to_der()?;
+    let split = issuer_der.len() / 2;
+    let mut first_index = root_der.clone();
+    first_index.extend_from_slice(&issuer_der[..split]);
+    simulator.install_chain_parts(&[first_index, issuer_der[split..].to_vec()])?;
+    let (identity, _) = Identity::create(&simulator.tcti, "rsa")?;
+    assert_eq!(identity.ek_intermediates()?, vec![root_der, issuer_der]);
+
+    let server = Server::start(&root_ca).await?;
+    let local = tempfile::tempdir()?;
+    let mirror = local.path().join("mirror");
+    std::fs::create_dir(&mirror)?;
+    let invitation = device_auth::invite(&server.state, "split-chain")?;
+    let enrolled = client::enroll_with_tcti(
+        &local.path().join("config.json"),
+        server.url.clone(),
+        server.state.public_key(),
+        mirror,
+        invitation,
+        None,
+        None,
+        simulator.tcti.clone(),
+    )
+    .await?;
+    assert_eq!(enrolled.status, "pending-approval");
     Ok(())
 }
 

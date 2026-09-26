@@ -16,14 +16,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
       - name: Install TPM build and simulator dependencies
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libssl-dev pkg-config swtpm swtpm-tools tpm2-tools
       - name: Format and test
-        run: |
-          sh -n deploy/install.sh
-          cargo fmt --all -- --check
-          cargo test --locked
+        run: make test
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build release binaries
         run: cargo build --release --locked --bins
       - name: Verify TPM enrollment on Debian 13 and Arch runtimes
@@ -40,8 +39,6 @@ jobs:
         run: docker run --rm --mount type=bind,source="$PWD/target/release/mysync",target=/usr/local/bin/mysync,readonly archlinux:base bash -c 'pacman -Syu --noconfirm --needed tpm2-tss openssl && /usr/local/bin/mysync --version'
       - name: Build server image
         run: docker build -f deploy/Dockerfile .
-      - name: Validate documentation
-        run: make docs-check
       - name: Audit Rust dependencies
         run: |
           cargo install cargo-audit --locked --version 0.22.2

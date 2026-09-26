@@ -49,6 +49,10 @@ services:
         source: ../docs
         target: /workspace/docs
         read_only: true
+      - type: bind
+        source: ./mkdocs_hooks.py
+        target: /workspace/mkdocs_hooks.py
+        read_only: true
     ports:
       - "127.0.0.1:8000:8000"
     stop_grace_period: 2s

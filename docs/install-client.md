@@ -6,7 +6,7 @@ Sauvegarder les fichiers importants avant la première synchronisation. Choisir 
 
 ## Installer le binaire signé
 
-Remplacer le domaine d'exemple par l'origine HTTPS du serveur. Dans un terminal :
+Dans la documentation source, remplacer le domaine d'exemple par l'origine HTTPS du serveur. La documentation publiée par `make docs-build` ou `make deploy` utilise automatiquement l'origine configurée par l'administrateur. Dans un terminal :
 
 ```sh
 curl -fsS --proto '=https' --max-redirs 0 https://sync.example.org/install.sh | sh
@@ -14,7 +14,9 @@ curl -fsS --proto '=https' --max-redirs 0 https://sync.example.org/install.sh | 
 
 Pour examiner le script avant sa première exécution, le télécharger dans un fichier, le lire, puis lancer `sh install.sh`. Le script utilise `/dev/tty` pour les questions interactives : l'appairage fonctionne aussi lorsque le script est transmis à `sh` par un pipe.
 
-Le script propose les paquets manquants sur Debian/Arch avant tout `sudo`, vérifie la signature de la release et le hash du binaire, puis contrôle l'accès au TPM. Dans un terminal, il demande le dossier miroir, affiche un code temporaire et attend l'administrateur. Il lance la première synchronisation puis le service utilisateur seulement si l'appairage réussit et qu'aucun conflit ne reste dans `.mysync-conflicts/`. Une unité systemd existante différente est laissée intacte et n'est pas démarrée automatiquement. Sans terminal, il installe le binaire et l'unité sans appairer ni démarrer le service. Une installation existante n'est pas remplacée. L'examen du script et la confiance dans l'origine HTTPS restent importants : la signature du binaire ne protège pas un script distant compromis.
+Le script propose les paquets manquants sur Debian/Arch avant tout `sudo`, vérifie la signature de la release et le hash du binaire, puis contrôle l'accès au TPM. Si `/dev/tpmrm0` est accessible au groupe `tss` mais pas à l'utilisateur courant, il propose de l'ajouter à ce groupe avec `sudo`. Il s'arrête ensuite : il faut fermer la session et se reconnecter (ou redémarrer), puis relancer l'installation pour que le nouveau groupe soit actif. Sans terminal, il affiche la commande à lancer manuellement. Dans un terminal, il demande le dossier miroir, affiche un code temporaire et attend l'administrateur. Si un ancien code d'appairage enregistré localement a expiré ou a été annulé, la reprise en crée un nouveau dans ce même lancement. Il lance la première synchronisation puis le service utilisateur seulement si l'appairage réussit et qu'aucun conflit ne reste dans `.mysync-conflicts/`. Une unité systemd existante différente est laissée intacte et n'est pas démarrée automatiquement. Sans terminal, il installe le binaire et l'unité sans appairer ni démarrer le service. Si un binaire existant diffère de la release signée, l'installateur refuse les versions plus récentes et demande confirmation avant de sauvegarder puis remplacer une version identique ou plus ancienne. Sans terminal, il demande de déplacer manuellement l'ancien binaire. L'examen du script et la confiance dans l'origine HTTPS restent importants : la signature du binaire ne protège pas un script distant compromis.
+
+Si un ancien profil contient un jeton `token`, l'installateur interactif propose de conserver ce profil et son état de révisions dans un dossier privé `legacy-profile.*` sous la configuration du client, puis reprend l'appairage TPM. Le dossier synchronisé reste à sa place ; sauvegarder séparément ses fichiers importants avant la première synchronisation et examiner les éventuels conflits. Sans terminal, le script s'arrête avec une explication. Un profil qui contient aussi une identité TPM doit être examiné manuellement : l'installateur ne l'archive pas automatiquement. Le jeton ancien n'est jamais accepté comme identité par le nouveau client.
 
 Si le certificat EK constructeur manque dans les index NV du TPM, fournir son fichier DER obtenu auprès du fabricant :
 
@@ -22,7 +24,7 @@ Si le certificat EK constructeur manque dans les index NV du TPM, fournir son fi
 curl -fsS --proto '=https' --max-redirs 0 https://sync.example.org/install.sh | MYSYNC_EK_CERT=/chemin/prive/ek.der sh
 ```
 
-L'installateur transmet le même certificat à `mysync setup`. Pour des intermédiaires EK constructeur, définir `MYSYNC_EK_CHAIN=/chemin/intermediaires.pem` lors de l'installation. Voir la [procédure et ses limites](device-auth.md#certificat-ek-absent-du-tpm). Ne pas remplacer le certificat constructeur par un certificat auto-signé.
+L'installateur transmet le même certificat à `mysync setup`. Pour Intel PTT, le client lit automatiquement les intermédiaires présents dans le TPM et complète leur chaîne auprès du dépôt HTTPS de certificats Intel ; aucune étape manuelle n'est nécessaire si le serveur fait confiance à la racine Intel correspondante. Pour les autres intermédiaires constructeur, définir `MYSYNC_EK_CHAIN=/chemin/intermediaires.pem` lors de l'installation. Voir la [procédure et ses limites](device-auth.md#certificat-ek-absent-du-tpm). Ne pas remplacer le certificat constructeur par un certificat auto-signé.
 
 ## Appairer et approuver un appareil
 

@@ -767,9 +767,14 @@ async fn api_and_updater_never_follow_redirects() -> Result<()> {
         let installed = temp.path().join("mysync");
         std::fs::write(&installed, b"original binary")?;
         assert!(
-            update::check_and_install_at(&config, &installed, "0.1.0")
-                .await
-                .is_err()
+            update::check_and_install_at(
+                &config.server,
+                &config.update_public_key,
+                &installed,
+                "0.1.0"
+            )
+            .await
+            .is_err()
         );
         assert_eq!(std::fs::read(&installed)?, b"original binary");
     }

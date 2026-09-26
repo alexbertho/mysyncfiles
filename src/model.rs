@@ -32,6 +32,13 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct ManifestPage {
+    pub generation: i64,
+    pub entries: Vec<Entry>,
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TrashItem {
     pub id: i64,
     pub path: String,
