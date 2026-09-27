@@ -5,8 +5,14 @@ use std::{
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    sync::Mutex,
 };
+
+// A concurrent fork can inherit another test's writable executable descriptor
+// until exec closes it, causing ETXTBSY even after fs::write has returned.
+// Serialize executable writes and process creation, but not child execution.
+static EXECUTABLE_IO: Mutex<()> = Mutex::new(());
 
 struct InstallerFixture {
     _temp: tempfile::TempDir,
@@ -18,9 +24,25 @@ struct InstallerFixture {
 }
 
 fn executable(path: &Path, bytes: &str) -> Result<()> {
+    let _guard = EXECUTABLE_IO.lock().unwrap();
     fs::write(path, bytes)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     Ok(())
+}
+
+fn spawn_command(command: &mut Command) -> Result<Child> {
+    let _guard = EXECUTABLE_IO.lock().unwrap();
+    Ok(command.spawn()?)
+}
+
+fn command_output(command: &mut Command) -> Result<Output> {
+    let child = spawn_command(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
+    Ok(child.wait_with_output()?)
 }
 
 impl InstallerFixture {
@@ -56,7 +78,11 @@ impl InstallerFixture {
         )?;
         let releases_root = root.join("releases");
         let target = release::current_target().unwrap();
-        release::publish(&key, &binary, "0.3.0", target, &releases_root)?;
+        {
+            // Publication spawns the client for both compatibility probes.
+            let _guard = EXECUTABLE_IO.lock().unwrap();
+            release::publish(&key, &binary, "0.3.0", target, &releases_root)?;
+        }
         let releases = releases_root.join(target);
         executable(
             &mocks.join("curl"),
@@ -146,7 +172,7 @@ printf 200
             command.env("MYSYNC_EK_CERT", certificate);
             command.env("MYSYNC_TEST_REQUIRE_EK_CERT", "1");
         }
-        Ok(command.env("MYSYNC_TEST_HTTP_STATUS", status).output()?)
+        command_output(command.env("MYSYNC_TEST_HTTP_STATUS", status))
     }
 
     fn run_interactive(&self, setup_exit: &str, piped: bool) -> Result<Output> {
@@ -164,18 +190,18 @@ printf 200
         } else {
             format!("sh {}", self.script.display())
         };
-        let mut child = self
-            .command("script")?
-            .args(["-q", "-e", "-c"])
-            .arg(command)
-            .arg("/dev/null")
-            .env("MYSYNC_TEST_SETUP_EXIT", setup_exit)
-            .env("MYSYNC_SERVER_PUBLIC_KEY", "test-origin-public-key")
-            .env("MYSYNC_TEST_SYSTEMCTL_STATUS", "0")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = spawn_command(
+            self.command("script")?
+                .args(["-q", "-e", "-c"])
+                .arg(command)
+                .arg("/dev/null")
+                .env("MYSYNC_TEST_SETUP_EXIT", setup_exit)
+                .env("MYSYNC_SERVER_PUBLIC_KEY", "test-origin-public-key")
+                .env("MYSYNC_TEST_SYSTEMCTL_STATUS", "0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
         child.stdin.take().unwrap().write_all(input)?;
         Ok(child.wait_with_output()?)
     }
@@ -218,11 +244,12 @@ fn installer_guides_tss_membership_without_an_interactive_terminal() -> Result<(
     assert!(!fixture.root.join("sudo-called").exists());
     fixture.assert_not_installed();
 
-    let output = fixture
-        .command("sh")?
-        .arg(&fixture.script)
-        .env("MYSYNC_TEST_TSS_ASSIGNED", "1")
-        .output()?;
+    let output = command_output(
+        fixture
+            .command("sh")?
+            .arg(&fixture.script)
+            .env("MYSYNC_TEST_TSS_ASSIGNED", "1"),
+    )?;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("sign out and back in"));
     assert!(!fixture.root.join("sudo-called").exists());
@@ -233,16 +260,17 @@ fn installer_guides_tss_membership_without_an_interactive_terminal() -> Result<(
 fn installer_offers_tss_group_update_in_a_terminal() -> Result<()> {
     let fixture = InstallerFixture::new(true)?;
     mock_inaccessible_tss_device(&fixture)?;
-    let mut child = fixture
-        .command("script")?
-        .args(["-q", "-e", "-c"])
-        .arg(format!("sh {}", fixture.script.display()))
-        .arg("/dev/null")
-        .env("MYSYNC_TEST_SUDO_CALLED", fixture.root.join("sudo-called"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = spawn_command(
+        fixture
+            .command("script")?
+            .args(["-q", "-e", "-c"])
+            .arg(format!("sh {}", fixture.script.display()))
+            .arg("/dev/null")
+            .env("MYSYNC_TEST_SUDO_CALLED", fixture.root.join("sudo-called"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
     child.stdin.take().unwrap().write_all(b"y\n")?;
     let output = child.wait_with_output()?;
     assert!(!output.status.success());
