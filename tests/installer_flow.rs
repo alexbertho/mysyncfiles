@@ -116,19 +116,17 @@ printf 200
         self.run_with_cert(status, None)
     }
 
-    fn run_with_cert(&self, status: &str, certificate: Option<&Path>) -> Result<Output> {
-        let mut command = Command::new("sh");
-        command.arg(&self.script);
-        if let Some(certificate) = certificate {
-            command.env("MYSYNC_EK_CERT", certificate);
-            command.env("MYSYNC_TEST_REQUIRE_EK_CERT", "1");
-        }
-        Ok(command
+    fn command(&self, program: &str) -> Result<Command> {
+        let mut command = Command::new(program);
+        command
             .env("HOME", &self.home)
+            // Keep profiles and units private even when the runner exports XDG_CONFIG_HOME.
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("SHELL", "/bin/sh")
             .env("NO_COLOR", "1")
             .env("TERM", "dumb")
             .env("MYSYNC_TEST_RELEASES", &self.releases)
-            .env("MYSYNC_TEST_HTTP_STATUS", status)
+            .env("MYSYNC_TEST_HTTP_STATUS", "200")
             .env("MYSYNC_TEST_SETUP_CALLED", self.root.join("setup-called"))
             .env(
                 "MYSYNC_TEST_SYSTEMCTL_CALLED",
@@ -137,8 +135,18 @@ printf 200
             .env(
                 "PATH",
                 format!("{}:{}", self.mocks.display(), std::env::var("PATH")?),
-            )
-            .output()?)
+            );
+        Ok(command)
+    }
+
+    fn run_with_cert(&self, status: &str, certificate: Option<&Path>) -> Result<Output> {
+        let mut command = self.command("sh")?;
+        command.arg(&self.script);
+        if let Some(certificate) = certificate {
+            command.env("MYSYNC_EK_CERT", certificate);
+            command.env("MYSYNC_TEST_REQUIRE_EK_CERT", "1");
+        }
+        Ok(command.env("MYSYNC_TEST_HTTP_STATUS", status).output()?)
     }
 
     fn run_interactive(&self, setup_exit: &str, piped: bool) -> Result<Output> {
@@ -156,28 +164,14 @@ printf 200
         } else {
             format!("sh {}", self.script.display())
         };
-        let mut child = Command::new("script")
+        let mut child = self
+            .command("script")?
             .args(["-q", "-e", "-c"])
             .arg(command)
             .arg("/dev/null")
-            .env("HOME", &self.home)
-            .env("SHELL", "/bin/sh")
-            .env("NO_COLOR", "1")
-            .env("TERM", "dumb")
-            .env("MYSYNC_TEST_RELEASES", &self.releases)
-            .env("MYSYNC_TEST_HTTP_STATUS", "200")
-            .env("MYSYNC_TEST_SETUP_CALLED", self.root.join("setup-called"))
             .env("MYSYNC_TEST_SETUP_EXIT", setup_exit)
             .env("MYSYNC_SERVER_PUBLIC_KEY", "test-origin-public-key")
             .env("MYSYNC_TEST_SYSTEMCTL_STATUS", "0")
-            .env(
-                "MYSYNC_TEST_SYSTEMCTL_CALLED",
-                self.root.join("systemctl-called"),
-            )
-            .env(
-                "PATH",
-                format!("{}:{}", self.mocks.display(), std::env::var("PATH")?),
-            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -224,15 +218,10 @@ fn installer_guides_tss_membership_without_an_interactive_terminal() -> Result<(
     assert!(!fixture.root.join("sudo-called").exists());
     fixture.assert_not_installed();
 
-    let mut command = Command::new("sh");
-    let output = command
+    let output = fixture
+        .command("sh")?
         .arg(&fixture.script)
-        .env("HOME", &fixture.home)
         .env("MYSYNC_TEST_TSS_ASSIGNED", "1")
-        .env(
-            "PATH",
-            format!("{}:{}", fixture.mocks.display(), std::env::var("PATH")?),
-        )
         .output()?;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("sign out and back in"));
@@ -244,19 +233,12 @@ fn installer_guides_tss_membership_without_an_interactive_terminal() -> Result<(
 fn installer_offers_tss_group_update_in_a_terminal() -> Result<()> {
     let fixture = InstallerFixture::new(true)?;
     mock_inaccessible_tss_device(&fixture)?;
-    let mut child = Command::new("script")
+    let mut child = fixture
+        .command("script")?
         .args(["-q", "-e", "-c"])
         .arg(format!("sh {}", fixture.script.display()))
         .arg("/dev/null")
-        .env("HOME", &fixture.home)
-        .env("SHELL", "/bin/sh")
-        .env("NO_COLOR", "1")
-        .env("TERM", "dumb")
         .env("MYSYNC_TEST_SUDO_CALLED", fixture.root.join("sudo-called"))
-        .env(
-            "PATH",
-            format!("{}:{}", fixture.mocks.display(), std::env::var("PATH")?),
-        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
