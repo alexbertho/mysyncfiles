@@ -57,7 +57,9 @@ test:
 		docker run --rm --user "$$(id -u):$$(id -g)" \
 			--volume "$$(pwd):/src" \
 			--volume "$$HOME/.cargo/registry:/tmp/cargo/registry" \
-			--env CARGO_HOME=/tmp/cargo mysyncfiles-tpm-dev cargo test --locked; \
+			--env CARGO_HOME=/tmp/cargo \
+			--env CARGO_TARGET_DIR=/tmp/cargo-target \
+			mysyncfiles-tpm-dev cargo test --locked; \
 	fi
 	python3 -B -m unittest discover -s tests -p 'test_*.py'
 	$(MAKE) docs-check

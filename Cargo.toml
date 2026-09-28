@@ -38,7 +38,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["full"] }
+tokio = {
+    version = "1",
+    features = [
+        "fs",
+        "io-util",
+        "macros",
+        "net",
+        "process",
+        "rt-multi-thread",
+        "signal",
+        "sync",
+        "time",
+    ],
+}
 tokio-util = { version = "0.7", features = ["io"] }
 tss-esapi = "7.7"
 tempfile = "3"
@@ -48,3 +61,8 @@ x509-parser = "0.18"
 [dev-dependencies]
 walkdir = "2"
 tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
