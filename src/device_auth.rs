@@ -1,3 +1,4 @@
+// ⚡ Bolt: Using prepare_cached() caches the parsed SQLite statements on the connection, avoiding re-parsing overhead for repeated operations like manifests.
 use crate::{
     auth_protocol::*,
     server::{ApiError, ServerState},
@@ -307,7 +308,7 @@ pub struct DeviceEnrollment {
 }
 pub fn list(state: &ServerState) -> Result<Vec<DeviceEnrollment>> {
     let db = state.db.lock().unwrap();
-    let mut q=db.prepare("SELECT e.id,d.name,e.fingerprint,CASE
+    let mut q=db.prepare_cached("SELECT e.id,d.name,e.fingerprint,CASE
         WHEN d.revoked_at IS NOT NULL THEN 'revoked' WHEN e.approved_at IS NOT NULL THEN 'approved'
         WHEN e.expires_at<=?1 THEN 'expired' WHEN e.verified_at IS NOT NULL THEN 'pending-approval'
         ELSE 'invited' END FROM device_enrollments e JOIN devices d ON d.id=e.device_id ORDER BY d.id")?;

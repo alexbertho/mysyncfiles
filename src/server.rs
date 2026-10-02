@@ -1,3 +1,4 @@
+// ⚡ Bolt: Using prepare_cached() caches the parsed SQLite statements on the connection, avoiding re-parsing overhead for repeated operations like manifests.
 use std::{
     collections::HashSet,
     io::{Read, SeekFrom},
@@ -205,7 +206,7 @@ fn recover_storage(state: &ServerState) -> Result<usize> {
         ("tmp", "SELECT temp_name FROM uploads"),
     ] {
         let referenced = tx
-            .prepare(sql)?
+            .prepare_cached(sql)?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         let dir = state.data_dir.join(directory);
@@ -253,7 +254,7 @@ pub fn open_with_releases(
     private_dir(&data_dir.join("tmp"))?;
     let conn = Connection::open(data_dir.join("metadata.sqlite3"))?;
     let columns = conn
-        .prepare("PRAGMA table_info(devices)")?
+        .prepare_cached("PRAGMA table_info(devices)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if columns.iter().any(|column| column == "token_hash") {
@@ -331,7 +332,7 @@ pub fn open_with_releases(
 pub fn list_devices(state: &ServerState) -> Result<Vec<(i64, String, bool)>> {
     let db = state.db.lock().unwrap();
     let mut query =
-        db.prepare("SELECT id, name, revoked_at IS NOT NULL FROM devices ORDER BY id")?;
+        db.prepare_cached("SELECT id, name, revoked_at IS NOT NULL FROM devices ORDER BY id")?;
     let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
@@ -541,7 +542,9 @@ async fn manifest(
                 ));
             }
             let mut query = db
-                .prepare("SELECT path, revision, sha256, size, deleted FROM entries ORDER BY path")
+                .prepare_cached(
+                    "SELECT path, revision, sha256, size, deleted FROM entries ORDER BY path",
+                )
                 .map_err(ApiError::internal)?;
             let entries = query
                 .query_map([], |row| {
@@ -593,7 +596,7 @@ async fn manifest_page(
                 )
                 .map_err(ApiError::internal)?;
             let mut query_rows = db
-                .prepare(
+                .prepare_cached(
                     "SELECT path, revision, sha256, size, deleted FROM entries
              WHERE path > ?1 ORDER BY path LIMIT ?2",
                 )
@@ -1125,7 +1128,7 @@ async fn list_trash(
     state.blocking(move |state| {
     let db = state.db.lock().unwrap();
     let mut query = db
-        .prepare("SELECT id, path, size, deleted_at, expires_at FROM trash WHERE expires_at > ?1 ORDER BY deleted_at DESC")
+        .prepare_cached("SELECT id, path, size, deleted_at, expires_at FROM trash WHERE expires_at > ?1 ORDER BY deleted_at DESC")
         .map_err(ApiError::internal)?;
     let items = query
         .query_map([now()], |row| {
@@ -1202,7 +1205,7 @@ pub fn purge_expired(state: &ServerState) -> Result<usize> {
     let tx = db.transaction()?;
     let cutoff = now();
     let blobs = {
-        let mut query = tx.prepare("SELECT blob FROM trash WHERE expires_at <= ?1")?;
+        let mut query = tx.prepare_cached("SELECT blob FROM trash WHERE expires_at <= ?1")?;
         query
             .query_map([cutoff], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1241,7 +1244,7 @@ pub fn purge_trash_item(state: &ServerState, id: i64) -> Result<bool> {
 pub fn purge_upload_sessions(state: &ServerState) -> Result<usize> {
     let active = state.active_uploads.lock().unwrap();
     let db = state.db.lock().unwrap();
-    let mut query = db.prepare("SELECT id, temp_name FROM uploads WHERE touched_at < ?1")?;
+    let mut query = db.prepare_cached("SELECT id, temp_name FROM uploads WHERE touched_at < ?1")?;
     let stale = query
         .query_map([now() - UPLOAD_SESSION_SECONDS], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
