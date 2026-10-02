@@ -9,6 +9,18 @@ permissions:
   contents: read
 
 jobs:
+  web-status-browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install isolated browser test tools
+        run: |
+          npm install --prefix "$RUNNER_TEMP/mysync-browser" --no-save playwright@1.60.0
+          node "$RUNNER_TEMP/mysync-browser/node_modules/playwright/cli.js" install --with-deps chromium firefox
+      - name: Status page and loopback transport
+        run: NODE_PATH="$RUNNER_TEMP/mysync-browser/node_modules" node tests/web_status_browser.cjs
   linux:
     runs-on: ubuntu-24.04
     steps:
@@ -28,12 +40,17 @@ jobs:
       - name: Verify TPM enrollment on Debian 13 and Arch runtimes
         run: |
           tpm_test_binary=$(cargo test --locked --test tpm_flow --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "tpm_flow") | .executable // empty')
+          status_test_binary=$(cargo test --locked --test web_status_flow --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "web_status_flow") | .executable // empty')
           test -x "$tpm_test_binary"
+          test -x "$status_test_binary"
           for runtime in debian:13-slim archlinux:base; do
             docker build --build-arg BASE_IMAGE="$runtime" -t mysync-tpm-runtime -f deploy/Dockerfile.tpm-runtime .
             docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true \
               --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
               --mount type=bind,src="$tpm_test_binary",dst=/test-tpm,readonly mysync-tpm-runtime
+            docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
+              --mount type=bind,src="$status_test_binary",dst=/test-tpm,readonly mysync-tpm-runtime
           done
       - name: Smoke-test client on Arch Linux
         run: docker run --rm --mount type=bind,source="$PWD/target/release/mysync",target=/usr/local/bin/mysync,readonly archlinux:base bash -c 'pacman -Syu --noconfirm --needed tpm2-tss openssl && /usr/local/bin/mysync --version'

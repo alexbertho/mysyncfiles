@@ -16,7 +16,10 @@ use crate::release;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateOutcome {
-    Current,
+    Current {
+        installed_version: String,
+        published_version: String,
+    },
     Installed(String),
 }
 
@@ -143,7 +146,10 @@ pub async fn check_and_install_at(
         bail!("release target does not match this client");
     }
     if manifest.validate()? <= Version::parse(current_version)? {
-        return Ok(UpdateOutcome::Current);
+        return Ok(UpdateOutcome::Current {
+            installed_version: current_version.to_owned(),
+            published_version: manifest.version,
+        });
     }
 
     let parent = executable
@@ -211,8 +217,12 @@ pub async fn check_and_install_at(
         FileExt::try_lock_exclusive(&lock).context("another client update is being installed; retry shortly")?;
         // The running process can be older than the binary currently on disk.
         // Recheck that actual binary while holding the lock, after download.
-        if executable_version(executable).await? >= manifest.validate()? {
-            return Ok(UpdateOutcome::Current);
+        let installed_version = executable_version(executable).await?;
+        if installed_version >= manifest.validate()? {
+            return Ok(UpdateOutcome::Current {
+                installed_version: installed_version.to_string(),
+                published_version: manifest.version.clone(),
+            });
         }
         tokio::fs::rename(&temp_path, executable).await?;
         std::fs::File::open(parent)?.sync_all()?;

@@ -3,6 +3,11 @@ set -euo pipefail
 
 project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source_binary=${1:-"$project_dir/target/release/mysync"}
+web_status=${MYSYNC_WEB_STATUS:-}
+case "$web_status" in
+    ''|true|false) ;;
+    *) printf 'MYSYNC_WEB_STATUS must be true or false.\n' >&2; exit 1 ;;
+esac
 
 if [[ -z ${HOME:-} ]]; then
     printf 'HOME is required to install the client.\n' >&2
@@ -35,6 +40,31 @@ fi
 source_major=${BASH_REMATCH[1]}
 source_minor=${BASH_REMATCH[2]}
 source_patch=${BASH_REMATCH[3]}
+
+setup_help=$("$source_binary" setup --help)
+if [[ $setup_help == *--web-status* ]]; then
+    if [[ -z $web_status && -t 1 && -r /dev/tty ]]; then
+        saved_setting=$("$source_binary" --config "$config_path" web-status status)
+        case "$saved_setting" in
+            web_status_enabled=true) web_status=true; prompt='Y/n' ;;
+            web_status_enabled=false) web_status=false; prompt='y/N' ;;
+            *) printf 'Cannot read the saved browser status setting.\n' >&2; exit 1 ;;
+        esac
+        while :; do
+            printf 'Enable browser status on this PC? [%s] ' "$prompt" >/dev/tty
+            IFS= read -r answer </dev/tty || { printf 'Cannot read the browser status choice.\n' >&2; exit 1; }
+            case "$answer" in
+                '') break ;;
+                y|Y|yes|YES) web_status=true; break ;;
+                n|N|no|NO) web_status=false; break ;;
+                *) printf 'Please answer yes or no.\n' ;;
+            esac
+        done
+    fi
+elif [[ -n $web_status ]]; then
+    printf 'The source client lacks --web-status; build MySyncFiles 0.3.8 or newer.\n' >&2
+    exit 1
+fi
 
 for directory in "$destination_dir" "$unit_dir"; do
     if [[ -L "$directory" ]]; then
@@ -96,6 +126,11 @@ fi
 unit_file="$unit_dir/mysync.service"
 [[ ! -L "$unit_file" ]] || { printf 'Refusing symbolic-link service file: %s\n' "$unit_file" >&2; exit 1; }
 install -m 644 "$project_dir/deploy/mysync.service" "$unit_file"
+
+if [[ -n $web_status ]]; then
+    if [[ $web_status == true ]]; then action=enable; else action=disable; fi
+    "$destination" --config "$config_path" web-status "$action"
+fi
 
 if [[ $(loginctl show-user "$account" --property=Linger --value) != yes ]]; then
     sudo loginctl enable-linger "$account"

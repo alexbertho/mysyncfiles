@@ -22,6 +22,30 @@ sudo install -d -m 0750 -o 1000 -g 1000 /srv/mysyncfiles-releases
 
 `deploy/.env` est ignoré par Git. Conserver le répertoire de données et ses sauvegardes hors du dépôt. Voir la [configuration](configuration.md) pour le rôle de chaque valeur.
 
+## Prévoir du swap sur un petit VPS
+
+`make install` et `make deploy` compilent le serveur en Rust. Sur un VPS avec peu de RAM et sans swap, prévoir par exemple 2 Gio de swap avant la première compilation. Le build conserve sa limite mémoire de 3 Gio ; le swap donne une marge aux autres services de l'hôte. Vérifier la mémoire et le système de fichiers de la racine :
+
+```sh
+free -h
+findmnt -no FSTYPE /
+```
+
+Si aucun swap n'est actif, que `/swapfile` n'existe pas et que la racine est en `ext4`, créer un fichier de swap puis l'activer au démarrage :
+
+```sh
+test ! -e /swapfile &&
+sudo cp -p /etc/fstab "/etc/fstab.pre-swap.$(date +%Y%m%d%H%M%S)" &&
+sudo install -m 0600 /dev/null /swapfile &&
+sudo fallocate -l 2G /swapfile &&
+sudo mkswap /swapfile &&
+sudo swapon /swapfile &&
+printf '/swapfile none swap defaults 0 0\n' | sudo tee -a /etc/fstab &&
+free -h
+```
+
+Sur Btrfs, la création d'un fichier de swap exige des précautions particulières : suivre la [procédure Btrfs](https://btrfs.readthedocs.io/en/latest/Swapfile.html) au lieu des commandes `ext4` ci-dessus.
+
 ## Construire et démarrer
 
 ```sh
@@ -30,7 +54,7 @@ make start
 curl -fsS http://127.0.0.1:8484/v1/health
 ```
 
-`make install` valide la configuration Compose, l'existence des dossiers et leurs chemins absolus, puis construit l'image. `make start` refait ces vérifications et lance le serveur, qui initialise SQLite dans le dossier de données. Le point de santé est accessible uniquement sur la boucle locale de l'hôte. Pour consulter les journaux ou arrêter sans effacer les données : `make logs` et `make stop`.
+`make install` valide la configuration Compose, l'existence des dossiers et leurs chemins absolus, puis construit l'image avec une limite mémoire. `make start` refait ces vérifications et lance l'image déjà construite sans déclencher de compilation ; le serveur initialise SQLite dans le dossier de données. Le point de santé est accessible uniquement sur la boucle locale de l'hôte. Pour consulter les journaux ou arrêter sans effacer les données : `make logs` et `make stop`.
 
 Pour déployer ensuite des modifications du serveur et de la documentation, utiliser `make deploy` après avoir configuré l'origine publique avec `device auth-configure`. La commande exécute les tests avant de reconstruire et de relancer le serveur ; voir le [détail du déploiement](operations.md#publier-la-documentation).
 

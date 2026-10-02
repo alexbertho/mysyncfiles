@@ -51,6 +51,10 @@ impl InstallerFixture {
     }
 
     fn new_with_setup(doctor_ok: bool, setup_ok: bool) -> Result<Self> {
+        Self::new_with_capabilities(doctor_ok, setup_ok, true)
+    }
+
+    fn new_with_capabilities(doctor_ok: bool, setup_ok: bool, web_status: bool) -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().to_path_buf();
         let home = root.join("home");
@@ -70,7 +74,11 @@ impl InstallerFixture {
                     "echo 'TPM unavailable' >&2; exit 1"
                 },
                 if setup_ok {
-                    "exit 0"
+                    if web_status {
+                        "echo '--web-status <true|false>'; exit 0"
+                    } else {
+                        "exit 0"
+                    }
                 } else {
                     "case \"$0\" in */source-client) exit 0;; *) exit 2;; esac"
                 }
@@ -151,6 +159,7 @@ printf 200
             .env("SHELL", "/bin/sh")
             .env("NO_COLOR", "1")
             .env("TERM", "dumb")
+            .env_remove("MYSYNC_WEB_STATUS")
             .env("MYSYNC_TEST_RELEASES", &self.releases)
             .env("MYSYNC_TEST_HTTP_STATUS", "200")
             .env("MYSYNC_TEST_SETUP_CALLED", self.root.join("setup-called"))
@@ -176,7 +185,7 @@ printf 200
     }
 
     fn run_interactive(&self, setup_exit: &str, piped: bool) -> Result<Output> {
-        self.run_interactive_with_input(setup_exit, piped, b"\n")
+        self.run_interactive_with_input(setup_exit, piped, b"\n\n")
     }
 
     fn run_interactive_with_input(
@@ -185,13 +194,27 @@ printf 200
         piped: bool,
         input: &[u8],
     ) -> Result<Output> {
+        self.run_interactive_with_setting(setup_exit, piped, input, None)
+    }
+
+    fn run_interactive_with_setting(
+        &self,
+        setup_exit: &str,
+        piped: bool,
+        input: &[u8],
+        setting: Option<&str>,
+    ) -> Result<Output> {
         let command = if piped {
             format!("cat {} | sh", self.script.display())
         } else {
             format!("sh {}", self.script.display())
         };
+        let mut process = self.command("script")?;
+        if let Some(setting) = setting {
+            process.env("MYSYNC_WEB_STATUS", setting);
+        }
         let mut child = spawn_command(
-            self.command("script")?
+            process
                 .args(["-q", "-e", "-c"])
                 .arg(command)
                 .arg("/dev/null")
@@ -329,7 +352,7 @@ fn installer_backs_up_an_older_or_different_same_version_client() -> Result<()> 
         assert!(String::from_utf8_lossy(&output.stderr).contains("Back up"));
         assert_eq!(fs::read_to_string(bin_dir.join("mysync"))?, old_binary);
 
-        let output = fixture.run_interactive_with_input("0", false, b"y\n\n")?;
+        let output = fixture.run_interactive_with_input("0", false, b"y\n\n\n")?;
         assert!(
             output.status.success(),
             "{}",
@@ -373,7 +396,7 @@ fn installer_archives_a_legacy_token_profile_before_pairing() -> Result<()> {
     fs::write(config_dir.join("config.state.json"), b"old state")?;
     fs::write(config_dir.join("config.state.journal"), b"old journal")?;
 
-    let output = fixture.run_interactive_with_input("0", true, b"y\n\n")?;
+    let output = fixture.run_interactive_with_input("0", true, b"y\n\n\n")?;
     assert!(
         output.status.success(),
         "{}",
@@ -476,6 +499,7 @@ fn interactive_installer_starts_service_only_after_setup_succeeds() -> Result<()
     let setup = fs::read_to_string(success.root.join("setup-called"))?;
     assert!(setup.contains("setup --server https://sync.example.test"));
     assert!(setup.contains("--dir"));
+    assert!(setup.contains("--web-status true"));
     assert!(setup.contains("--server-public-key test-origin-public-key"));
     assert!(success.root.join("systemctl-called").exists());
 
@@ -496,6 +520,137 @@ fn interactive_installer_starts_service_only_after_setup_succeeds() -> Result<()
     assert!(output.status.success());
     assert!(custom_unit.root.join("setup-called").exists());
     assert!(!custom_unit.root.join("systemctl-called").exists());
+    Ok(())
+}
+
+#[test]
+fn installer_offers_web_status_and_preserves_saved_opt_out() -> Result<()> {
+    for (input, setting) in [
+        (b"\nn\n".as_slice(), None),
+        (b"\n".as_slice(), Some("false")),
+    ] {
+        let fixture = InstallerFixture::new(true)?;
+        let output = fixture.run_interactive_with_setting("0", true, input, setting)?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            fs::read_to_string(fixture.root.join("setup-called"))?.contains("--web-status false")
+        );
+        assert!(fixture.root.join("systemctl-called").exists());
+    }
+    // Both an active profile and a pairing awaiting approval keep their choice.
+    for filename in ["config.json", "config.pairing.json"] {
+        let fixture = InstallerFixture::new(true)?;
+        let config_dir = fixture.home.join(".config/mysync");
+        fs::create_dir_all(&config_dir)?;
+        fs::write(config_dir.join(filename), b"{\"web_status_enabled\":false}")?;
+        let output = fixture.run_interactive("0", false)?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("[y/N]"));
+        assert!(
+            fs::read_to_string(fixture.root.join("setup-called"))?.contains("--web-status false")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn installer_checks_web_status_input_and_legacy_capability() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    let output = command_output(
+        fixture
+            .command("sh")?
+            .arg(&fixture.script)
+            .env("MYSYNC_WEB_STATUS", "invalid"),
+    )?;
+    assert!(!output.status.success());
+    fixture.assert_not_installed();
+
+    let output = fixture.run_interactive_with_input("0", false, b"\ninvalid\nn\n")?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Please answer yes or no"));
+    assert!(fs::read_to_string(fixture.root.join("setup-called"))?.contains("--web-status false"));
+
+    let legacy = InstallerFixture::new_with_capabilities(true, true, false)?;
+    let output = command_output(
+        legacy
+            .command("sh")?
+            .arg(&legacy.script)
+            .env("MYSYNC_WEB_STATUS", "false"),
+    )?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lacks --web-status"));
+    legacy.assert_not_installed();
+    let output = legacy.run_interactive_with_input("0", false, b"\n")?;
+    assert!(output.status.success());
+    assert!(!fs::read_to_string(legacy.root.join("setup-called"))?.contains("--web-status"));
+    Ok(())
+}
+
+#[test]
+fn noninteractive_installer_passes_web_status_to_the_next_setup_command() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    let output = command_output(
+        fixture
+            .command("sh")?
+            .arg(&fixture.script)
+            .env("MYSYNC_WEB_STATUS", "false"),
+    )?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--web-status false"));
+    assert!(!fixture.root.join("setup-called").exists());
+    assert!(!fixture.root.join("systemctl-called").exists());
+    Ok(())
+}
+
+#[test]
+fn source_installer_applies_web_status_before_starting_service() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    executable(&fixture.mocks.join("id"), "#!/bin/sh\necho test-user\n")?;
+    let config = fixture.home.join(".config/mysync/config.json");
+    fs::create_dir_all(config.parent().unwrap())?;
+    fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "server": "https://sync.example.test", "root": fixture.home
+        }))?,
+    )?;
+    executable(&fixture.mocks.join("loginctl"), "#!/bin/sh\necho yes\n")?;
+    // A service start checks that the selected preference was already saved.
+    executable(
+        &fixture.mocks.join("systemctl"),
+        r##"#!/bin/sh
+python3 - "$XDG_CONFIG_HOME/mysync/config.json" "$MYSYNC_TEST_EXPECT_WEB_STATUS" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    assert json.load(source)['web_status_enabled'] == (sys.argv[2] == 'true')
+PY
+"##,
+    )?;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/install-client.sh");
+    for setting in ["false", "true"] {
+        let output = command_output(
+            fixture
+                .command("bash")?
+                .arg(&script)
+                .arg(env!("CARGO_BIN_EXE_mysync"))
+                .env("MYSYNC_WEB_STATUS", setting)
+                .env("MYSYNC_TEST_EXPECT_WEB_STATUS", setting),
+        )?;
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Ok(())
 }
 

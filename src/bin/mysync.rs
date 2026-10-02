@@ -36,6 +36,9 @@ enum Command {
         ek_chain: Option<PathBuf>,
         #[arg(long)]
         ek_cert: Option<PathBuf>,
+        /// Enable browser status (new profiles default to true; existing choices are kept)
+        #[arg(long, action = clap::ArgAction::Set)]
+        web_status: Option<bool>,
     },
     /// Check TPM 2.0 access and an EK certificate without enrolling
     Doctor {
@@ -68,6 +71,11 @@ enum Command {
         #[arg(long)]
         public_key: String,
     },
+    /// Show or change local browser status; restart a running daemon after changes
+    WebStatus {
+        #[command(subcommand)]
+        action: Option<WebStatusAction>,
+    },
     /// Run one synchronization pass
     Sync,
     /// Watch local changes and poll the server continuously
@@ -80,6 +88,16 @@ enum Command {
     Update,
     /// Restore an item from the server trash
     Restore { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum WebStatusAction {
+    /// Enable browser status in the client profile
+    Enable,
+    /// Disable browser status in the client profile
+    Disable,
+    /// Show the saved setting without contacting the TPM or server
+    Status,
 }
 
 fn print_report(report: SyncReport) {
@@ -130,9 +148,22 @@ async fn main() -> Result<()> {
             dir,
             ek_chain,
             ek_cert,
+            web_status,
         } => {
             let key = server_key(&config_path, server_public_key)?;
-            let outcome = client::setup(&config_path, server, key, dir, ek_cert, ek_chain).await?;
+            let outcome = client::setup_with_options(
+                &config_path,
+                server,
+                key,
+                dir,
+                client::SetupOptions {
+                    ek_cert,
+                    ek_chain,
+                    web_status_enabled: web_status,
+                    ..client::SetupOptions::default()
+                },
+            )
+            .await?;
             let conflicts = outcome.conflicts.max(outcome.report.conflicts);
             print_report(outcome.report);
             if conflicts != 0 {
@@ -188,6 +219,22 @@ async fn main() -> Result<()> {
             client::trust_server(&config_path, &public_key).await?;
             println!("Server public key pinned in the client profile.");
         }
+        Command::WebStatus { action } => {
+            let enabled = match action {
+                Some(WebStatusAction::Enable) => Some(true),
+                Some(WebStatusAction::Disable) => Some(false),
+                Some(WebStatusAction::Status) | None => None,
+            };
+            if let Some(enabled) = enabled {
+                client::set_web_status(&config_path, enabled)?;
+                println!("web_status_enabled={enabled}; restart the running daemon to apply");
+            } else {
+                println!(
+                    "web_status_enabled={}",
+                    client::load_config(&config_path)?.web_status_enabled
+                );
+            }
+        }
         Command::Sync => print_report(client::sync(&config_path).await?),
         Command::Daemon => client::daemon(&config_path).await?,
         Command::Status => {
@@ -215,9 +262,16 @@ async fn main() -> Result<()> {
             match mysyncfiles::update::check_and_install(&config.server, &config.update_public_key)
                 .await?
             {
-                mysyncfiles::update::UpdateOutcome::Current => println!("client is up to date"),
+                mysyncfiles::update::UpdateOutcome::Current {
+                    installed_version,
+                    published_version,
+                } => println!(
+                    "installed client: {installed_version}; latest signed release: {published_version}; no update installed"
+                ),
                 mysyncfiles::update::UpdateOutcome::Installed(version) => {
-                    println!("installed {version}; restart mysync.service if it is running")
+                    println!(
+                        "installed {version}; restart the running daemon or mysync.service to use this version"
+                    )
                 }
             }
         }

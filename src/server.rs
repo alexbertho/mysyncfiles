@@ -17,24 +17,26 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::StreamExt;
+use openssl::sha::Sha256;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::model::{
-    BeginUpload, Entry, Manifest, ManifestPage, RestoreRequest, TrashItem, UPLOAD_CHUNK_BYTES,
-    UploadProgress, valid_path,
+    BeginUpload, Entry, Manifest, ManifestPage, ManifestSummary, RestoreRequest, TrashItem,
+    UPLOAD_CHUNK_BYTES, UploadProgress, valid_path,
 };
 use crate::release;
 
 mod origin;
+mod web_status;
 
 const RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 const UPLOAD_SESSION_SECONDS: i64 = 24 * 60 * 60;
 const MAX_UPLOAD_SESSIONS_PER_DEVICE: i64 = 16;
+const FILE_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 pub struct ServerState {
     pub(crate) origin_key: ed25519_dalek::SigningKey,
@@ -43,11 +45,34 @@ pub struct ServerState {
     pub(crate) db: Mutex<Connection>,
     pub(crate) enrollment_limit: tokio::sync::Semaphore,
     pair_ready_rate: Mutex<(std::time::Instant, u32)>,
-    pub(crate) signed_request_limit: tokio::sync::Semaphore,
+    pub(crate) signed_request_limit: Arc<tokio::sync::Semaphore>,
+    blocking_limit: Arc<tokio::sync::Semaphore>,
+    web_status_limit: tokio::sync::Semaphore,
     active_uploads: Mutex<HashSet<String>>,
 }
 
 impl ServerState {
+    /// The permit belongs to the worker, so cancellation cannot create an
+    /// unbounded backlog of non-cancellable SQLite/fsync/hash operations.
+    pub(crate) async fn blocking<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(Arc<Self>) -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let permit = self
+            .blocking_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(ApiError::internal)?;
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation(state)
+        })
+        .await
+        .map_err(ApiError::internal)?
+    }
+
     pub fn public_key(&self) -> String {
         hex::encode(self.origin_key.verifying_key().to_bytes())
     }
@@ -284,6 +309,8 @@ pub fn open_with_releases(
          CREATE INDEX IF NOT EXISTS uploads_touched ON uploads(touched_at);",
     )?;
     crate::device_auth::initialize(&conn)?;
+    web_status::initialize(&conn)?;
+    web_status::purge(&conn)?;
     Ok(Arc::new(ServerState {
         origin_key: origin::load_key(&conn)?,
         data_dir,
@@ -294,7 +321,9 @@ pub fn open_with_releases(
         db: Mutex::new(conn),
         enrollment_limit: tokio::sync::Semaphore::new(4),
         pair_ready_rate: Mutex::new((std::time::Instant::now(), 0)),
-        signed_request_limit: tokio::sync::Semaphore::new(8),
+        signed_request_limit: Arc::new(tokio::sync::Semaphore::new(8)),
+        blocking_limit: Arc::new(tokio::sync::Semaphore::new(8)),
+        web_status_limit: tokio::sync::Semaphore::new(8),
         active_uploads: Mutex::new(HashSet::new()),
     }))
 }
@@ -329,10 +358,8 @@ fn validate_path(path: &str) -> Result<(), ApiError> {
 }
 
 fn stored_entry(db: &Connection, path: &str) -> rusqlite::Result<Option<StoredEntry>> {
-    db.query_row(
-        "SELECT revision, blob, sha256, size, deleted FROM entries WHERE path = ?1",
-        [path],
-        |row| {
+    db.prepare_cached("SELECT revision, blob, sha256, size, deleted FROM entries WHERE path = ?1")?
+        .query_row([path], |row| {
             Ok(StoredEntry {
                 public: Entry {
                     path: path.to_owned(),
@@ -343,9 +370,8 @@ fn stored_entry(db: &Connection, path: &str) -> rusqlite::Result<Option<StoredEn
                 },
                 blob: row.get(1)?,
             })
-        },
-    )
-    .optional()
+        })
+        .optional()
 }
 
 // Call under the same transaction as the mutation: two simultaneous uploads
@@ -462,51 +488,83 @@ async fn client_release(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, metadata.len().to_string())
         .header(header::CACHE_CONTROL, cache)
-        .body(Body::from_stream(ReaderStream::new(opened)))
+        .body(Body::from_stream(ReaderStream::with_capacity(
+            opened,
+            FILE_STREAM_BUFFER_BYTES,
+        )))
         .map_err(ApiError::internal)
+}
+
+#[derive(Default, Deserialize)]
+struct ManifestQuery {
+    #[serde(default)]
+    summary: bool,
 }
 
 async fn manifest(
     State(state): State<Arc<ServerState>>,
     Extension(_device): Extension<i64>,
-) -> Result<Json<Manifest>, ApiError> {
-    let db = state.db.lock().unwrap();
-    let generation = db
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'generation'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(ApiError::internal)?;
-    let count: i64 = db
-        .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
-        .map_err(ApiError::internal)?;
-    if count > 1000 {
-        return Err(ApiError(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "manifest pagination required".into(),
-        ));
-    }
-    let mut query = db
-        .prepare("SELECT path, revision, sha256, size, deleted FROM entries ORDER BY path")
-        .map_err(ApiError::internal)?;
-    let entries = query
-        .query_map([], |row| {
-            Ok(Entry {
-                path: row.get(0)?,
-                revision: row.get(1)?,
-                sha256: row.get(2)?,
-                size: row.get(3)?,
-                deleted: row.get(4)?,
+    Query(query): Query<ManifestQuery>,
+) -> Result<Response, ApiError> {
+    state
+        .blocking(move |state| {
+            let db = state.db.lock().unwrap();
+            let generation = db
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'generation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            if query.summary {
+                let files: i64 = db
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries WHERE deleted = 0",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(ApiError::internal)?;
+                drop(db);
+                return Ok(Json(ManifestSummary {
+                    generation,
+                    files: usize::try_from(files).map_err(ApiError::internal)?,
+                })
+                .into_response());
+            }
+            let count: i64 = db
+                .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+                .map_err(ApiError::internal)?;
+            if count > 1000 {
+                return Err(ApiError(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "manifest pagination required".into(),
+                ));
+            }
+            let mut query = db
+                .prepare("SELECT path, revision, sha256, size, deleted FROM entries ORDER BY path")
+                .map_err(ApiError::internal)?;
+            let entries = query
+                .query_map([], |row| {
+                    Ok(Entry {
+                        path: row.get(0)?,
+                        revision: row.get(1)?,
+                        sha256: row.get(2)?,
+                        size: row.get(3)?,
+                        deleted: row.get(4)?,
+                    })
+                })
+                .map_err(ApiError::internal)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)?;
+            drop(query);
+            drop(db);
+            Ok(Json(Manifest {
+                generation,
+                entries,
             })
+            .into_response())
         })
-        .map_err(ApiError::internal)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(ApiError::internal)?;
-    Ok(Json(Manifest {
-        generation,
-        entries,
-    }))
+        .await
 }
 
 #[derive(Deserialize)]
@@ -522,45 +580,51 @@ async fn manifest_page(
     Extension(_device): Extension<i64>,
     Query(query): Query<ManifestPageQuery>,
 ) -> Result<Json<ManifestPage>, ApiError> {
-    let limit = query.limit.unwrap_or(1000).clamp(1, 1000);
-    let after = query.after.unwrap_or_default();
-    let db = state.db.lock().unwrap();
-    let generation = db
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'generation'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(ApiError::internal)?;
-    let mut query_rows = db
-        .prepare(
-            "SELECT path, revision, sha256, size, deleted FROM entries
+    state
+        .blocking(move |state| {
+            let limit = query.limit.unwrap_or(1000).clamp(1, 1000);
+            let after = query.after.unwrap_or_default();
+            let db = state.db.lock().unwrap();
+            let generation = db
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'generation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            let mut query_rows = db
+                .prepare(
+                    "SELECT path, revision, sha256, size, deleted FROM entries
              WHERE path > ?1 ORDER BY path LIMIT ?2",
-        )
-        .map_err(ApiError::internal)?;
-    let mut entries = query_rows
-        .query_map(rusqlite::params![after, limit + 1], |row| {
-            Ok(Entry {
-                path: row.get(0)?,
-                revision: row.get(1)?,
-                sha256: row.get(2)?,
-                size: row.get(3)?,
-                deleted: row.get(4)?,
-            })
+                )
+                .map_err(ApiError::internal)?;
+            let mut entries = query_rows
+                .query_map(rusqlite::params![after, limit + 1], |row| {
+                    Ok(Entry {
+                        path: row.get(0)?,
+                        revision: row.get(1)?,
+                        sha256: row.get(2)?,
+                        size: row.get(3)?,
+                        deleted: row.get(4)?,
+                    })
+                })
+                .map_err(ApiError::internal)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)?;
+            let next = if entries.len() > limit as usize {
+                // Keep the legacy wire format: next names the first omitted entry.
+                // Clients resume after the last returned entry, not after this hint.
+                entries.pop().map(|entry| entry.path)
+            } else {
+                None
+            };
+            Ok(Json(ManifestPage {
+                generation,
+                entries,
+                next,
+            }))
         })
-        .map_err(ApiError::internal)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(ApiError::internal)?;
-    let next = if entries.len() > limit as usize {
-        entries.pop().map(|entry| entry.path)
-    } else {
-        None
-    };
-    Ok(Json(ManifestPage {
-        generation,
-        entries,
-        next,
-    }))
+        .await
 }
 
 async fn download(
@@ -568,33 +632,38 @@ async fn download(
     Extension(_device): Extension<i64>,
     Query(query): Query<FileQuery>,
 ) -> Result<Response, ApiError> {
-    validate_path(&query.path)?;
-    let requested = query
-        .revision
-        .ok_or_else(|| ApiError::bad("revision required"))?;
-    let (file, size) = {
-        let db = state.db.lock().unwrap();
-        let current = stored_entry(&db, &query.path).map_err(ApiError::internal)?;
-        let current =
-            current.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
-        if current.public.revision != requested || current.public.deleted {
-            return Err(ApiError::conflict("revision changed"));
-        }
-        let blob = current
-            .blob
-            .ok_or_else(|| ApiError::internal("missing blob reference"))?;
-        let file = std::fs::File::open(state.data_dir.join("blobs").join(blob))
-            .map_err(ApiError::internal)?;
-        (file, current.public.size.unwrap_or(0))
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, size.to_string())
-        .body(Body::from_stream(ReaderStream::new(
-            tokio::fs::File::from_std(file),
-        )))
-        .map_err(ApiError::internal)
+    state
+        .blocking(move |state| {
+            validate_path(&query.path)?;
+            let requested = query
+                .revision
+                .ok_or_else(|| ApiError::bad("revision required"))?;
+            let (file, size) = {
+                let db = state.db.lock().unwrap();
+                let current = stored_entry(&db, &query.path).map_err(ApiError::internal)?;
+                let current = current
+                    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "file not found".into()))?;
+                if current.public.revision != requested || current.public.deleted {
+                    return Err(ApiError::conflict("revision changed"));
+                }
+                let blob = current
+                    .blob
+                    .ok_or_else(|| ApiError::internal("missing blob reference"))?;
+                let file = std::fs::File::open(state.data_dir.join("blobs").join(blob))
+                    .map_err(ApiError::internal)?;
+                (file, current.public.size.unwrap_or(0))
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONTENT_LENGTH, size.to_string())
+                .body(Body::from_stream(ReaderStream::with_capacity(
+                    tokio::fs::File::from_std(file),
+                    FILE_STREAM_BUFFER_BYTES,
+                )))
+                .map_err(ApiError::internal)
+        })
+        .await
 }
 
 async fn upload(
@@ -642,12 +711,16 @@ async fn upload(
         let _ = tokio::fs::remove_file(&temp_path).await;
         return Err(error);
     }
-    let digest = hex::encode(hash.finalize());
-    let result = commit_upload(&state, &query.path, base, &temp_path, digest, size);
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-    }
-    result.map(Json)
+    let digest = hex::encode(hash.finish());
+    state
+        .blocking(move |state| {
+            let result = commit_upload(&state, &query.path, base, &temp_path, digest, size);
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            result.map(Json)
+        })
+        .await
 }
 
 fn commit_upload(
@@ -691,6 +764,7 @@ fn commit_upload(
         // uncertain outcome. Never remove content possibly referenced by SQL.
         return Err(ApiError::internal(error));
     }
+    drop(db);
     if let Some(old_blob) = previous.and_then(|entry| entry.blob) {
         let _ = std::fs::remove_file(state.data_dir.join("blobs").join(old_blob));
     }
@@ -739,89 +813,93 @@ async fn begin_upload(
     Extension(device_id): Extension<i64>,
     Json(request): Json<BeginUpload>,
 ) -> Result<Json<UploadProgress>, ApiError> {
-    validate_path(&request.path)?;
-    if request.base_revision < 0
-        || request.size < 0
-        || request.sha256.len() != 64
-        || !request.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(ApiError::bad("invalid upload metadata"));
-    }
-    let db = state.db.lock().unwrap();
-    check_path_namespace(&db, &request.path)?;
-    let current = stored_entry(&db, &request.path).map_err(ApiError::internal)?;
-    if current.map(|entry| entry.public.revision).unwrap_or(0) != request.base_revision {
-        return Err(ApiError::conflict("server version wins; refresh manifest"));
-    }
-    let existing: Option<(String, i64, String)> = db
-        .query_row(
-            "SELECT id, received_size, temp_name FROM uploads
+    state
+        .blocking(move |state| {
+            validate_path(&request.path)?;
+            if request.base_revision < 0
+                || request.size < 0
+                || request.sha256.len() != 64
+                || !request.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(ApiError::bad("invalid upload metadata"));
+            }
+            let db = state.db.lock().unwrap();
+            check_path_namespace(&db, &request.path)?;
+            let current = stored_entry(&db, &request.path).map_err(ApiError::internal)?;
+            if current.map(|entry| entry.public.revision).unwrap_or(0) != request.base_revision {
+                return Err(ApiError::conflict("server version wins; refresh manifest"));
+            }
+            let existing: Option<(String, i64, String)> = db
+                .query_row(
+                    "SELECT id, received_size, temp_name FROM uploads
              WHERE device_id = ?1 AND path = ?2 AND base_revision = ?3
                AND size = ?4 AND sha256 = ?5 ORDER BY touched_at DESC LIMIT 1",
-            params![
-                device_id,
-                request.path,
-                request.base_revision,
-                request.size,
-                request.sha256
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(ApiError::internal)?;
-    if let Some((id, offset, temp_name)) = existing {
-        if state.data_dir.join("tmp").join(temp_name).exists() && offset <= request.size {
-            db.execute(
-                "UPDATE uploads SET touched_at = ?2 WHERE id = ?1",
-                params![id, now()],
-            )
-            .map_err(ApiError::internal)?;
-            return Ok(Json(UploadProgress { id, offset }));
-        }
-        db.execute("DELETE FROM uploads WHERE id = ?1", [&id])
-            .map_err(ApiError::internal)?;
-    }
-    let pending: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM uploads WHERE device_id = ?1",
-            [device_id],
-            |row| row.get(0),
-        )
-        .map_err(ApiError::internal)?;
-    if pending >= MAX_UPLOAD_SESSIONS_PER_DEVICE {
-        return Err(ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many pending uploads for this device".into(),
-        ));
-    }
-    let id = Uuid::new_v4().to_string();
-    let temp = state.data_dir.join("tmp").join(&id);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(ApiError::internal)?
-        .sync_all()
-        .map_err(ApiError::internal)?;
-    sync_directory(&state.data_dir.join("tmp")).map_err(ApiError::internal)?;
-    if let Err(error) = db.execute(
-        "INSERT INTO uploads(id, device_id, path, base_revision, size, sha256,
+                    params![
+                        device_id,
+                        request.path,
+                        request.base_revision,
+                        request.size,
+                        request.sha256
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(ApiError::internal)?;
+            if let Some((id, offset, temp_name)) = existing {
+                if state.data_dir.join("tmp").join(temp_name).exists() && offset <= request.size {
+                    db.execute(
+                        "UPDATE uploads SET touched_at = ?2 WHERE id = ?1",
+                        params![id, now()],
+                    )
+                    .map_err(ApiError::internal)?;
+                    return Ok(Json(UploadProgress { id, offset }));
+                }
+                db.execute("DELETE FROM uploads WHERE id = ?1", [&id])
+                    .map_err(ApiError::internal)?;
+            }
+            let pending: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM uploads WHERE device_id = ?1",
+                    [device_id],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            if pending >= MAX_UPLOAD_SESSIONS_PER_DEVICE {
+                return Err(ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many pending uploads for this device".into(),
+                ));
+            }
+            let id = Uuid::new_v4().to_string();
+            let temp = state.data_dir.join("tmp").join(&id);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+                .map_err(ApiError::internal)?
+                .sync_all()
+                .map_err(ApiError::internal)?;
+            sync_directory(&state.data_dir.join("tmp")).map_err(ApiError::internal)?;
+            if let Err(error) = db.execute(
+                "INSERT INTO uploads(id, device_id, path, base_revision, size, sha256,
              received_size, temp_name, touched_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
-        params![
-            id,
-            device_id,
-            request.path,
-            request.base_revision,
-            request.size,
-            request.sha256,
-            id,
-            now()
-        ],
-    ) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(ApiError::internal(error));
-    }
-    Ok(Json(UploadProgress { id, offset: 0 }))
+                params![
+                    id,
+                    device_id,
+                    request.path,
+                    request.base_revision,
+                    request.size,
+                    request.sha256,
+                    id,
+                    now()
+                ],
+            ) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(ApiError::internal(error));
+            }
+            Ok(Json(UploadProgress { id, offset: 0 }))
+        })
+        .await
 }
 
 async fn upload_chunk(
@@ -831,13 +909,16 @@ async fn upload_chunk(
     Query(query): Query<ChunkQuery>,
     body: Body,
 ) -> Result<Json<UploadProgress>, ApiError> {
-    let _guard = lock_upload(&state, &id)?;
-    let session = {
-        let db = state.db.lock().unwrap();
-        upload_row(&db, &id, device_id)
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "upload not found".into()))?
-    };
+    let (guard, session, id) = state
+        .blocking(move |state| {
+            let guard = lock_upload(&state, &id)?;
+            let db = state.db.lock().unwrap();
+            let session = upload_row(&db, &id, device_id)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "upload not found".into()))?;
+            Ok((guard, session, id))
+        })
+        .await?;
     if query.offset != session.offset {
         return Err(ApiError::conflict(
             "upload offset changed; retry synchronization",
@@ -887,22 +968,29 @@ async fn upload_chunk(
         return Err(error);
     }
     let offset = session.offset + written;
-    let updated = state
-        .db
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE uploads SET received_size = ?3, touched_at = ?4
+    state
+        .blocking(move |state| {
+            // Keep the upload reservation until the durable offset update completes,
+            // including when the requesting task is cancelled.
+            let _guard = guard;
+            let updated = state
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE uploads SET received_size = ?3, touched_at = ?4
              WHERE id = ?1 AND device_id = ?2 AND received_size = ?5",
-            params![id, device_id, offset, now(), session.offset],
-        )
-        .map_err(ApiError::internal)?;
-    if updated != 1 {
-        return Err(ApiError::conflict(
-            "upload offset changed; retry synchronization",
-        ));
-    }
-    Ok(Json(UploadProgress { id, offset }))
+                    params![id, device_id, offset, now(), session.offset],
+                )
+                .map_err(ApiError::internal)?;
+            if updated != 1 {
+                return Err(ApiError::conflict(
+                    "upload offset changed; retry synchronization",
+                ));
+            }
+            Ok(Json(UploadProgress { id, offset }))
+        })
+        .await
 }
 
 fn hash_upload(path: &Path) -> Result<(String, i64)> {
@@ -918,7 +1006,7 @@ fn hash_upload(path: &Path) -> Result<(String, i64)> {
         hash.update(&buffer[..read]);
         size += read as i64;
     }
-    Ok((hex::encode(hash.finalize()), size))
+    Ok((hex::encode(hash.finish()), size))
 }
 
 async fn finish_upload(
@@ -926,54 +1014,54 @@ async fn finish_upload(
     Extension(device_id): Extension<i64>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<Entry>, ApiError> {
-    let _guard = lock_upload(&state, &id)?;
-    let session = {
-        let db = state.db.lock().unwrap();
-        upload_row(&db, &id, device_id)
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "upload not found".into()))?
-    };
-    if session.offset != session.size {
-        return Err(ApiError::bad("upload is incomplete"));
-    }
-    let temp = state.data_dir.join("tmp").join(&session.temp_name);
-    let hash_path = temp.clone();
-    let (digest, size) = tokio::task::spawn_blocking(move || hash_upload(&hash_path))
+    state
+        .blocking(move |state| {
+            let _guard = lock_upload(&state, &id)?;
+            let session = {
+                let db = state.db.lock().unwrap();
+                upload_row(&db, &id, device_id)
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "upload not found".into()))?
+            };
+            if session.offset != session.size {
+                return Err(ApiError::bad("upload is incomplete"));
+            }
+            let temp = state.data_dir.join("tmp").join(&session.temp_name);
+            let (digest, size) = hash_upload(&temp).map_err(ApiError::internal)?;
+            if digest != session.sha256 || size != session.size {
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute("DELETE FROM uploads WHERE id = ?1", [&id])
+                    .map_err(ApiError::internal)?;
+                let _ = std::fs::remove_file(&temp);
+                return Err(ApiError::bad("upload integrity check failed"));
+            }
+            let result = commit_upload(
+                &state,
+                &session.path,
+                session.base_revision,
+                &temp,
+                digest,
+                size,
+            );
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.0 == StatusCode::CONFLICT)
+            {
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute("DELETE FROM uploads WHERE id = ?1", [&session.id])
+                    .map_err(ApiError::internal)?;
+                let _ = std::fs::remove_file(&temp);
+            }
+            result.map(Json)
+        })
         .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)?;
-    if digest != session.sha256 || size != session.size {
-        state
-            .db
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM uploads WHERE id = ?1", [&id])
-            .map_err(ApiError::internal)?;
-        let _ = std::fs::remove_file(&temp);
-        return Err(ApiError::bad("upload integrity check failed"));
-    }
-    let result = commit_upload(
-        &state,
-        &session.path,
-        session.base_revision,
-        &temp,
-        digest,
-        size,
-    );
-    if result.is_ok()
-        || result
-            .as_ref()
-            .is_err_and(|error| error.0 == StatusCode::CONFLICT)
-    {
-        state
-            .db
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM uploads WHERE id = ?1", [&session.id])
-            .map_err(ApiError::internal)?;
-        let _ = std::fs::remove_file(&temp);
-    }
-    result.map(Json)
 }
 
 async fn delete(
@@ -981,55 +1069,60 @@ async fn delete(
     Extension(_device): Extension<i64>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<Entry>, ApiError> {
-    validate_path(&query.path)?;
-    let base = query
-        .base_revision
-        .ok_or_else(|| ApiError::bad("base_revision required"))?;
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction().map_err(ApiError::internal)?;
-    let current = stored_entry(&tx, &query.path).map_err(ApiError::internal)?;
-    let current = current.ok_or_else(|| ApiError::conflict("file is absent on server"))?;
-    if current.public.revision != base {
-        return Err(ApiError::conflict("server version wins; refresh manifest"));
-    }
-    if current.public.deleted {
-        return Ok(Json(current.public));
-    }
-    let deleted_at = now();
-    tx.execute(
-        "INSERT INTO trash(path, blob, sha256, size, deleted_at, expires_at)
+    state
+        .blocking(move |state| {
+            validate_path(&query.path)?;
+            let base = query
+                .base_revision
+                .ok_or_else(|| ApiError::bad("base_revision required"))?;
+            let mut db = state.db.lock().unwrap();
+            let tx = db.transaction().map_err(ApiError::internal)?;
+            let current = stored_entry(&tx, &query.path).map_err(ApiError::internal)?;
+            let current = current.ok_or_else(|| ApiError::conflict("file is absent on server"))?;
+            if current.public.revision != base {
+                return Err(ApiError::conflict("server version wins; refresh manifest"));
+            }
+            if current.public.deleted {
+                return Ok(Json(current.public));
+            }
+            let deleted_at = now();
+            tx.execute(
+                "INSERT INTO trash(path, blob, sha256, size, deleted_at, expires_at)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            query.path,
-            current.blob,
-            current.public.sha256,
-            current.public.size,
-            deleted_at,
-            deleted_at + RETENTION_SECONDS
-        ],
-    )
-    .map_err(ApiError::internal)?;
-    let revision = next_revision(&tx).map_err(ApiError::internal)?;
-    tx.execute(
-        "UPDATE entries SET revision = ?2, blob = NULL, sha256 = NULL, size = NULL,
+                params![
+                    query.path,
+                    current.blob,
+                    current.public.sha256,
+                    current.public.size,
+                    deleted_at,
+                    deleted_at + RETENTION_SECONDS
+                ],
+            )
+            .map_err(ApiError::internal)?;
+            let revision = next_revision(&tx).map_err(ApiError::internal)?;
+            tx.execute(
+                "UPDATE entries SET revision = ?2, blob = NULL, sha256 = NULL, size = NULL,
              deleted = 1, updated_at = ?3 WHERE path = ?1",
-        params![query.path, revision, deleted_at],
-    )
-    .map_err(ApiError::internal)?;
-    tx.commit().map_err(ApiError::internal)?;
-    Ok(Json(Entry {
-        path: query.path,
-        revision,
-        sha256: None,
-        size: None,
-        deleted: true,
-    }))
+                params![query.path, revision, deleted_at],
+            )
+            .map_err(ApiError::internal)?;
+            tx.commit().map_err(ApiError::internal)?;
+            Ok(Json(Entry {
+                path: query.path,
+                revision,
+                sha256: None,
+                size: None,
+                deleted: true,
+            }))
+        })
+        .await
 }
 
 async fn list_trash(
     State(state): State<Arc<ServerState>>,
     Extension(_device): Extension<i64>,
 ) -> Result<Json<Vec<TrashItem>>, ApiError> {
+    state.blocking(move |state| {
     let db = state.db.lock().unwrap();
     let mut query = db
         .prepare("SELECT id, path, size, deleted_at, expires_at FROM trash WHERE expires_at > ?1 ORDER BY deleted_at DESC")
@@ -1048,6 +1141,7 @@ async fn list_trash(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(ApiError::internal)?;
     Ok(Json(items))
+    }).await
 }
 
 async fn restore(
@@ -1055,48 +1149,52 @@ async fn restore(
     Extension(_device): Extension<i64>,
     Json(request): Json<RestoreRequest>,
 ) -> Result<Json<Entry>, ApiError> {
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction().map_err(ApiError::internal)?;
-    let item: Option<(String, String, String, i64)> = tx
-        .query_row(
-            "SELECT path, blob, sha256, size FROM trash WHERE id = ?1 AND expires_at > ?2",
-            params![request.id, now()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()
-        .map_err(ApiError::internal)?;
-    let (path, blob, digest, size) =
-        item.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "trash item not found".into()))?;
-    validate_path(&path)?;
-    check_path_namespace(&tx, &path)?;
-    if stored_entry(&tx, &path)
-        .map_err(ApiError::internal)?
-        .is_some_and(|entry| !entry.public.deleted)
-    {
-        return Err(ApiError::conflict(
-            "a live file already exists at this path",
-        ));
-    }
-    let revision = next_revision(&tx).map_err(ApiError::internal)?;
-    tx.execute(
-        "INSERT INTO entries(path, revision, blob, sha256, size, deleted, updated_at)
+    state
+        .blocking(move |state| {
+            let mut db = state.db.lock().unwrap();
+            let tx = db.transaction().map_err(ApiError::internal)?;
+            let item: Option<(String, String, String, i64)> = tx
+                .query_row(
+                    "SELECT path, blob, sha256, size FROM trash WHERE id = ?1 AND expires_at > ?2",
+                    params![request.id, now()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(ApiError::internal)?;
+            let (path, blob, digest, size) =
+                item.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "trash item not found".into()))?;
+            validate_path(&path)?;
+            check_path_namespace(&tx, &path)?;
+            if stored_entry(&tx, &path)
+                .map_err(ApiError::internal)?
+                .is_some_and(|entry| !entry.public.deleted)
+            {
+                return Err(ApiError::conflict(
+                    "a live file already exists at this path",
+                ));
+            }
+            let revision = next_revision(&tx).map_err(ApiError::internal)?;
+            tx.execute(
+                "INSERT INTO entries(path, revision, blob, sha256, size, deleted, updated_at)
          VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6)
          ON CONFLICT(path) DO UPDATE SET revision = excluded.revision, blob = excluded.blob,
              sha256 = excluded.sha256, size = excluded.size, deleted = 0,
              updated_at = excluded.updated_at",
-        params![path, revision, blob, digest, size, now()],
-    )
-    .map_err(ApiError::internal)?;
-    tx.execute("DELETE FROM trash WHERE id = ?1", [request.id])
-        .map_err(ApiError::internal)?;
-    tx.commit().map_err(ApiError::internal)?;
-    Ok(Json(Entry {
-        path,
-        revision,
-        sha256: Some(digest),
-        size: Some(size),
-        deleted: false,
-    }))
+                params![path, revision, blob, digest, size, now()],
+            )
+            .map_err(ApiError::internal)?;
+            tx.execute("DELETE FROM trash WHERE id = ?1", [request.id])
+                .map_err(ApiError::internal)?;
+            tx.commit().map_err(ApiError::internal)?;
+            Ok(Json(Entry {
+                path,
+                revision,
+                sha256: Some(digest),
+                size: Some(size),
+                deleted: false,
+            }))
+        })
+        .await
 }
 
 pub fn purge_expired(state: &ServerState) -> Result<usize> {
@@ -1111,6 +1209,7 @@ pub fn purge_expired(state: &ServerState) -> Result<usize> {
     };
     tx.execute("DELETE FROM trash WHERE expires_at <= ?1", [cutoff])?;
     tx.commit()?;
+    drop(db);
     for blob in &blobs {
         let _ = std::fs::remove_file(state.data_dir.join("blobs").join(blob));
     }
@@ -1130,6 +1229,7 @@ pub fn purge_trash_item(state: &ServerState, id: i64) -> Result<bool> {
     };
     tx.execute("DELETE FROM trash WHERE id = ?1", [id])?;
     tx.commit()?;
+    drop(db);
     match std::fs::remove_file(state.data_dir.join("blobs").join(blob)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1160,6 +1260,26 @@ pub fn purge_upload_sessions(state: &ServerState) -> Result<usize> {
 }
 
 pub fn router(state: Arc<ServerState>) -> Router {
+    let web = web_status::router()
+        .merge(
+            Router::new()
+                .route(
+                    crate::web_status_protocol::PROOFS_PATH,
+                    post(web_status::proof),
+                )
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::device_auth::middleware,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    origin::middleware,
+                )),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            web_status::middleware,
+        ));
     let protected = Router::new()
         .route("/v1/manifest", get(manifest))
         .route("/v1/manifest/page", get(manifest_page))
@@ -1190,6 +1310,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
             crate::device_auth::enrollment_middleware,
         ));
     Router::new()
+        .merge(web)
         .merge(protected)
         .merge(enrollment)
         .route("/v1/health", get(health))
@@ -1227,11 +1348,19 @@ pub async fn serve(
         let mut timer = tokio::time::interval(Duration::from_secs(60 * 60));
         loop {
             timer.tick().await;
-            if let Err(error) = purge_expired(&purge_state) {
-                eprintln!("trash purge failed: {error:#}");
-            }
-            if let Err(error) = purge_upload_sessions(&purge_state) {
-                eprintln!("upload cleanup failed: {error:#}");
+            let result = purge_state
+                .blocking(|state| {
+                    if let Err(error) = purge_expired(&state) {
+                        eprintln!("trash purge failed: {error:#}");
+                    }
+                    if let Err(error) = purge_upload_sessions(&state) {
+                        eprintln!("upload cleanup failed: {error:#}");
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(error) = result {
+                eprintln!("cleanup worker failed: {}", error.1);
             }
         }
     });
@@ -1253,6 +1382,44 @@ pub async fn serve(
 #[cfg(test)]
 mod socket_tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_database_worker_keeps_its_reservation_without_blocking_tokio() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let state = open(directory.path())?;
+        let worker_state = state.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            worker_state
+                .blocking(move |state| {
+                    let _db = state.db.lock().unwrap();
+                    let _ = started.send(());
+                    wait.recv_timeout(Duration::from_secs(5))
+                        .map_err(ApiError::internal)?;
+                    Ok(())
+                })
+                .await
+        });
+        ready.await?;
+        task.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(state.blocking_limit.available_permits(), 7);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await?;
+        release.send(())?;
+        let _all = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.blocking_limit.clone().acquire_many_owned(8),
+        )
+        .await??;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn accepted_api_sockets_disable_nagle() -> Result<()> {
         use axum::serve::Listener;

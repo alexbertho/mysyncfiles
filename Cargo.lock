@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "mysyncfiles"
-version = "0.3.6"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -1098,6 +1098,8 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "hyper",
+ "hyper-util",
  "notify",
  "openssl",
  "reqwest",
@@ -1108,6 +1110,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-util",

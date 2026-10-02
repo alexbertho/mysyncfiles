@@ -22,6 +22,12 @@ ok() { printf '%s[ok]%s %s\n' "$green" "$reset" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$yellow" "$reset" "$*" >&2; }
 die() { printf '%s[error]%s %s\n' "$red" "$reset" "$*" >&2; exit 1; }
 
+web_status=${MYSYNC_WEB_STATUS:-}
+case "$web_status" in
+    ''|true|false) ;;
+    *) die 'MYSYNC_WEB_STATUS must be true or false.' ;;
+esac
+
 say '  /\/\  MySyncFiles'
 say ' /_/\_\ Client setup'
 say
@@ -262,7 +268,13 @@ if ! reported=$("$tmp/mysync" --version 2>"$tmp/probe-error"); then
     fi
 fi
 [ "$reported" = "mysync $version" ] || die 'Signed client reports a different version.'
-"$tmp/mysync" setup --help >/dev/null 2>&1 || die 'The signed client release lacks the setup command; ask the administrator to publish a newer signed client.'
+setup_help=$("$tmp/mysync" setup --help 2>/dev/null) || die 'The signed client release lacks the setup command; ask the administrator to publish a newer signed client.'
+supports_web_status=0
+case "$setup_help" in *--web-status*) supports_web_status=1 ;; esac
+if [ "$supports_web_status" = 0 ]; then
+    [ -z "$web_status" ] || die 'The signed client lacks --web-status; ask the administrator to publish MySyncFiles 0.3.8 or newer.'
+    warn 'This signed client does not offer the browser status setting; it requires MySyncFiles 0.3.8 or newer.'
+fi
 ok 'Binary integrity and compatibility verified.'
 
 step 4 'Checking TPM 2.0 and EK certificate'
@@ -433,6 +445,39 @@ if [ -t 1 ] && [ -r /dev/tty ]; then
     IFS= read -r mirror_dir </dev/tty || die 'Cannot read the folder from the terminal.'
     [ -n "$mirror_dir" ] || mirror_dir="$HOME/Sync"
     set -- setup --server "$SERVER_URL" --dir "$mirror_dir"
+    if [ "$supports_web_status" = 1 ]; then
+        if [ -z "$web_status" ]; then
+            # Preserve a saved choice, including a setup interrupted before approval.
+            web_status=$(python3 - "$config_file" "$config_dir/config.pairing.json" <<'PY'
+import json, pathlib, sys
+
+enabled = True
+for filename in sys.argv[1:]:
+    path = pathlib.Path(filename)
+    if path.exists():
+        profile = json.loads(path.read_bytes())
+        enabled = profile.get('web_status_enabled', True)
+        if type(enabled) is not bool:
+            raise SystemExit('Saved web_status_enabled must be a boolean.')
+        break
+print('true' if enabled else 'false')
+PY
+) || die 'Cannot read the saved browser status setting.'
+            if [ "$web_status" = true ]; then prompt='Y/n'; else prompt='y/N'; fi
+            while :; do
+                printf 'Enable browser status on this PC? [%s] ' "$prompt" >/dev/tty
+                answer=
+                IFS= read -r answer </dev/tty || die 'Cannot read the browser status choice from the terminal.'
+                case "$answer" in
+                    '') break ;;
+                    y|Y|yes|YES) web_status=true; break ;;
+                    n|N|no|NO) web_status=false; break ;;
+                    *) say 'Please answer yes or no.' ;;
+                esac
+            done
+        fi
+        set -- "$@" --web-status "$web_status"
+    fi
     [ -z "${MYSYNC_SERVER_PUBLIC_KEY:-}" ] || set -- "$@" --server-public-key "$MYSYNC_SERVER_PUBLIC_KEY"
     [ -z "${MYSYNC_EK_CERT:-}" ] || set -- "$@" --ek-cert "$MYSYNC_EK_CERT"
     if [ -n "${MYSYNC_EK_CHAIN:-}" ]; then
@@ -442,13 +487,16 @@ if [ -t 1 ] && [ -r /dev/tty ]; then
     "$destination" "$@" </dev/tty || die 'Pairing or first synchronization is incomplete. Rerun this installer or mysync setup to resume; the service remains stopped.'
     if [ "$service_ready" = 1 ]; then
         systemctl --user daemon-reload || die 'Synchronization succeeded, but the user service manager could not reload.'
-        systemctl --user enable --now mysync.service || die 'Synchronization succeeded, but the user service could not start. Check systemctl --user status mysync.service.'
+        systemctl --user enable mysync.service || die 'Synchronization succeeded, but the user service could not be enabled.'
+        systemctl --user restart mysync.service || die 'Synchronization succeeded, but the user service could not start. Check systemctl --user status mysync.service.'
         ok 'Client paired, files checked and user service started.'
     else
         warn 'Pairing succeeded, but the existing service file differs; review it before starting the service.'
     fi
     say 'For startup without login: sudo loginctl enable-linger "$(id -un)"'
 else
-    say "Next: run $destination setup --server $SERVER_URL --dir \"\$HOME/Sync\" in a terminal."
+    setup_option=
+    [ -z "$web_status" ] || setup_option=" --web-status $web_status"
+    say "Next: run $destination setup --server $SERVER_URL --dir \"\$HOME/Sync\"$setup_option in a terminal."
     say 'The user service remains stopped until setup succeeds.'
 fi

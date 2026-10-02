@@ -18,6 +18,8 @@ cargo test --locked
 
 Les binaires sont `mysync` (client), `mysync-server` et `mysync-release`. L'[environnement Docker TPM de développement](device-auth.md#tests-et-validation) permet aussi de compiler et tester sans installer cette chaîne sur l'hôte.
 
+Pour préparer seulement le client et l'outil de publication, lancer `make build-client`. Cette cible construit `target/release/mysync` et `target/release/mysync-release`, avec une tâche Cargo par défaut et le conteneur TPM si nécessaire. Elle ne remplace aucun client installé et ne publie aucune release.
+
 Pour installer un client construit depuis les sources, exécuter `./deploy/install-tpm-deps.sh` et `./target/release/mysync doctor`, puis `./target/release/mysync setup --server URL_HTTPS --dir "$HOME/Sync"` et [appairer l'appareil](install-client.md#appairer-et-approuver-un-appareil) avec `make pair` sur le serveur. Après une première synchronisation sans conflit, lancer `./deploy/install-client.sh`. Ce script copie le binaire dans `~/.local/bin`, installe l'unité utilisateur, active le *linger* et démarre le service. Il accepte un chemin de binaire de confiance en argument. Pour un premier binaire téléchargé autrement que par `/install.sh`, vérifier sa provenance et son empreinte : une mise à jour signée ne protège pas rétroactivement ce premier téléchargement.
 
 ## Publier un client signé
@@ -26,6 +28,16 @@ Le serveur distribue `/install.sh` et les routes publiques `/v1/updates/<cible>/
 
 La publication est une opération administrateur distincte du build serveur, de la CI et du démarrage. Elle doit être effectuée avec la clé privée correspondant à la clé publique intégrée au client **et** au serveur :
 
+Avant la compilation, augmenter la version du paquet dans `Cargo.toml` et son entrée `mysyncfiles` dans `Cargo.lock`, puis lancer `make test` et `make build-client`. Une modification du client conservant le numéro déjà publié ne sera pas installée par `mysync update`. Vérifier le binaire construit sur les distributions ciblées avant publication. La fonctionnalité de présence locale apparaît dans la version **0.3.7**.
+
+La version **0.3.8** active cette présence par défaut et ajoute `mysync web-status` et `setup --web-status true|false`. La question de l’installateur HTTPS nécessite aussi le déploiement du serveur qui embarque `deploy/install.sh` ; publier uniquement le client ne remplace pas ce script. L’installateur depuis les sources propose également le réglage et accepte `MYSYNC_WEB_STATUS=true|false`.
+
+La version **0.3.9** améliore les scans SHA-256, les transferts et la préparation
+de `status` et `sync`, et corrige la pagination des grands manifestes. Le nouveau
+client fonctionne avec les serveurs précédents ; le résumé signé utilisé par
+`status` nécessite le nouveau serveur pour réduire le nombre de requêtes. Les
+profils, signatures, contrôles de révision et copies de conflits restent compatibles.
+
 ```sh
 mysync-release publish --secret-key /chemin/prive/cle-signature \
   --binary target/release/mysync --version VERSION \
@@ -33,6 +45,8 @@ mysync-release publish --secret-key /chemin/prive/cle-signature \
 ```
 
 Publier séparément `linux-x86_64` et `linux-aarch64` avec des binaires construits et testés sur l'architecture correspondante. La version annoncée doit correspondre à `mysync --version` et dépasser celle déjà publiée. `--output-dir` désigne la racine montée dans `/releases` ; l'outil crée le sous-dossier de la cible. Le dépôt source ne garantit pas qu'un artefact signé soit disponible sur un serveur donné. La publication de `latest.signed.json` peut déclencher les mises à jour automatiques : vérifier au préalable les bibliothèques natives et le TPM des clients concernés.
+
+Après publication, exécuter `mysync update` puis `mysync --version` sur un client. Si aucune mise à jour n'est installée, la commande indique la version du client et celle de la dernière release signée proposée par ce serveur. Relancer le daemon après une installation manuelle pour qu'il utilise le nouveau binaire. `make deploy` met à jour le serveur et la documentation ; les clients continuent à recevoir la release précédemment publiée tant que cette étape de publication n'a pas eu lieu.
 
 Garder la clé privée hors du conteneur et du répertoire public de releases, idéalement hors ligne sur un poste de publication distinct. Un fork génère sa propre clé avec `mysync-release keygen --secret-key /chemin/prive/cle-signature`, remplace `src/update_public_key.hex`, puis reconstruit client et serveur avant publication. La rotation de la clé publique n'est pas automatisée : les anciens clients doivent être réinstallés par un canal fiable. Voir les [garanties de distribution](security.md#distribution-et-exploitation).
 
@@ -50,13 +64,61 @@ L'état client est publié atomiquement une fois par passe modifiée, avec séri
 
 Sauvegarder de façon cohérente le répertoire de données privé, qui contient la base SQLite et les blobs, ainsi que les éléments de configuration nécessaires à la restauration. Éviter une copie brute de SQLite pendant les écritures : arrêter le serveur le temps d'une copie des fichiers, ou utiliser une méthode de sauvegarde SQLite cohérente. Tester régulièrement la restauration sur un hôte isolé. Conserver les sauvegardes et la clé privée hors du dépôt et du répertoire de releases. MySyncFiles ne remplace pas ces sauvegardes : les écrasements ordinaires n'ont pas d'historique restaurable.
 
-`make test` vérifie l'installateur, le formatage Rust, les tests Rust, le rendu des URL de documentation et le build MkDocs. Si les bibliothèques TPM manquent sur l'hôte, les tests Rust passent dans `deploy/Dockerfile.tpm-dev`. `make deploy` lance ces contrôles, valide `deploy/.env`, reconstruit l'image, génère la documentation avec l'origine configurée, recrée le service serveur et copie `site/` vers `/var/www/mysyncfiles/docs/` (ou `MYSYNC_DOCS_DIR`). Il faut Docker Compose, Rust, Python 3, `rsync` et `sudo` sur l'hôte de déploiement. Cette commande ne publie pas de binaire client signé. `make clean` supprime seulement `target/` et `site/` ; les données privées, releases et fichiers déjà déployés restent en place.
+`make test` vérifie l'installateur, le formatage Rust, les tests Rust, le rendu des URL de documentation et le build MkDocs. Si les bibliothèques TPM manquent sur l'hôte, les tests Rust passent dans `deploy/Dockerfile.tpm-dev`. Les compilations Cargo utilisent une tâche par défaut. Les conteneurs de développement et les étapes de construction Rust via Buildx sont limités à 3 Gio de mémoire ; les conteneurs de test et de compilation cliente disposent de deux processeurs. `MYSYNC_BUILD_MEMORY` ajuste la limite mémoire, `MYSYNC_TEST_CPUS` les processeurs de ces conteneurs et `MYSYNC_CARGO_JOBS` les tâches Cargo des tests et du client ; l'image serveur reste compilée avec une tâche. `make test`, `make install` et `make build-client` prennent un verrou sur le répertoire du projet et refusent de lancer deux compilations en parallèle. Une limite mémoire atteinte fait échouer le build ou le test ; elle évite qu'il épuise la mémoire de l'hôte.
+
+`make deploy` lance les contrôles, valide `deploy/.env`, reconstruit l'image, génère la documentation avec l'origine configurée, recrée le service serveur et copie `site/` vers `/var/www/mysyncfiles/docs/` (ou `MYSYNC_DOCS_DIR`). Il faut Docker Compose, Docker Buildx, `flock`, Rust, Python 3, `rsync` et `sudo` sur l'hôte de déploiement. Cette commande ne publie pas de binaire client signé. `make clean` supprime seulement `target/` et `site/` ; les données privées, releases et fichiers déjà déployés restent en place.
 
 `make logs`, `make stop` et `make start` pilotent le serveur sans supprimer les volumes. Les commandes directes `docker compose -f deploy/compose.yaml ...` restent utilisables. Ne pas démarrer deux serveurs sur la même base.
 
 L'appartenance au groupe `docker` accorde des privilèges élevés sur l'hôte. Réserver les commandes Compose aux administrateurs autorisés.
 
 La documentation se prévisualise indépendamment avec `make docs` sur `http://127.0.0.1:8000`, s'arrête avec `make docs-stop` et se valide avec `make docs-check`. Ce service local n'expose ni les données du serveur ni `deploy/.env`.
+
+## Mesurer les performances
+
+`make benchmark` construit des binaires release et mesure de vrais processus
+`mysync` face à un serveur local isolé, avec appairage et signatures via `swtpm`.
+Les profils, clés et fichiers de test sont temporaires. Cette cible ne contacte
+pas le serveur configuré dans `deploy/.env`. Elle utilise le même environnement
+TPM que `make test` ; Python 3 et Linux sont nécessaires.
+
+```sh
+make benchmark > benchmark.jsonl
+make benchmark MYSYNC_BENCH_ARGS='--suite metadata --repetitions 5 --work-dir target' > metadata.jsonl
+```
+
+Les suites disponibles sont `metadata`, `transfer`, `overwrite`, `daemon`, `concurrent` et
+`all`. Elles couvrent 100 et 10 000 fichiers de 4 Kio, les transferts de 100 et
+1 000 petits fichiers, trois fichiers de 64 Mio, un miroir de 512 Mio, les
+conflits, les remplacements ordinaires et 35 secondes de daemon au repos. `--delay-ms 40` ajoute 40 ms à chaque
+réponse HTTP pour étudier le coût des allers-retours. `--binary CHEMIN` permet
+de mesurer un autre client face au même serveur de benchmark.
+
+Chaque mesure de commande contient le temps total, le CPU utilisateur/système, le pic
+RSS du client, les blocs de 512 octets lus/écrits (`getrusage`), les requêtes HTTP
+et les étapes de `status`/`sync`. Les compteurs d'I/O logiques dans `/proc` sont
+échantillonnés toutes les 2 ms et peuvent manquer les toutes dernières opérations.
+`scan` comprend parcours, métadonnées, lectures et SHA-256 ; `apply` comprend les
+transferts et le journal durable. Certaines étapes s'exécutent simultanément :
+leurs durées ne doivent pas être additionnées. Les timings ne sont activés que
+par `MYSYNC_BENCH_TIMINGS=1` et n'incluent ni chemins ni contenus privés.
+Les compteurs `harness_io_*` incluent le serveur de test et ses processus enfants
+terminés ; ils ne permettent pas d'isoler les I/O du serveur.
+
+Le serveur traite les opérations bloquantes avec huit tâches au maximum et
+conserve sa limite de huit corps de requête signés en mémoire. Une requête
+authentifiée peut attendre jusqu'à 250 ms qu'une place se libère avant de recevoir
+HTTP 429 ; cette attente ne lit pas son corps et ne garde pas le verrou SQLite.
+
+Comparer les médianes de plusieurs répétitions, avec le même matériel, quota
+CPU, filesystem et état de cache, sans compiler pendant les mesures. Les scans
+sont normalement servis par le cache du noyau : zéro bloc physique lu ne signifie
+pas zéro lecture logique. Le serveur et les TPM simulés partagent le quota CPU
+du benchmark ; ce test sur loopback ne mesure pas le TLS ni un TPM matériel.
+Les scénarios de concurrence indiquent aussi les latences p50/p95 et le retard
+maximal d'un timer Tokio. Vérifier `returncode` et les compteurs de fichiers avant
+de comparer un ancien client : les versions qui reprennent après le curseur
+`next` peuvent omettre une entrée à chaque page du manifeste.
 
 ## Publier la documentation
 

@@ -29,7 +29,7 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 pub fn hash(bytes: impl AsRef<[u8]>) -> String {
-    hex::encode(Sha256::digest(bytes.as_ref()))
+    hex::encode(openssl::sha::sha256(bytes.as_ref()))
 }
 pub fn random_secret() -> Result<String> {
     let mut bytes = [0u8; 32];

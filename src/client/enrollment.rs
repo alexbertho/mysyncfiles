@@ -146,6 +146,17 @@ struct PairingRequest {
     server_public_key: String,
     root: PathBuf,
     code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web_status_enabled: Option<bool>,
+}
+
+#[derive(Default)]
+pub struct SetupOptions {
+    pub ek_cert: Option<PathBuf>,
+    pub ek_chain: Option<PathBuf>,
+    pub web_status_enabled: Option<bool>,
+    /// Override the TPM transport for tests; manufacturer trust is unchanged.
+    pub tcti: Option<String>,
 }
 
 pub struct SetupOutcome {
@@ -258,6 +269,35 @@ pub async fn setup_with_tcti(
     ek_chain: Option<PathBuf>,
     tcti: String,
 ) -> Result<SetupOutcome> {
+    setup_with_options(
+        config_path,
+        server,
+        server_public_key,
+        root,
+        SetupOptions {
+            ek_cert,
+            ek_chain,
+            tcti: Some(tcti),
+            ..SetupOptions::default()
+        },
+    )
+    .await
+}
+
+pub async fn setup_with_options(
+    config_path: &Path,
+    server: String,
+    server_public_key: String,
+    root: PathBuf,
+    options: SetupOptions,
+) -> Result<SetupOutcome> {
+    let SetupOptions {
+        ek_cert,
+        ek_chain,
+        web_status_enabled,
+        tcti,
+    } = options;
+    let tcti = tcti.unwrap_or_else(crate::tpm::default_tcti);
     validate_server_url(&server)?;
     let server_public_key =
         hex::encode(crate::origin_auth::public_key(&server_public_key)?.to_bytes());
@@ -279,6 +319,9 @@ pub async fn setup_with_tcti(
             || config.server_public_key != server_public_key
         {
             bail!("existing client profile has a different server, key or folder");
+        }
+        if let Some(enabled) = web_status_enabled {
+            super::set_web_status(config_path, enabled)?;
         }
         let report = sync(config_path).await?;
         let conflicts = status(config_path).await?.conflicts;
@@ -310,10 +353,19 @@ pub async fn setup_with_tcti(
             server_public_key: server_public_key.clone(),
             root: root.clone(),
             code: crate::auth_protocol::pairing_code()?,
+            web_status_enabled: Some(
+                web_status_enabled.unwrap_or_else(super::default_web_status_enabled),
+            ),
         };
         private_write_json(&pair_path, &request)?;
         request
     };
+    if let Some(enabled) = web_status_enabled
+        && request.web_status_enabled != Some(enabled)
+    {
+        request.web_status_enabled = Some(enabled);
+        private_write_json(&pair_path, &request)?;
+    }
     drop(pair_lock);
     println!("Pairing code: {}", request.code);
     println!("Ask the administrator to run `make pair` on the server. Waiting...");
@@ -373,6 +425,22 @@ pub async fn setup_with_tcti(
     let conflicts = status(config_path).await?.conflicts;
     std::fs::remove_file(pair_path)?;
     Ok(SetupOutcome { report, conflicts })
+}
+
+fn pairing_web_status(config_path: &Path, config: &ClientConfig) -> Result<Option<bool>> {
+    let bytes = match std::fs::read(config_path.with_extension("pairing.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let request: PairingRequest = serde_json::from_slice(&bytes)?;
+    if request.server != config.server
+        || request.server_public_key != config.server_public_key
+        || request.root != config.root
+    {
+        bail!("pairing preferences belong to a different client profile");
+    }
+    Ok(request.web_status_enabled)
 }
 
 pub async fn enroll(
@@ -458,14 +526,18 @@ pub async fn enroll_with_tcti(
             }
         })
         .await??;
-        let config = ClientConfig {
+        let mut config = ClientConfig {
             server,
             server_public_key,
             identity: Some(identity),
             root,
             auto_update: true,
+            web_status_enabled: super::default_web_status_enabled(),
             update_public_key: default_update_public_key(),
         };
+        if let Some(enabled) = pairing_web_status(config_path, &config)? {
+            config.web_status_enabled = enabled;
+        }
         Api::new(&config)?;
         let pending = PendingEnrollment {
             config,
@@ -474,6 +546,12 @@ pub async fn enroll_with_tcti(
         private_write_json(&pending_path, &pending)?;
         pending
     };
+    if let Some(enabled) = pairing_web_status(config_path, &pending.config)?
+        && pending.config.web_status_enabled != enabled
+    {
+        pending.config.web_status_enabled = enabled;
+        private_write_json(&pending_path, &pending)?;
+    }
     let api = Api::new(&pending.config)?;
     if pending.challenge.is_none() {
         let identity = pending
@@ -544,8 +622,11 @@ pub async fn enroll_with_tcti(
 pub async fn activate_enrollment(config_path: &Path) -> Result<SyncReport> {
     let lock = acquire_lock(config_path).await?;
     let pending_path = config_path.with_extension("enrollment.json");
-    let pending: PendingEnrollment =
+    let mut pending: PendingEnrollment =
         serde_json::from_slice(&std::fs::read(&pending_path).context("no pending enrollment")?)?;
+    if let Some(enabled) = pairing_web_status(config_path, &pending.config)? {
+        pending.config.web_status_enabled = enabled;
+    }
     Api::new(&pending.config)?.authenticate().await?;
     private_write_json(config_path, &pending.config)?;
     std::fs::remove_file(pending_path)?;
