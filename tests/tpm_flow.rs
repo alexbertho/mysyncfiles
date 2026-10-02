@@ -547,14 +547,16 @@ async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
     let origin_key = server.state.public_key();
     let tcti = simulator.tcti.clone();
     let setup = tokio::spawn(async move {
-        client::setup_with_tcti(
+        client::setup_with_options(
             &pending_config,
             origin,
             origin_key,
             pending_root,
-            None,
-            None,
-            tcti,
+            client::SetupOptions {
+                web_status_enabled: Some(false),
+                tcti: Some(tcti),
+                ..client::SetupOptions::default()
+            },
         )
         .await
     });
@@ -569,6 +571,8 @@ async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
         }
     })
     .await??;
+    let pairing: serde_json::Value = serde_json::from_slice(&std::fs::read(&pair_path)?)?;
+    assert_eq!(pairing["web_status_enabled"], false);
     let id = device_auth::register_pair(&server.state, "setup-client", &code)?;
     let fingerprint = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -580,12 +584,36 @@ async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
         }
     })
     .await??;
+    let pending: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.with_extension("enrollment.json"))?)?;
+    assert_eq!(pending["config"]["web_status_enabled"], false);
+    // Resume without an explicit flag after the installer was interrupted.
+    setup.abort();
+    let _ = setup.await;
+    let pending_config = config.clone();
+    let pending_root = root.clone();
+    let origin = server.url.clone();
+    let origin_key = server.state.public_key();
+    let tcti = simulator.tcti.clone();
+    let setup = tokio::spawn(async move {
+        client::setup_with_tcti(
+            &pending_config,
+            origin,
+            origin_key,
+            pending_root,
+            None,
+            None,
+            tcti,
+        )
+        .await
+    });
     device_auth::approve(&server.state, &id, &fingerprint)?;
     let outcome = tokio::time::timeout(Duration::from_secs(30), setup).await???;
     assert_eq!(outcome.report.uploaded, 1);
     assert_eq!(outcome.conflicts, 0);
     assert!(!pair_path.exists());
     assert!(config.exists());
+    assert!(!client::load_config(&config)?.web_status_enabled);
     let conflict_dir = root.join(".mysync-conflicts");
     std::fs::create_dir(&conflict_dir)?;
     std::fs::write(conflict_dir.join("review.txt"), b"review this file")?;
@@ -601,18 +629,24 @@ async fn setup_waits_for_admin_then_syncs_and_is_resumable() -> Result<()> {
     .await?;
     assert_eq!(resumed.report.uploaded, 0);
     assert_eq!(resumed.conflicts, 1);
+    assert!(!client::load_config(&config)?.web_status_enabled);
     std::fs::remove_file(conflict_dir.join("review.txt"))?;
-    let cleared = client::setup_with_tcti(
+    let cleared = client::setup_with_options(
         &config,
         server.url.clone(),
         server.state.public_key(),
         root,
-        None,
-        None,
-        simulator.tcti.clone(),
+        client::SetupOptions {
+            web_status_enabled: Some(true),
+            tcti: Some(simulator.tcti.clone()),
+            ..client::SetupOptions::default()
+        },
     )
     .await?;
     assert_eq!(cleared.conflicts, 0);
+    let final_config = client::load_config(&config)?;
+    assert!(final_config.web_status_enabled);
+    assert_eq!(final_config.identity.unwrap().device, id);
     Ok(())
 }
 
@@ -652,6 +686,7 @@ async fn setup_replaces_an_expired_resumed_pairing_code_in_one_run() -> Result<(
                 identity: Some(identity),
                 root: root.clone(),
                 auto_update: true,
+                web_status_enabled: false,
                 update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
             },
             "challenge": null,
@@ -902,8 +937,32 @@ async fn signed_requests_authenticate_before_buffering_and_bound_in_flight_bodie
             .status(),
         StatusCode::TOO_MANY_REQUESTS
     );
+    // A short burst waits for admission without reading another body. Once
+    // existing handlers finish, this request succeeds without a client retry.
+    let waiting = signed(
+        &http,
+        &format!("{}/v1/manifest", server.url),
+        Method::GET,
+        vec![],
+        &key,
+        &active.token,
+    )
+    .await?;
+    let waiting_http = http.clone();
+    let waiting = tokio::spawn(async move { waiting_http.execute(waiting).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !waiting.is_finished(),
+        "burst was rejected before admission"
+    );
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await???
+            .status(),
+        StatusCode::OK
+    );
     // Cancellation releases admission slots; a new legitimate request works.
     let request = signed(
         &http,
@@ -1071,6 +1130,7 @@ async fn tpm_enrollment_request_binding_replay_and_revocation() -> Result<()> {
         identity: Some(key.clone()),
         root: root.clone(),
         auto_update: false,
+        web_status_enabled: false,
         update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
     };
     let config_path = local.path().join("config.json");
@@ -1345,6 +1405,7 @@ async fn client_enrollment_is_resumable() -> Result<()> {
         let config = client::load_config(&path)?;
         assert_eq!(config.identity.as_ref().unwrap().device, enrollment_id);
         assert!(config.auto_update);
+        assert!(config.web_status_enabled);
         assert_eq!(std::fs::read(root.join("keep.txt"))?, b"keep local data");
         assert_eq!(
             std::fs::metadata(&path)?.permissions().mode() & 0o777,

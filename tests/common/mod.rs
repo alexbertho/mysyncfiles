@@ -276,6 +276,7 @@ pub fn config(url: &str, root: &Path, identity: Identity) -> ClientConfig {
         identity: Some(identity),
         root: root.into(),
         auto_update: false,
+        web_status_enabled: false,
         update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
     }
 }

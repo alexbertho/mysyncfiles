@@ -18,6 +18,14 @@ Le script propose les paquets manquants sur Debian/Arch avant tout `sudo`, véri
 
 Si un ancien profil contient un jeton `token`, l'installateur interactif propose de conserver ce profil et son état de révisions dans un dossier privé `legacy-profile.*` sous la configuration du client, puis reprend l'appairage TPM. Le dossier synchronisé reste à sa place ; sauvegarder séparément ses fichiers importants avant la première synchronisation et examiner les éventuels conflits. Sans terminal, le script s'arrête avec une explication. Un profil qui contient aussi une identité TPM doit être examiné manuellement : l'installateur ne l'archive pas automatiquement. Le jeton ancien n'est jamais accepté comme identité par le nouveau client.
 
+Avec un client signé **0.3.8 ou ultérieur**, l’installateur demande aussi `Enable browser status on this PC? [Y/n]` avant l’appairage. Entrée active la [présence locale sur `/status`](web-status.md) ; répondre `n` la désactive. Une préférence déjà enregistrée devient le choix proposé, même après un appairage interrompu. Pour fixer ce choix sans question :
+
+```sh
+curl -fsS --proto '=https' --max-redirs 0 https://sync.example.org/install.sh | MYSYNC_WEB_STATUS=false sh
+```
+
+`MYSYNC_WEB_STATUS` accepte `true` ou `false`. Sans terminal, le script affiche la commande `setup` à lancer avec ce choix, sans appairer ni démarrer le service. Une ancienne release dépourvue de ce réglage reste installable sans cette variable ; un choix explicite nécessite une release 0.3.8 ou ultérieure. Après l’installation, utiliser `mysync web-status enable` ou `disable`, puis relancer le daemon. Une réinstallation réussie redémarre le service pour appliquer le binaire et le réglage.
+
 Si le certificat EK constructeur manque dans les index NV du TPM, fournir son fichier DER obtenu auprès du fabricant :
 
 ```sh
@@ -45,6 +53,8 @@ Si l'installateur a été lancé sans terminal, démarrer l'appairage sur le cli
 ```
 
 Ajouter `--ek-cert /chemin/ek.der` et `--ek-chain /chemin/intermediaires.pem` si nécessaire. Après la première synchronisation, examiner les éventuels fichiers dans `.mysync-conflicts/` avant d'activer le service. Si `mysync setup` a réussi sans conflit hors de l'installateur, démarrer le service avec `systemctl --user enable --now mysync.service`. Pour un démarrage sans session ouverte : `sudo loginctl enable-linger "$(id -un)"`.
+
+Avec le client 0.3.8, ajouter `--web-status false` à `setup` pour désactiver la présence navigateur dès l’appairage. Sans cette option, les nouveaux profils l’activent et une reprise conserve le choix précédent.
 
 ## Parcours manuel avec invitation
 

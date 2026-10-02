@@ -7,8 +7,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
 use notify::{RecursiveMode, Watcher};
+use openssl::sha::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::local_fs::Mirror;
@@ -17,9 +17,12 @@ use crate::model::Entry;
 
 mod api;
 mod enrollment;
+pub mod local_api;
+mod metrics;
 pub use api::Api;
 pub use enrollment::{
-    SetupOutcome, activate_enrollment, enroll, enroll_with_tcti, setup, setup_with_tcti,
+    SetupOptions, SetupOutcome, activate_enrollment, enroll, enroll_with_tcti, setup,
+    setup_with_options, setup_with_tcti,
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -34,11 +37,18 @@ pub struct ClientConfig {
     pub root: PathBuf,
     #[serde(default = "default_auto_update")]
     pub auto_update: bool,
+    /// Loopback-only browser presence, enabled unless explicitly disabled.
+    #[serde(default = "default_web_status_enabled")]
+    pub web_status_enabled: bool,
     #[serde(default = "default_update_public_key")]
     pub update_public_key: String,
 }
 
 fn default_auto_update() -> bool {
+    true
+}
+
+fn default_web_status_enabled() -> bool {
     true
 }
 
@@ -93,20 +103,23 @@ fn lock_path(config_path: &Path) -> PathBuf {
 }
 
 async fn acquire_lock(config_path: &Path) -> Result<std::fs::File> {
-    let path = lock_path(config_path);
+    let file = open_profile_lock(config_path)?;
     tokio::task::spawn_blocking(move || {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(path)?;
         file.lock_exclusive()?;
         Ok(file)
     })
     .await?
+}
+
+fn open_profile_lock(config_path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(lock_path(config_path))?)
 }
 
 fn private_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -160,6 +173,17 @@ pub async fn trust_server(config_path: &Path, public_key: &str) -> Result<()> {
     let _lock = acquire_lock(config_path).await?;
     let mut config = load_config(config_path)?;
     config.server_public_key = hex::encode(key.to_bytes());
+    private_write_json(config_path, &config)
+}
+
+/// Change only the saved browser-presence preference, without contacting a
+/// server/TPM or starting a service. A running daemon reads it after restart.
+pub fn set_web_status(config_path: &Path, enabled: bool) -> Result<()> {
+    let lock = open_profile_lock(config_path)?;
+    FileExt::try_lock_exclusive(&lock)
+        .context("client profile is busy; stop the daemon or retry after synchronization")?;
+    let mut config = load_config(config_path)?;
+    config.web_status_enabled = enabled;
     private_write_json(config_path, &config)
 }
 
@@ -291,7 +315,7 @@ fn hash_reader(
         hash.update(&buffer[..size]);
         after_read()?;
     }
-    Ok(hex::encode(hash.finalize()))
+    Ok(hex::encode(hash.finish()))
 }
 
 #[cfg(test)]
@@ -317,10 +341,14 @@ fn file_stamp(file: &std::fs::File) -> Result<FileStamp> {
 }
 
 fn unchanged_capture(
+    mirror: &Mirror,
     file: &mut std::fs::File,
     observed: Option<&String>,
     mut after_read: impl FnMut(),
 ) -> Result<bool> {
+    // Keep the copy when monitoring is unavailable. Timestamp checks alone
+    // cannot distinguish writes in the same filesystem clock tick.
+    let watch = mirror.watch_changes(file).ok();
     let before = file_stamp(file)?;
     let digest = hash_reader(&mut *file, || {
         after_read();
@@ -328,7 +356,9 @@ fn unchanged_capture(
     })?;
     // A digest can match even when an already-read region was edited. ctime
     // also catches writers that restore mtime; atime is deliberately ignored.
-    Ok(before == file_stamp(file)? && Some(&digest) == observed)
+    Ok(before == file_stamp(file)?
+        && Some(&digest) == observed
+        && watch.is_some_and(|watch| watch.unchanged()))
 }
 
 struct Scan {
@@ -337,6 +367,7 @@ struct Scan {
 }
 
 async fn scan(mirror: &Mirror) -> Result<Scan> {
+    let _timing = metrics::Phase::start("scan");
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -452,12 +483,23 @@ async fn apply_remote(
             }
             return Ok(true);
         }
-        // Hash the displaced file after publication, not the stale pre-download
-        // pathname. Edits made while downloading or just before capture survive.
-        let mut captured = backup
-            .read()?
-            .ok_or_else(|| anyhow!("recovery copy disappeared"))?;
-        let changed = !unchanged_capture(&mut captured, observed, || {})?;
+        // A known conflict is always retained. Only hash a capture when its
+        // contents can affect the decision to remove it. This still checks
+        // late edits against the captured inode before any removal.
+        let changed = if preserve_local {
+            false
+        } else {
+            let mut captured = backup
+                .read()?
+                .ok_or_else(|| anyhow!("recovery copy disappeared"))?;
+            let observed = observed.cloned();
+            let mirror = mirror.clone();
+            let _timing = metrics::Phase::start("capture_hash");
+            !tokio::task::spawn_blocking(move || {
+                unchanged_capture(&mirror, &mut captured, observed.as_ref(), || {})
+            })
+            .await??
+        };
         if preserve_local || changed {
             eprintln!("conflict copy saved: {display}");
             report.conflicts += 1;
@@ -474,13 +516,19 @@ async fn sync_pass(
     mirror: &Mirror,
     report: &mut SyncReport,
 ) -> Result<bool> {
-    let manifest = api.manifest().await?;
+    let _pass_timing = metrics::Phase::start("sync_pass");
+    let (manifest, scanned) = tokio::try_join!(
+        async {
+            let _timing = metrics::Phase::start("manifest");
+            api.manifest().await
+        },
+        scan(mirror)
+    )?;
     let remote: BTreeMap<String, Entry> = manifest
         .entries
         .into_iter()
         .map(|entry| (entry.path.clone(), entry))
         .collect();
-    let scanned = scan(mirror).await?;
     let local = scanned.files;
     let pass_issues = scanned.issues;
     for issue in &pass_issues {
@@ -493,7 +541,10 @@ async fn sync_pass(
         }
         eprintln!("sync skipped {:?}: {}", issue.path, issue.error);
     }
+    let timing = metrics::Phase::start("load_state");
     let mut checkpoint = Checkpoint::open(config_path)?;
+    drop(timing);
+    let timing = metrics::Phase::start("plan");
     let state = &checkpoint.state;
     let paths: BTreeSet<String> = remote
         .keys()
@@ -520,7 +571,9 @@ async fn sync_pass(
         .cloned()
         .collect();
     let mut paths: Vec<_> = paths.into_iter().collect();
-    paths.sort_by_key(|path| {
+    // Stable sorting retains the BTreeSet's lexical order within each class
+    // and depth, without copying a path for every comparison.
+    paths.sort_by_cached_key(|path| {
         let deletion = remote.get(path).is_some_and(|e| {
             e.deleted
                 && (!local.contains_key(path)
@@ -547,9 +600,10 @@ async fn sync_pass(
                 2
             },
             std::cmp::Reverse(path.matches('/').count()),
-            path.clone(),
         )
     });
+    drop(timing);
+    let timing = metrics::Phase::start("apply");
     let result = async {
         let mut rescan = false;
         for path in paths {
@@ -600,7 +654,7 @@ async fn sync_pass(
                     },
                     true,
                 )?;
-                if !entry.deleted && local.keys().any(|p| p.starts_with(&format!("{path}/"))) {
+                if !entry.deleted && has_descendants(&local, &path) {
                     rescan = true; // Check all displaced directories on a fresh pass.
                 }
             } else if local_changed {
@@ -636,6 +690,8 @@ async fn sync_pass(
         Ok(rescan)
     }
     .await;
+    drop(timing);
+    let _checkpoint_timing = metrics::Phase::start("checkpoint");
     checkpoint.finish()?;
     result
 }
@@ -659,15 +715,32 @@ pub async fn sync(config_path: &Path) -> Result<SyncReport> {
     sync_passes(config_path, &config.root, &api).await
 }
 
+fn has_descendants<T>(files: &BTreeMap<String, T>, path: &str) -> bool {
+    let prefix = format!("{path}/");
+    files
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|(candidate, _)| candidate.starts_with(&prefix))
+}
+
 pub async fn status(config_path: &Path) -> Result<Status> {
+    let _timing = metrics::Phase::start("status");
     let config = load_config(config_path)?;
     let api = Api::new(&config)?;
-    let manifest = api.manifest().await?;
     let mirror = Mirror::open(&config.root)?;
-    let scanned = scan(&mirror).await?;
+    let (manifest, scanned) = tokio::try_join!(
+        async {
+            let _timing = metrics::Phase::start("manifest");
+            api.manifest_summary().await
+        },
+        scan(&mirror)
+    )?;
     let local = scanned.files;
     let mut issues = scanned.issues;
+    let timing = metrics::Phase::start("load_state");
     let state = load_state(config_path)?;
+    drop(timing);
+    let _compare_timing = metrics::Phase::start("compare");
     let changed_files = local
         .iter()
         .filter(|(path, hash)| {
@@ -695,11 +768,7 @@ pub async fn status(config_path: &Path) -> Result<Status> {
     Ok(Status {
         issues,
         local_files: local.len(),
-        remote_files: manifest
-            .entries
-            .iter()
-            .filter(|entry| !entry.deleted)
-            .count(),
+        remote_files: manifest.files,
         pending_local: changed_files + deleted_files,
         conflicts,
         generation: manifest.generation,
@@ -708,7 +777,23 @@ pub async fn status(config_path: &Path) -> Result<Status> {
 
 pub async fn daemon(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
-    let api = Api::new(&config)?;
+    let api = std::sync::Arc::new(Api::new(&config)?);
+    let activity = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::web_status_protocol::DaemonState::Starting,
+    ));
+    // The guard closes listeners and aborts requests on every exit, including
+    // cancellation, terminal errors and successful auto-update restarts.
+    let _bridge = if config.web_status_enabled {
+        match local_api::LocalBridge::start(api.clone(), activity.clone()) {
+            Ok(bridge) => Some(bridge),
+            Err(error) => {
+                eprintln!("web status bridge disabled: {error}; synchronization continues");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let watch_root = config.root.clone();
@@ -741,11 +826,13 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
     loop {
         let sync = async {
             let _lock = acquire_lock(config_path).await?;
+            *activity.lock().unwrap() = crate::web_status_protocol::DaemonState::Syncing;
             sync_passes(config_path, &config.root, &api).await
         };
         tokio::pin!(sync);
         tokio::select! {
             result = &mut sync => {
+                *activity.lock().unwrap() = if result.is_ok() { crate::web_status_protocol::DaemonState::Idle } else { crate::web_status_protocol::DaemonState::Error };
                 if let Err(error) = result {
                     eprintln!("sync failed: {error:#}");
                 }
@@ -771,7 +858,7 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
                             eprintln!("client updated to {version}; restarting service");
                             return Ok(());
                         }
-                        Ok(crate::update::UpdateOutcome::Current) => {}
+                        Ok(crate::update::UpdateOutcome::Current { .. }) => {}
                         Err(error) => eprintln!("client update check failed: {error:#}"),
                     },
                     _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -815,25 +902,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sha256_backend_preserves_existing_file_and_protocol_digests() -> Result<()> {
+        use sha2::Digest;
+        // SHA padding boundaries and both sides of the file read buffer size.
+        for size in [
+            0, 1, 55, 56, 63, 64, 65, 4096, 65535, 65536, 65537, 1_048_576,
+        ] {
+            let bytes: Vec<u8> = (0..size).map(|i| (i * 17 % 251) as u8).collect();
+            let expected = hex::encode(sha2::Sha256::digest(&bytes));
+            assert_eq!(hash_reader(bytes.as_slice(), || Ok(()))?, expected);
+            assert_eq!(crate::auth_protocol::hash(&bytes), expected);
+        }
+        assert_eq!(
+            crate::auth_protocol::hash(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn descendant_lookup_respects_path_component_boundaries() {
+        let files = ["a-file", "a.b/child", "a/child", "b/é", "é/child"]
+            .into_iter()
+            .map(|path| (path.to_owned(), ()))
+            .collect();
+        for path in ["a", "b", "é"] {
+            assert!(has_descendants(&files, path));
+        }
+        for path in ["", "a-file", "a/child", "a/chi", "b/é", "z"] {
+            assert!(!has_descendants(&files, path));
+        }
+    }
+
+    #[test]
     fn recovery_hash_detects_writes_to_an_already_read_region() -> Result<()> {
         use std::os::unix::fs::FileExt;
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("recovery");
+        let mirror = Mirror::open(temp.path())?;
         std::fs::write(&path, vec![0u8; 3 * 64 * 1024])?;
         let writer = std::fs::OpenOptions::new().write(true).open(&path)?;
         let observed = hash_file(std::fs::File::open(&path)?)?;
         let mut captured = std::fs::File::open(&path)?;
         let mut wrote = false;
-        assert!(!unchanged_capture(&mut captured, Some(&observed), || {
-            if !wrote {
-                writer.write_all_at(b"late edit", 0).unwrap();
-                wrote = true;
+        assert!(!unchanged_capture(
+            &mirror,
+            &mut captured,
+            Some(&observed),
+            || {
+                if !wrote {
+                    writer.write_all_at(b"late edit", 0).unwrap();
+                    wrote = true;
+                }
             }
-        })?);
+        )?);
         assert!(wrote);
         let new_hash = hash_file(std::fs::File::open(&path)?)?;
         assert_ne!(new_hash, observed);
         assert!(unchanged_capture(
+            &mirror,
             &mut std::fs::File::open(&path)?,
             Some(&new_hash),
             || {}

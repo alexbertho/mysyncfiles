@@ -8,3 +8,4 @@ pub mod release;
 pub mod server;
 pub mod tpm;
 pub mod update;
+pub mod web_status_protocol;

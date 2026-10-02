@@ -32,6 +32,25 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct ManifestSummary {
+    pub generation: i64,
+    pub files: usize,
+}
+
+impl From<Manifest> for ManifestSummary {
+    fn from(manifest: Manifest) -> Self {
+        Self {
+            generation: manifest.generation,
+            files: manifest
+                .entries
+                .iter()
+                .filter(|entry| !entry.deleted)
+                .count(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ManifestPage {
     pub generation: i64,
     pub entries: Vec<Entry>,

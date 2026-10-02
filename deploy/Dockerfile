@@ -4,13 +4,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends libtss2-dev lib
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY benches ./benches
 COPY deploy/install.sh deploy/mysync.service ./deploy/
-RUN cargo build --locked --release --bin mysync-server
+RUN cargo build --locked --release --jobs 1 --bin mysync-server
 
 FROM debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime-deps
+COPY --from=build /src/target/release/mysync-server /usr/local/bin/mysync-server
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tpm2-tools \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/mysync-server /usr/local/bin/mysync-server
 
 RUN set -eu; \
     runtime_root=/runtime; \

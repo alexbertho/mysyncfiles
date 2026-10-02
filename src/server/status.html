@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Statut local · MySyncFiles</title>
+  <link rel="stylesheet" href="/status.css">
+  <script src="/status.js" defer></script>
+</head>
+<body>
+  <main>
+    <p class="brand">MySyncFiles</p>
+    <h1>Statut de cet appareil</h1>
+    <p>Vérifiez qu’un client approuvé répond depuis ce navigateur. Le navigateur peut demander l’autorisation d’accéder à cet appareil.</p>
+    <p>Cette vérification nécessite MySyncFiles 0.3.7 ou une version ultérieure sur ce PC.</p>
+    <p>Le daemon doit être lancé. La présence navigateur est activée par défaut à partir de la version 0.3.8 ; utilisez <code>mysync web-status enable</code> pour la réactiver, puis relancez le daemon. Cette page ne consulte aucun fichier.</p>
+    <div class="actions">
+      <button id="verify" type="button">Vérifier</button>
+      <button id="cancel" type="button" hidden>Annuler</button>
+    </div>
+    <p id="message" role="status" aria-live="polite">Aucune vérification effectuée.</p>
+    <dl id="result" hidden></dl>
+    <p class="note">Une absence de réponse peut signifier que le daemon est arrêté, que l’accès est bloqué ou que le client est absent. Elle ne prouve pas une désinstallation.</p>
+    <p class="note">La reconnaissance confirme la réponse d’une clé TPM approuvée. Elle ne garantit ni la proximité physique du TPM, ni l’intégrité du logiciel. Le statut est déclaré par le client.</p>
+    <p class="note">Session anonyme de cinq minutes, présence valable au plus deux minutes. <a href="/status">Recharger la page</a> pour ouvrir une nouvelle session après expiration.</p>
+  </main>
+</body>
+</html>

@@ -49,11 +49,18 @@ impl Proxy {
                 async move {
                     let (parts, body) = request.into_parts();
                     let manifest = parts.uri.path() == "/v1/manifest";
+                    let presence =
+                        parts.uri.path() == mysyncfiles::web_status_protocol::PROOFS_PATH;
                     let mutation = parts.method == "PUT" && parts.uri.path() == "/v1/file";
                     if manifest {
                         polls.fetch_add(1, Ordering::SeqCst);
                     }
-                    let bytes = to_bytes(body, 8 * 1024 * 1024).await.unwrap();
+                    let mut bytes = to_bytes(body, 8 * 1024 * 1024).await.unwrap();
+                    if presence && mode.load(Ordering::SeqCst) == 9 {
+                        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        value["status"]["client_version"] = "99.0.0".into();
+                        bytes = serde_json::to_vec(&value).unwrap().into();
+                    }
                     let response = http
                         .request(parts.method, format!("{origin}{}", parts.uri))
                         .headers(parts.headers)
@@ -98,6 +105,21 @@ impl Proxy {
                         6 if manifest => {
                             headers.remove(RESPONSE_HEADER);
                         }
+                        7 if presence => {
+                            let mut value: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            value["challenge_id"] = "0".repeat(64).into();
+                            bytes = serde_json::to_vec(&value).unwrap().into();
+                        }
+                        8 if presence => {
+                            headers.remove(RESPONSE_HEADER);
+                        }
+                        10 if manifest => {
+                            let mut value: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            value["files"] = 0.into();
+                            bytes = serde_json::to_vec(&value).unwrap().into();
+                        }
                         _ => {}
                     }
                     headers.remove("transfer-encoding");
@@ -123,6 +145,79 @@ impl Proxy {
             task,
         })
     }
+}
+
+#[tokio::test]
+async fn presence_rejects_proxy_changes_to_signed_status_and_acknowledgements() -> Result<()> {
+    use mysyncfiles::{auth_protocol::now, web_status_protocol::*};
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("server");
+    let mut server = common::TestServer::start(&data).await?;
+    let device = server.add_device("client").await?;
+    let proxy = Proxy::start(server.url.clone()).await?;
+    rusqlite::Connection::open(data.join("metadata.sqlite3"))?.execute(
+        "UPDATE auth_settings SET value=?1 WHERE key='public_url'",
+        [&proxy.url],
+    )?;
+    common::register_origin(&proxy.url, server.state.public_key());
+    let api = client::Api::new(&common::config(&proxy.url, temp.path(), device))?;
+    let http = reqwest::Client::new();
+    let page = http
+        .get(format!("{}/status", proxy.url))
+        .send()
+        .await?
+        .error_for_status()?;
+    let cookie = page.headers()["set-cookie"]
+        .to_str()?
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    for mode in [7, 8, 9] {
+        let challenge: ChallengeResponse = http
+            .post(format!("{}/v1/web/status/challenges", proxy.url))
+            .header("cookie", &cookie)
+            .header("origin", &proxy.url)
+            .header("x-mysync-web", "1")
+            .json(&serde_json::json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let proof = PresenceProof {
+            ticket: challenge.ticket,
+            observed_origin: proxy.url.clone(),
+            instance_id: "a".repeat(64),
+            status: LocalStatus {
+                api_version: 1,
+                client_version: "0.3.6".into(),
+                daemon_state: DaemonState::Idle,
+                communication: CommunicationState::Unknown,
+                observed_at: now(),
+                last_authenticated_at: None,
+                error: None,
+            },
+        };
+        proxy.mode.store(mode, Ordering::SeqCst);
+        assert!(api.submit_presence(&proof).await.is_err());
+        let result = http
+            .get(format!(
+                "{}/v1/web/status/challenges/{}",
+                proxy.url, challenge.challenge_id
+            ))
+            .header("cookie", &cookie)
+            .header("x-mysync-web", "1")
+            .send()
+            .await?;
+        if mode == 9 {
+            assert_eq!(result.status(), StatusCode::ACCEPTED);
+        } else {
+            let verified: VerifiedPresence = result.error_for_status()?.json().await?;
+            assert_eq!(verified.status.client_version, "0.3.6");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -158,6 +253,18 @@ async fn proxy_cannot_forge_files_tombstones_mutations_status_or_replay_response
             "{mode}: {error:#}"
         );
         assert_eq!(std::fs::read(root.join("file"))?, b"original");
+        assert_eq!(std::fs::read(&state_path)?, original_state);
+    }
+    for mode in [10, 4, 5, 6] {
+        proxy.mode.store(mode, Ordering::SeqCst);
+        let error = client::status(&config_path)
+            .await
+            .err()
+            .expect("summary must be authenticated");
+        assert!(
+            error.to_string().contains("origin response"),
+            "{mode}: {error:#}"
+        );
         assert_eq!(std::fs::read(&state_path)?, original_state);
     }
     proxy.mode.store(3, Ordering::SeqCst);

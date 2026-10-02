@@ -16,6 +16,8 @@ La commande `device auth-configure` enregistre dans SQLite l'origine publique HT
 
 ## Client
 
+`web_status_enabled` est un booléen, `true` par défaut depuis la version 0.3.8, enregistré dans les nouveaux profils. Un ancien profil sans ce champ utilise `true` ; un `false` explicite reste conservé. À `true`, `mysync daemon` expose le pont de présence sur le port loopback 47831 pour la page `/status` du serveur. Utiliser `mysync web-status status`, `enable` ou `disable` pour consulter ou modifier ce réglage. L’installateur propose le choix et `mysync setup --web-status true|false` permet de le fixer pendant l’appairage. Un redémarrage du daemon est nécessaire après modification. Voir [le fonctionnement et les limites du statut web](web-status.md).
+
 Le champ `server_public_key` contient la clé publique Ed25519 reçue directement de l'administrateur. `setup` et `enroll` acceptent `--server-public-key CLE_HEX`, ou la demandent dans un terminal. Un ancien profil sans cette clé refuse de synchroniser jusqu'à l'exécution de `mysync trust-server --public-key CLE_HEX` ; voir la [migration](device-auth.md#authenticite-des-reponses-et-migration). Cette clé est distincte de `update_public_key`, utilisée pour les releases.
 
 `config.state.journal` accompagne `config.state.json` lorsqu'une passe comporte des mutations. Le journal permet de reprendre après interruption avant la publication du prochain état complet ; conserver les deux fichiers ensemble lors d'une sauvegarde du profil.

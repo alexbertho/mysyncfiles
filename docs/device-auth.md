@@ -129,12 +129,14 @@ Les routes publiques d'appairage partagent quatre admissions, acquises avant tou
 ## Tests et validation
 
 ```sh
-docker build -t mysyncfiles-tpm-dev -f deploy/Dockerfile.tpm-dev .
-docker run --rm --user "$(id -u):$(id -g)" \
+docker buildx build --resource memory=3g --resource memory-swap=3g \
+  --load -t mysyncfiles-tpm-dev -f deploy/Dockerfile.tpm-dev .
+docker run --rm --memory=3g --memory-swap=3g --cpus=2 \
+  --user "$(id -u):$(id -g)" \
   --mount type=bind,src="$PWD",dst=/src \
   -e CARGO_HOME=/src/target/docker-cargo \
   -e CARGO_TARGET_DIR=/src/target/docker-tpm \
-  mysyncfiles-tpm-dev cargo +1.98.1 test --locked
+  mysyncfiles-tpm-dev cargo +1.98.1 test --locked --jobs 1
 ```
 
 Les tests créent des TPM simulés isolés et des autorités éphémères. Ils couvrent les EK RSA/ECC, certificats non fiables/expirés/mauvais usage, activation avec une mauvaise clé, copie du blob sur un autre TPM, approbation, reprise d'appairage, expiration, rejeu, altération de requêtes, sessions volées, révocation et transferts signés par blocs. Les régressions de synchronisation et les mises à jour signées sont aussi testées.

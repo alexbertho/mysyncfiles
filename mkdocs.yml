@@ -32,6 +32,7 @@ nav:
       - Architecture: architecture.md
       - Fonctionnement du serveur: server.md
       - Fonctionnement du client: client.md
+      - Présence locale et statut web: web-status.md
   - Administrer:
       - Configuration: configuration.md
       - Déploiement et publication: operations.md

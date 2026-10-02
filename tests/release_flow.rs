@@ -50,6 +50,36 @@ fn publishing_rejects_a_client_without_setup() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn publishing_requires_a_new_version_for_a_changed_binary() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let key = temp.path().join("signing.key");
+    release::generate_key(&key)?;
+    let binary = temp.path().join("mysync");
+    executable(&binary, "0.3.6")?;
+    let releases = temp.path().join("releases");
+    let target = release::current_target().unwrap();
+    let manifest = release::publish(&key, &binary, "0.3.6", target, &releases)?;
+    let envelope = releases.join(target).join("latest.signed.json");
+    let previous = std::fs::read(&envelope)?;
+    let original_binary = std::fs::read(&binary)?;
+    let mut changed = original_binary.clone();
+    changed.extend_from_slice(b"\n# new client behavior\n");
+    std::fs::write(&binary, changed)?;
+    let error = release::publish(&key, &binary, "0.3.6", target, &releases).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("newer than the published version")
+    );
+    assert_eq!(std::fs::read(envelope)?, previous);
+    assert_eq!(
+        std::fs::read(releases.join(target).join(manifest.artifact))?,
+        original_binary
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn installer_is_served_from_the_image_only_after_public_url_configuration() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -242,6 +272,7 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
             identity: None,
             root: temp.path().into(),
             auto_update: true,
+            web_status_enabled: false,
             update_public_key: public.clone(),
         });
         tasks.push(tokio::spawn(async move {
@@ -270,7 +301,11 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
         newer
     );
     assert_eq!(new?, UpdateOutcome::Installed("0.3.0".into()));
-    assert_eq!(old?, UpdateOutcome::Current);
+    let current = UpdateOutcome::Current {
+        installed_version: "0.3.0".into(),
+        published_version: "0.2.0".into(),
+    };
+    assert_eq!(old?, current);
     assert!(std::fs::read_to_string(&installed)?.contains("0.3.0"));
     // Also cover a stale daemon that starts its check after the newer install.
     assert_eq!(
@@ -281,7 +316,7 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
             "0.1.0"
         )
         .await?,
-        UpdateOutcome::Current
+        current
     );
     for task in tasks {
         task.abort();
@@ -330,6 +365,7 @@ async fn update_keeps_installed_client_when_signed_candidate_cannot_run() -> Res
             identity: None,
             root: temp.path().into(),
             auto_update: true,
+            web_status_enabled: false,
             update_public_key: public_key,
         };
         assert!(
@@ -380,13 +416,14 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
         axum::serve(listener, server::router(state)).await.unwrap();
     });
     let installed = temp.path().join("mysync");
-    executable(&installed, "0.1.0")?;
+    executable(&installed, "0.3.6")?;
     let config = ClientConfig {
         server_public_key: String::new(),
         server: format!("http://{address}"),
         identity: None,
         root: temp.path().to_path_buf(),
         auto_update: true,
+        web_status_enabled: false,
         update_public_key: public_key,
     };
     let response =
@@ -405,7 +442,7 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
             &config.server,
             &config.update_public_key,
             &installed,
-            "0.1.0"
+            "0.3.6"
         )
         .await
         .is_err()
@@ -417,7 +454,7 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
             &config.server,
             &config.update_public_key,
             &installed,
-            "0.1.0"
+            "0.3.6"
         )
         .await?,
         UpdateOutcome::Installed(version.into())
@@ -431,8 +468,84 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
             version
         )
         .await?,
-        UpdateOutcome::Current
+        UpdateOutcome::Current {
+            installed_version: version.into(),
+            published_version: version.into(),
+        }
     );
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_reports_the_actual_published_version_without_replacing_current_clients()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let key = temp.path().join("signing.key");
+    let public_key = release::generate_key(&key)?;
+    let binary = temp.path().join("source-mysync");
+    executable(&binary, "0.3.6")?;
+    let target = release::current_target().unwrap();
+    let releases = temp.path().join("releases");
+    let manifest = release::publish(&key, &binary, "0.3.6", target, &releases)?;
+    // Reproduce an existing deployment with legacy signed metadata. Neither an
+    // equal nor a newer installed client should try to download the artifact.
+    std::fs::remove_file(releases.join(target).join("latest.signed.json"))?;
+    std::fs::remove_file(releases.join(target).join(manifest.artifact))?;
+    let state = server::open_with_releases(temp.path().join("data"), Some(releases))?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let server_url = format!("http://{}", listener.local_addr()?);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, server::router(state)).await.unwrap();
+    });
+    let installed = temp.path().join("mysync");
+    for version in ["0.3.6", env!("CARGO_PKG_VERSION")] {
+        executable(&installed, version)?;
+        let previous = std::fs::read(&installed)?;
+        assert_eq!(
+            update::check_and_install_at(&server_url, &public_key, &installed, version).await?,
+            UpdateOutcome::Current {
+                installed_version: version.into(),
+                published_version: "0.3.6".into(),
+            }
+        );
+        assert_eq!(std::fs::read(&installed)?, previous);
+    }
+    // Exercise the real CLI in its supported installation location, using an
+    // isolated HOME and profile. It must distinguish source/server deployment
+    // from the signed release currently offered to this client.
+    let home = temp.path().join("home");
+    let bin_dir = home.join(".local/bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o700))?;
+    let cli = bin_dir.join("mysync");
+    std::fs::copy(env!("CARGO_BIN_EXE_mysync"), &cli)?;
+    let config = ClientConfig {
+        server: server_url,
+        server_public_key: String::new(),
+        identity: None,
+        root: temp.path().into(),
+        auto_update: true,
+        web_status_enabled: false,
+        update_public_key: public_key,
+    };
+    let config_path = temp.path().join("config.json");
+    let config_bytes = serde_json::to_vec(&config)?;
+    std::fs::write(&config_path, &config_bytes)?;
+    let output = tokio::process::Command::new(&cli)
+        .env("HOME", &home)
+        .args(["--config", config_path.to_str().unwrap(), "update"])
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = String::from_utf8(output.stdout)?;
+    assert!(message.contains(&format!("installed client: {}", env!("CARGO_PKG_VERSION"))));
+    assert!(message.contains("latest signed release: 0.3.6; no update installed"));
+    assert_eq!(std::fs::read(config_path)?, config_bytes);
     task.abort();
     Ok(())
 }
@@ -494,6 +607,7 @@ async fn update_rejects_unsigned_metadata() -> Result<()> {
         identity: None,
         root: temp.path().to_path_buf(),
         auto_update: true,
+        web_status_enabled: false,
         update_public_key: public_key,
     };
     assert!(

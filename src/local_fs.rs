@@ -12,6 +12,68 @@ use uuid::Uuid;
 
 use crate::model::valid_path;
 
+/// One reusable inotify instance per mirror: closing an instance may wait for
+/// a kernel grace period, so creating/destroying one for every file is costly.
+#[derive(Default)]
+struct ChangeWatcher(std::sync::Mutex<Option<std::os::fd::OwnedFd>>);
+
+pub(crate) struct ChangeWatch<'a> {
+    watcher: std::sync::MutexGuard<'a, Option<std::os::fd::OwnedFd>>,
+    id: i32,
+}
+
+impl ChangeWatcher {
+    fn watch(&self, file: &File) -> std::io::Result<ChangeWatch<'_>> {
+        use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+        use std::os::fd::AsRawFd;
+        let mut watcher = self.0.lock().unwrap();
+        if watcher.is_none() {
+            *watcher = Some(inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC)?);
+        }
+        // This kernel-owned name resolves the already-open inode, even after
+        // a rename. Never re-resolve a user-supplied mirror pathname here.
+        let id = inotify::add_watch(
+            watcher.as_ref().unwrap(),
+            format!("/proc/self/fd/{}", file.as_raw_fd()),
+            WatchFlags::MODIFY
+                | WatchFlags::ATTRIB
+                | WatchFlags::CLOSE_WRITE
+                | WatchFlags::MOVE_SELF
+                | WatchFlags::DELETE_SELF,
+        )?;
+        Ok(ChangeWatch { watcher, id })
+    }
+}
+
+impl ChangeWatch<'_> {
+    pub fn unchanged(&self) -> bool {
+        use rustix::fs::inotify::{ReadFlags, Reader};
+        let mut buffer = [std::mem::MaybeUninit::uninit(); 512];
+        let mut events = Reader::new(self.watcher.as_ref().unwrap(), &mut buffer);
+        loop {
+            match events.next() {
+                Err(Errno::INTR) => continue,
+                Err(Errno::AGAIN) => return true,
+                Ok(event)
+                    if event.wd() != self.id
+                        && !event.events().contains(ReadFlags::QUEUE_OVERFLOW) =>
+                {
+                    continue;
+                }
+                // A current event, overflow, invalidation or error means the
+                // recovery copy must be kept. Ignore old watches' IGNORED events.
+                _ => return false,
+            }
+        }
+    }
+}
+
+impl Drop for ChangeWatch<'_> {
+    fn drop(&mut self) {
+        let _ = fs::inotify::remove_watch(self.watcher.as_ref().unwrap(), self.id);
+    }
+}
+
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -47,6 +109,7 @@ impl Directory {
 #[derive(Clone)]
 pub(crate) struct Mirror {
     root: Directory,
+    changes: Arc<ChangeWatcher>,
 }
 
 pub(crate) struct LocalEntry {
@@ -154,7 +217,12 @@ impl Mirror {
             .context("opening the sync root without symlinks")?;
         Ok(Self {
             root: Directory(Arc::new(File::from(fd))),
+            changes: Arc::new(ChangeWatcher::default()),
         })
+    }
+
+    pub fn watch_changes(&self, file: &File) -> std::io::Result<ChangeWatch<'_>> {
+        self.changes.watch(file)
     }
 
     pub fn entry(&self, path: &str, create_parents: bool) -> Result<Option<LocalEntry>> {
@@ -327,6 +395,33 @@ impl Mirror {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn change_watch_follows_the_open_inode_after_a_path_is_replaced() -> Result<()> {
+        use std::os::unix::fs::{FileExt, symlink};
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("file");
+        let outside = temp.path().join("other");
+        std::fs::write(&path, b"original")?;
+        std::fs::write(&outside, b"other")?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        std::fs::rename(&path, temp.path().join("captured"))?;
+        symlink(&outside, &path)?;
+        let changes = ChangeWatcher::default();
+        let watch = changes.watch(&file)?;
+        std::fs::write(&outside, b"unrelated edit")?;
+        assert!(watch.unchanged());
+        file.write_all_at(b"late edit", 0)?;
+        assert!(!watch.unchanged());
+        drop(watch);
+        // Reusing the instance must ignore the previous watch's removal event.
+        let next = changes.watch(&file)?;
+        assert!(next.unchanged());
+        Ok(())
+    }
 
     #[test]
     fn scan_reports_one_bad_entry_and_keeps_scanning() -> Result<()> {

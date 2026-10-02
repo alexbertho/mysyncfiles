@@ -2,15 +2,19 @@
 use super::ClientConfig;
 use crate::auth_protocol::validate_server_url;
 use crate::model::{
-    BeginUpload, Entry, Manifest, ManifestPage, RestoreRequest, TrashItem, UPLOAD_CHUNK_BYTES,
-    UploadProgress, valid_path,
+    BeginUpload, Entry, Manifest, ManifestPage, ManifestSummary, RestoreRequest, TrashItem,
+    UPLOAD_CHUNK_BYTES, UploadProgress, valid_path,
 };
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use openssl::sha::Sha256;
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
-use sha2::{Digest, Sha256};
-use std::{io::SeekFrom, time::Duration};
+use std::{
+    io::SeekFrom,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 pub struct Api {
@@ -19,11 +23,13 @@ pub struct Api {
     signer: crate::tpm::RequestSigner,
     session: tokio::sync::Mutex<Option<crate::auth_protocol::Session>>,
     origin_key: ed25519_dalek::VerifyingKey,
+    communication: Arc<Mutex<(crate::web_status_protocol::CommunicationState, Option<i64>)>>,
 }
 
 struct AuthenticatedResponse {
     response: reqwest::Response,
     proof: crate::origin_auth::ResponseProof,
+    communication: Arc<Mutex<(crate::web_status_protocol::CommunicationState, Option<i64>)>>,
 }
 
 impl AuthenticatedResponse {
@@ -55,7 +61,12 @@ async fn authenticated_json<T: DeserializeOwned>(
         .proof
         .body_sha256
         .context("unsigned JSON body from origin")?;
-    json_body(response.response, limit, Some(&digest)).await
+    let result = json_body(response.response, limit, Some(&digest)).await;
+    if result.is_err() {
+        response.communication.lock().unwrap().0 =
+            crate::web_status_protocol::CommunicationState::Failed;
+    }
+    result
 }
 
 async fn json_body<T: DeserializeOwned>(
@@ -113,6 +124,10 @@ impl Api {
                 config.identity.clone().context("TPM identity is missing")?,
             )?,
             session: tokio::sync::Mutex::new(None),
+            communication: Arc::new(Mutex::new((
+                crate::web_status_protocol::CommunicationState::Unknown,
+                None,
+            ))),
         })
     }
 
@@ -144,6 +159,26 @@ impl Api {
     }
 
     async fn execute_signed(&self, request: reqwest::Request) -> Result<AuthenticatedResponse> {
+        let result = self.execute_signed_inner(request).await;
+        let mut communication = self.communication.lock().unwrap();
+        match &result {
+            Ok(response) => {
+                communication.0 = if response.status().is_success() {
+                    crate::web_status_protocol::CommunicationState::Authenticated
+                } else {
+                    crate::web_status_protocol::CommunicationState::Failed
+                };
+                communication.1 = Some(crate::auth_protocol::now());
+            }
+            Err(_) => communication.0 = crate::web_status_protocol::CommunicationState::Failed,
+        }
+        result
+    }
+
+    async fn execute_signed_inner(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<AuthenticatedResponse> {
         let request_proof = request
             .headers()
             .get(crate::auth_protocol::PROOF_HEADER)
@@ -162,7 +197,72 @@ impl Api {
             &request_proof,
             response.status().as_u16(),
         )?;
-        Ok(AuthenticatedResponse { response, proof })
+        Ok(AuthenticatedResponse {
+            response,
+            proof,
+            communication: self.communication.clone(),
+        })
+    }
+
+    pub(super) fn web_origin(&self) -> Result<String> {
+        crate::web_status_protocol::origin(&self.base)
+    }
+
+    pub(super) fn verify_status_ticket(
+        &self,
+        ticket: &str,
+    ) -> Result<crate::web_status_protocol::Challenge> {
+        crate::web_status_protocol::Challenge::verify(
+            ticket,
+            &self.origin_key,
+            &self.web_origin()?,
+            crate::auth_protocol::now(),
+        )
+    }
+
+    pub(super) fn communication(
+        &self,
+    ) -> (crate::web_status_protocol::CommunicationState, Option<i64>) {
+        *self.communication.lock().unwrap()
+    }
+
+    /// Fixed destination and typed payload; never exposes a generic signing API.
+    pub async fn submit_presence(
+        &self,
+        proof: &crate::web_status_protocol::PresenceProof,
+    ) -> Result<crate::web_status_protocol::ProofAccepted> {
+        let claims = self.verify_status_ticket(&proof.ticket)?;
+        anyhow::ensure!(claims.origin == proof.observed_origin, "wrong_origin");
+        let bytes = serde_json::to_vec(proof)?;
+        anyhow::ensure!(
+            bytes.len() <= crate::web_status_protocol::MAX_JSON_BYTES,
+            "proof_too_large"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let response = self
+                .send(
+                    self.http
+                        .post(self.url(crate::web_status_protocol::PROOFS_PATH))
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(bytes),
+                )
+                .await?;
+            let accepted: crate::web_status_protocol::ProofAccepted =
+                authenticated_json(response, crate::web_status_protocol::MAX_JSON_BYTES).await?;
+            anyhow::ensure!(
+                accepted.challenge_id == claims.challenge_id,
+                "challenge_mismatch"
+            );
+            Ok(accepted)
+        })
+        .await
+        .context("presence_timeout")
+        .and_then(|result| result);
+        if result.is_err() {
+            self.communication.lock().unwrap().0 =
+                crate::web_status_protocol::CommunicationState::Failed;
+        }
+        result
     }
 
     pub async fn authenticate(&self) -> Result<()> {
@@ -227,6 +327,35 @@ impl Api {
         if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
             return authenticated_json(response, LIST_JSON_LIMIT).await;
         }
+        self.manifest_pages().await
+    }
+
+    pub async fn manifest_summary(&self) -> Result<ManifestSummary> {
+        // An optional query keeps the signed response path compatible with old
+        // servers: they ignore it and return the full manifest (or a 413).
+        let response = self
+            .send(
+                self.http
+                    .get(self.url("/v1/manifest"))
+                    .query(&[("summary", true)]),
+            )
+            .await?;
+        if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            return Ok(self.manifest_pages().await?.into());
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Reply {
+            Full(Manifest),
+            Summary(ManifestSummary),
+        }
+        Ok(match authenticated_json(response, LIST_JSON_LIMIT).await? {
+            Reply::Full(manifest) => manifest.into(),
+            Reply::Summary(summary) => summary,
+        })
+    }
+
+    async fn manifest_pages(&self) -> Result<Manifest> {
         let mut entries = Vec::new();
         let mut after: Option<String> = None;
         let mut generation = None;
@@ -272,7 +401,10 @@ impl Api {
                     {
                         bail!("server returned a non-advancing manifest cursor");
                     }
-                    after = Some(next);
+                    // Legacy servers advertise the first OMITTED path in next,
+                    // but their SQL cursor is exclusive. Resume at the last
+                    // returned path so no file is skipped, on either version.
+                    after = previous_path;
                 }
                 None => break,
             }
@@ -296,7 +428,8 @@ impl Api {
                 .upload_chunked(path, base, local, size, expected_sha)
                 .await;
         }
-        let mut bytes = Vec::new();
+        // Leave room for EOF without growing the allocation of a stable file.
+        let mut bytes = Vec::with_capacity(size as usize + 1);
         tokio::fs::File::from_std(local)
             .take(UPLOAD_CHUNK_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
@@ -343,15 +476,16 @@ impl Api {
         if progress.offset < 0 || progress.offset > size {
             bail!("server returned an invalid upload offset");
         }
+        let mut file = tokio::fs::File::from_std(local);
+        file.seek(SeekFrom::Start(progress.offset as u64)).await?;
         while progress.offset < size {
             let length = (size - progress.offset).min(UPLOAD_CHUNK_BYTES) as u64;
-            let mut file = tokio::fs::File::from_std(local.try_clone()?);
-            file.seek(SeekFrom::Start(progress.offset as u64)).await?;
-            let mut bytes = Vec::new();
-            file.take(length).read_to_end(&mut bytes).await?;
-            if bytes.len() != length as usize {
-                bail!("local file changed during upload");
-            }
+            // The length is bounded by our protocol constant, not chosen by
+            // the server. Avoid repeated Vec growth/copies and fd duplication.
+            let mut bytes = vec![0; length as usize];
+            file.read_exact(&mut bytes)
+                .await
+                .context("local file changed during upload")?;
             let response = self
                 .send(
                     self.http
@@ -438,7 +572,7 @@ impl Api {
             file.write_all(&chunk).await?;
         }
         file.sync_all().await?;
-        if Some(hex::encode(hash.finalize())) != entry.sha256 || size != expected_size {
+        if Some(hex::encode(hash.finish())) != entry.sha256 || size != expected_size {
             bail!("download integrity check failed for {}", entry.path);
         }
         Ok(true)

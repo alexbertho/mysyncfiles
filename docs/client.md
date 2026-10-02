@@ -14,6 +14,8 @@ Les opérations sur le miroir refusent les liens symboliques et restent confiné
 
 ## Commandes utiles
 
+La page `/status` du serveur permet aussi une [vérification de présence locale](web-status.md), activée par défaut depuis la version 0.3.8 et désactivable à l’installation ou en commande. Elle affiche un statut léger, sans compte ni lecture de fichiers.
+
 | Commande | Effet |
 | --- | --- |
 | `mysync status` | Affiche les comptes locaux/distants et les conflits. |
@@ -21,9 +23,13 @@ Les opérations sur le miroir refusent les liens symboliques et restent confiné
 | `mysync trash` | Liste les suppressions restaurables du serveur. |
 | `mysync restore ID` | Restaure un élément de la corbeille et synchronise. |
 | `mysync update` | Cherche et installe une version cliente signée plus récente. |
+| `mysync web-status status` | Affiche le réglage local de présence navigateur. |
+| `mysync web-status enable` / `disable` | Active ou désactive ce réglage ; relancer le daemon pour l’appliquer. |
 
 La configuration et l'état du client résident hors du miroir, dans le répertoire de configuration utilisateur. Une clé TPM copiée sur un autre appareil ne permet pas d'utiliser l'identité. Voir la [configuration](configuration.md) et les [limites de cette garantie](device-auth.md#garanties-et-limites).
 
 ## Service et mises à jour
 
 Après [l'activation de l'appairage](install-client.md#activer-la-synchronisation-manuelle), `systemctl --user` pilote le service. Le démon contrôle les mises à jour au démarrage puis toutes les six heures ; une erreur de mise à jour ne bloque pas la synchronisation. Le manifeste signé, la cible, la taille et le SHA-256 sont contrôlés avant le remplacement atomique de `~/.local/bin/mysync`. La publication et l'installation locale sont verrouillées pour éviter une rétrogradation concurrente. Une installation sous `/usr/bin` n'est pas remplacée automatiquement.
+
+`mysync update` installe uniquement une release signée dont la version est supérieure à celle du client. En l'absence de mise à jour, il affiche les deux versions comparées. Redéployer le serveur ne publie pas de nouveau client : cette publication doit être faite par l'administrateur. Après une mise à jour manuelle, relancer le daemon ou le service utilisateur déjà actif pour charger le nouveau binaire. Le profil et l'identité TPM sont conservés ; les options désactivées, comme `web_status_enabled`, restent désactivées.

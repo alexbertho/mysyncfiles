@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc, time::Duration};
 
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+// Absorb short bursts without increasing the eight-body memory bound. Slow
+// clients still receive 429, and waiting never occupies a blocking worker.
+const SIGNED_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
 
 async fn read_signed_body(body: Body) -> Result<axum::body::Bytes, ApiError> {
     read_body(body, crate::model::UPLOAD_CHUNK_BYTES as usize).await
@@ -67,22 +70,37 @@ fn check_active_session(
     is_session: bool,
 ) -> Result<(), ApiError> {
     let active: bool = db
-        .query_row(
+        .prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM devices d JOIN device_enrollments e ON e.device_id=d.id
         WHERE e.id=?1 AND e.approved_at IS NOT NULL AND d.revoked_at IS NULL)",
-            [enrollment],
-            |r| r.get(0),
         )
+        .map_err(auth_error)?
+        .query_row([enrollment], |r| r.get(0))
         .map_err(auth_error)?;
     if !active {
         return Err(auth_error("device revoked"));
     }
     if !is_session {
-        let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM device_sessions WHERE token_hash=?1 AND enrollment_id=?2 AND expires_at>?3)",
+        let valid: bool = db.prepare_cached("SELECT EXISTS(SELECT 1 FROM device_sessions WHERE token_hash=?1 AND enrollment_id=?2 AND expires_at>?3)").map_err(auth_error)?.query_row(
             params![hash(token), enrollment, now()], |r| r.get(0)).map_err(auth_error)?;
         if !valid {
             return Err(auth_error("expired or mismatched session"));
         }
+    }
+    Ok(())
+}
+
+fn record_proof_nonce(tx: &rusqlite::Transaction<'_>, proof: &Proof) -> Result<(), ApiError> {
+    tx.execute("DELETE FROM proof_nonces WHERE expires_at<=?1", [now()])
+        .map_err(ApiError::internal)?;
+    let inserted = tx
+        .execute(
+            "INSERT OR IGNORE INTO proof_nonces VALUES(?1,?2,?3)",
+            params![proof.claims.device, proof.claims.nonce, now() + 120],
+        )
+        .map_err(ApiError::internal)?;
+    if inserted != 1 {
+        return Err(auth_error("replayed proof"));
     }
     Ok(())
 }
@@ -96,14 +114,15 @@ pub fn initialize(db: &Connection) -> Result<()> {
           verified_at INTEGER,approved_at INTEGER);
         CREATE TABLE IF NOT EXISTS device_sessions(token_hash TEXT PRIMARY KEY,enrollment_id TEXT NOT NULL REFERENCES device_enrollments(id),expires_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS proof_nonces(enrollment_id TEXT NOT NULL,nonce TEXT NOT NULL,expires_at INTEGER NOT NULL,
-          PRIMARY KEY(enrollment_id,nonce));")?;
+          PRIMARY KEY(enrollment_id,nonce));
+        CREATE INDEX IF NOT EXISTS proof_nonces_expiry ON proof_nonces(expires_at);
+        CREATE INDEX IF NOT EXISTS device_sessions_expiry ON device_sessions(expires_at);")?;
     Ok(())
 }
 fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
     Ok(db
-        .query_row("SELECT value FROM auth_settings WHERE key=?1", [key], |r| {
-            r.get(0)
-        })
+        .prepare_cached("SELECT value FROM auth_settings WHERE key=?1")?
+        .query_row([key], |r| r.get(0))
         .optional()?)
 }
 
@@ -519,102 +538,124 @@ pub async fn enroll_finish(
 
 pub async fn middleware(
     State(state): State<Arc<ServerState>>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let is_session = request.uri().path() == "/v1/auth/session";
-    // Retain the permit until the handler releases the buffered request too.
-    let body_permit;
     let authorization = request
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
+        .unwrap_or("");
+    let token = if is_session {
+        if !authorization.is_empty() {
+            return Err(auth_error("unexpected session credential"));
+        }
+        String::new()
+    } else {
+        authorization
+            .strip_prefix("MySync ")
+            .ok_or_else(|| auth_error("missing bound session"))?
+            .to_owned()
+    };
+    let proof = request
+        .headers()
+        .get(PROOF_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| auth_error("missing proof"))?;
+    let proof = Proof::decode(proof).map_err(auth_error)?;
+    let method = request.method().as_str().to_owned();
+    let target = request
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
         .to_owned();
-    {
-        let proof = request
-            .headers()
-            .get(PROOF_HEADER)
-            .and_then(|h| h.to_str().ok())
-            .ok_or_else(|| auth_error("missing proof"))?;
-        let proof = Proof::decode(proof).map_err(auth_error)?;
+    let header_token = token.clone();
+    let (proof, device, body_permit) = state.blocking(move |state| {
         let (public, origin, device) = {
             let db = state.db.lock().unwrap();
-            let row:Option<(String,i64)>=db.query_row("SELECT e.public,d.id FROM device_enrollments e JOIN devices d ON d.id=e.device_id
-                WHERE e.id=?1 AND e.approved_at IS NOT NULL AND d.revoked_at IS NULL",[&proof.claims.device],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(auth_error)?;
-            let (public, device) = row.ok_or_else(|| {
-                ApiError(
-                    StatusCode::FORBIDDEN,
-                    "device not approved or revoked".into(),
-                )
-            })?;
-            (
-                public,
-                setting(&db, "public_url")
-                    .map_err(auth_error)?
-                    .ok_or_else(|| auth_error("public URL missing"))?,
-                device,
-            )
+            let row: Option<(String, i64)> = db.query_row("SELECT e.public,d.id FROM device_enrollments e JOIN devices d ON d.id=e.device_id
+                WHERE e.id=?1 AND e.approved_at IS NOT NULL AND d.revoked_at IS NULL", [&proof.claims.device],
+                |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(auth_error)?;
+            let (public, device) = row.ok_or_else(|| ApiError(
+                StatusCode::FORBIDDEN, "device not approved or revoked".into()))?;
+            (public, setting(&db, "public_url").map_err(auth_error)?
+                .ok_or_else(|| auth_error("public URL missing"))?, device)
         };
-        let token = if is_session {
-            if !authorization.is_empty() {
-                return Err(auth_error("unexpected session credential"));
-            }
-            ""
-        } else {
-            authorization
-                .strip_prefix("MySync ")
-                .ok_or_else(|| auth_error("missing bound session"))?
-        };
-        let url = format!(
-            "{origin}{}",
-            request
-                .uri()
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/")
-        );
-        let (parts, body) = request.into_parts();
-        proof
-            .verify_headers(&public, parts.method.as_str(), &url, token)
+        proof.verify_headers(&public, &method, &format!("{origin}{target}"), &header_token)
             .map_err(auth_error)?;
-        {
+        let body_permit = {
             let mut db = state.db.lock().unwrap();
             let tx = db.transaction().map_err(ApiError::internal)?;
-            check_active_session(&tx, &proof.claims.device, token, is_session)?;
-            body_permit = state.signed_request_limit.try_acquire().map_err(|_| {
+            check_active_session(&tx, &proof.claims.device, &header_token, is_session)?;
+            if let Ok(permit) = state.signed_request_limit.clone().try_acquire_owned() {
+                record_proof_nonce(&tx, &proof)?;
+                tx.commit().map_err(ApiError::internal)?;
+                Some(Arc::new(permit))
+            } else {
+                None
+            }
+        };
+        Ok((proof, device, body_permit))
+    }).await?;
+    let (proof, body_permit) = if let Some(permit) = body_permit {
+        (proof, permit)
+    } else {
+        // Header authentication has succeeded, but the body is still unread.
+        // Release the DB and worker while waiting for existing handlers to finish.
+        let permit = Arc::new(
+            tokio::time::timeout(
+                SIGNED_ADMISSION_TIMEOUT,
+                state.signed_request_limit.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| {
                 ApiError(
                     StatusCode::TOO_MANY_REQUESTS,
                     "too many signed requests in flight".into(),
                 )
-            })?;
-            tx.execute("DELETE FROM proof_nonces WHERE expires_at<=?1", [now()])
-                .map_err(ApiError::internal)?;
-            let inserted = tx
-                .execute(
-                    "INSERT OR IGNORE INTO proof_nonces VALUES(?1,?2,?3)",
-                    params![proof.claims.device, proof.claims.nonce, now() + 120],
-                )
-                .map_err(ApiError::internal)?;
-            if inserted != 1 {
-                return Err(auth_error("replayed proof"));
-            }
-            tx.commit().map_err(ApiError::internal)?;
-        }
-        // The nonce is consumed even on a failed/cancelled body read. A retry
-        // must sign a fresh proof, so concurrent replays cannot reserve memory.
-        let bytes = read_signed_body(body).await?;
-        proof.verify_body(&bytes).map_err(auth_error)?;
-        check_active_session(
-            &state.db.lock().unwrap(),
-            &proof.claims.device,
-            token,
-            is_session,
-        )?;
-        request = Request::from_parts(parts, Body::from(bytes));
-        request.extensions_mut().insert(device);
-        request.extensions_mut().insert(proof.claims.device);
-    }
+            })?
+            .map_err(ApiError::internal)?,
+        );
+        let retained = permit.clone();
+        let nonce_token = token.clone();
+        let proof = state
+            .blocking(move |state| {
+                let _permit = retained;
+                let mut db = state.db.lock().unwrap();
+                let tx = db.transaction().map_err(ApiError::internal)?;
+                // Approval, revocation and expiry may have changed while waiting.
+                check_active_session(&tx, &proof.claims.device, &nonce_token, is_session)?;
+                record_proof_nonce(&tx, &proof)?;
+                tx.commit().map_err(ApiError::internal)?;
+                Ok(proof)
+            })
+            .await?;
+        (proof, permit)
+    };
+    // The nonce is durably consumed even on a failed/cancelled body read.
+    // Check revocation again AFTER receiving and verifying the bounded body.
+    let (parts, body) = request.into_parts();
+    let bytes = read_signed_body(body).await?;
+    // Retain admission in the worker if the requesting task is cancelled.
+    let permit = body_permit.clone();
+    let (enrollment, bytes) = state
+        .blocking(move |state| {
+            let _permit = permit;
+            proof.verify_body(&bytes).map_err(auth_error)?;
+            check_active_session(
+                &state.db.lock().unwrap(),
+                &proof.claims.device,
+                &token,
+                is_session,
+            )?;
+            Ok((proof.claims.device, bytes))
+        })
+        .await?;
+    let mut request = Request::from_parts(parts, Body::from(bytes));
+    request.extensions_mut().insert(device);
+    request.extensions_mut().insert(enrollment);
     let response = next.run(request).await;
     drop(body_permit);
     Ok(response)
@@ -623,25 +664,59 @@ pub async fn session(
     State(state): State<Arc<ServerState>>,
     axum::Extension(id): axum::Extension<String>,
 ) -> Result<Json<Session>, ApiError> {
-    let token = random_secret().map_err(ApiError::internal)?;
-    let expires = now() + SESSION_SECONDS;
-    let db = state.db.lock().unwrap();
-    db.execute("DELETE FROM device_sessions WHERE expires_at<=?1", [now()])
-        .map_err(ApiError::internal)?;
-    db.execute(
-        "INSERT INTO device_sessions VALUES(?1,?2,?3)",
-        params![hash(&token), id, expires],
-    )
-    .map_err(ApiError::internal)?;
-    Ok(Json(Session {
-        token,
-        expires_at: expires,
-    }))
+    state
+        .blocking(move |state| {
+            let token = random_secret().map_err(ApiError::internal)?;
+            let expires = now() + SESSION_SECONDS;
+            let db = state.db.lock().unwrap();
+            db.execute("DELETE FROM device_sessions WHERE expires_at<=?1", [now()])
+                .map_err(ApiError::internal)?;
+            db.execute(
+                "INSERT INTO device_sessions VALUES(?1,?2,?3)",
+                params![hash(&token), id, expires],
+            )
+            .map_err(ApiError::internal)?;
+            Ok(Json(Session {
+                token,
+                expires_at: expires,
+            }))
+        })
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_nonce_table_gains_expiry_index_without_losing_replay_records() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE proof_nonces(enrollment_id TEXT NOT NULL, nonce TEXT NOT NULL,
+            expires_at INTEGER NOT NULL, PRIMARY KEY(enrollment_id, nonce));
+            INSERT INTO proof_nonces VALUES('device','expired',100),('device','active',101);",
+        )?;
+        initialize(&db)?;
+        initialize(&db)?;
+        let plan: String = db.query_row(
+            "EXPLAIN QUERY PLAN DELETE FROM proof_nonces WHERE expires_at<=?1",
+            [100],
+            |row| row.get(3),
+        )?;
+        assert!(plan.contains("proof_nonces_expiry"), "{plan}");
+        assert_eq!(
+            db.execute("DELETE FROM proof_nonces WHERE expires_at<=?1", [100])?,
+            1
+        );
+        assert_eq!(
+            db.execute(
+                "INSERT OR IGNORE INTO proof_nonces VALUES('device','active',200)",
+                []
+            )?,
+            0
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn enrollment_admission_precedes_body_reads_and_releases_on_timeout() -> Result<()> {

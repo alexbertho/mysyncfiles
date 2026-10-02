@@ -1,6 +1,6 @@
 [package]
 name = "mysyncfiles"
-version = "0.3.6"
+version = "0.3.9"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-only"
@@ -28,6 +28,8 @@ futures-util = "0.3"
 fs2 = "0.4"
 getrandom = "0.4"
 hex = "0.4"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 notify = "8"
 openssl = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -38,6 +40,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
 sha2 = "0.10"
+socket2 = "0.6"
 tokio = {
     version = "1",
     features = [
@@ -66,3 +69,7 @@ tokio = { version = "1", features = ["test-util"] }
 strip = "symbols"
 lto = "thin"
 codegen-units = 1
+
+[[bench]]
+name = "performance"
+harness = false
