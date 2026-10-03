@@ -87,11 +87,13 @@ impl LocalBridge {
         let origin = api.web_origin()?;
         // Bind both before spawning anything: a collision disables the entire
         // bridge. Never fall back to an arbitrary port or a non-loopback address.
-        let v4 = bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
-            .context("cannot bind IPv4 loopback")?;
+        let ipv4_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let v4 = bind(ipv4_address)
+            .with_context(|| format!("cannot bind IPv4 loopback {ipv4_address}"))?;
         let port = v4.local_addr()?.port();
-        let v6 = optional_ipv6(bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)))
-            .context("cannot bind IPv6 loopback")?;
+        let ipv6_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
+        let v6 = optional_ipv6(bind(ipv6_address))
+            .with_context(|| format!("cannot bind IPv6 loopback {ipv6_address}"))?;
         let state = Arc::new(BridgeState {
             api,
             origin,
@@ -287,8 +289,18 @@ async fn handle_allowed(state: &BridgeState, request: Request<Body>) -> Response
         }
         attempts.push_back(Instant::now());
     }
-    let Ok(claims) = state.api.verify_status_ticket(&ticket) else {
-        return failure(StatusCode::FORBIDDEN, "invalid_challenge");
+    let claims = match state.api.verify_status_ticket(&ticket) {
+        Ok(claims) => claims,
+        Err(error) => {
+            return failure(
+                StatusCode::FORBIDDEN,
+                if error.to_string() == "files_read_disabled" {
+                    "files_read_disabled"
+                } else {
+                    "invalid_challenge"
+                },
+            );
+        }
     };
     if claims.origin != state.origin {
         return failure(StatusCode::FORBIDDEN, "origin_refused");
@@ -540,9 +552,18 @@ mod tests {
         if let Some(ref listener) = v6 {
             assert!(listener.local_addr()?.ip().is_loopback());
         }
-        assert!(
-            LocalBridge::start_on_port(state.api.clone(), state.activity.clone(), address.port())
-                .is_err()
+        let error = match LocalBridge::start_on_port(
+            state.api.clone(),
+            state.activity.clone(),
+            address.port(),
+        ) {
+            Ok(_) => anyhow::bail!("the bridge must refuse an occupied port"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(&address.to_string()));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AddrInUse
         );
         let bridge = LocalBridge {
             task: tokio::spawn(serve(v4, v6, state.clone())),

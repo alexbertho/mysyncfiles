@@ -40,12 +40,19 @@ pub struct ClientConfig {
     /// Loopback-only browser presence, enabled unless explicitly disabled.
     #[serde(default = "default_web_status_enabled")]
     pub web_status_enabled: bool,
+    /// Separate, explicit consent to open read-only browser file sessions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web_files_enabled: bool,
     #[serde(default = "default_update_public_key")]
     pub update_public_key: String,
 }
 
 fn default_auto_update() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 fn default_web_status_enabled() -> bool {
@@ -184,6 +191,15 @@ pub fn set_web_status(config_path: &Path, enabled: bool) -> Result<()> {
         .context("client profile is busy; stop the daemon or retry after synchronization")?;
     let mut config = load_config(config_path)?;
     config.web_status_enabled = enabled;
+    private_write_json(config_path, &config)
+}
+
+pub fn set_web_files(config_path: &Path, enabled: bool) -> Result<()> {
+    let lock = open_profile_lock(config_path)?;
+    FileExt::try_lock_exclusive(&lock)
+        .context("client profile is busy; stop the daemon or retry after synchronization")?;
+    let mut config = load_config(config_path)?;
+    config.web_files_enabled = enabled;
     private_write_json(config_path, &config)
 }
 
@@ -787,7 +803,7 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
         match local_api::LocalBridge::start(api.clone(), activity.clone()) {
             Ok(bridge) => Some(bridge),
             Err(error) => {
-                eprintln!("web status bridge disabled: {error}; synchronization continues");
+                eprintln!("web status bridge disabled: {error:#}; synchronization continues");
                 None
             }
         }

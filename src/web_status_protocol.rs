@@ -11,6 +11,7 @@ pub const MAX_JSON_BYTES: usize = 4096;
 pub const CHALLENGE_SECONDS: i64 = 60;
 pub const SESSION_SECONDS: i64 = 300;
 pub const PRESENCE_SECONDS: i64 = 120;
+pub const FILES_SESSION_SECONDS: i64 = 30 * 60;
 pub const PROOFS_PATH: &str = "/v1/web/status/proofs";
 pub const BRIDGE_HEADER: &str = "x-mysync-bridge";
 pub const CHALLENGE_HEADER: &str = "x-mysync-challenge";
@@ -65,7 +66,7 @@ impl Challenge {
         key.verify_strict(&[DOMAIN, &bytes].concat(), &signature)?;
         let claims: Self = serde_json::from_slice(&bytes)?;
         ensure!(
-            claims.version == 1 && claims.scope == "status.read",
+            claims.version == 1 && matches!(claims.scope.as_str(), "status.read" | "files.read"),
             "invalid_scope"
         );
         ensure!(

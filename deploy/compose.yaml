@@ -17,6 +17,12 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
     volumes:
       - type: bind
+        source: ../web
+        target: /web
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ${MYSYNC_DATA_DIR:?Set MYSYNC_DATA_DIR in deploy/.env}
         target: /data
       - type: bind

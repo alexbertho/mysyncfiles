@@ -21,6 +21,8 @@ jobs:
           node "$RUNNER_TEMP/mysync-browser/node_modules/playwright/cli.js" install --with-deps chromium firefox
       - name: Status page and loopback transport
         run: NODE_PATH="$RUNNER_TEMP/mysync-browser/node_modules" node tests/web_status_browser.cjs
+      - name: Atlas file explorer
+        run: NODE_PATH="$RUNNER_TEMP/mysync-browser/node_modules" node tests/web_files_browser.cjs
   linux:
     runs-on: ubuntu-24.04
     steps:
@@ -50,6 +52,8 @@ jobs:
               --mount type=bind,src="$tpm_test_binary",dst=/test-tpm,readonly mysync-tpm-runtime
             docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true \
               --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
+              --workdir / \
+              --mount type=bind,src="$PWD/web",dst=/web,readonly \
               --mount type=bind,src="$status_test_binary",dst=/test-tpm,readonly mysync-tpm-runtime
           done
       - name: Smoke-test client on Arch Linux

@@ -23,6 +23,7 @@ pub struct Api {
     signer: crate::tpm::RequestSigner,
     session: tokio::sync::Mutex<Option<crate::auth_protocol::Session>>,
     origin_key: ed25519_dalek::VerifyingKey,
+    web_files_enabled: bool,
     communication: Arc<Mutex<(crate::web_status_protocol::CommunicationState, Option<i64>)>>,
 }
 
@@ -118,6 +119,7 @@ impl Api {
             .build()?;
         Ok(Self {
             origin_key,
+            web_files_enabled: config.web_files_enabled,
             http,
             base: config.server.trim_end_matches('/').to_owned(),
             signer: crate::tpm::RequestSigner::new(
@@ -212,12 +214,17 @@ impl Api {
         &self,
         ticket: &str,
     ) -> Result<crate::web_status_protocol::Challenge> {
-        crate::web_status_protocol::Challenge::verify(
+        let claims = crate::web_status_protocol::Challenge::verify(
             ticket,
             &self.origin_key,
             &self.web_origin()?,
             crate::auth_protocol::now(),
-        )
+        )?;
+        anyhow::ensure!(
+            claims.scope != "files.read" || self.web_files_enabled,
+            "files_read_disabled"
+        );
+        Ok(claims)
     }
 
     pub(super) fn communication(

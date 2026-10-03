@@ -100,3 +100,30 @@ fn web_status_changes_fail_promptly_when_the_profile_is_busy() -> Result<()> {
     assert_eq!(fs::read(&config)?, original);
     Ok(())
 }
+
+#[test]
+fn file_read_consent_is_separate_and_disabled_for_existing_profiles() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = temp.path().join("client.json");
+    let original = serde_json::json!({"server":"https://sync.example.test", "root":temp.path(), "web_status_enabled":true});
+    fs::write(&config, serde_json::to_vec(&original)?)?;
+    assert!(!client::load_config(&config)?.web_files_enabled);
+    assert_eq!(
+        cli(&config, &["web-files", "status"])?.stdout,
+        b"web_files_enabled=false\n"
+    );
+    for (action, enabled) in [("enable", true), ("disable", false)] {
+        let output = cli(&config, &["web-files", action])?;
+        assert!(output.status.success());
+        let saved = client::load_config(&config)?;
+        assert_eq!(saved.web_files_enabled, enabled);
+        assert!(saved.web_status_enabled);
+        assert_eq!(saved.server, "https://sync.example.test");
+        assert_eq!(fs::metadata(&config)?.permissions().mode() & 0o777, 0o600);
+    }
+    let lock = fs::File::create(config.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    assert!(!cli(&config, &["web-files", "enable"])?.status.success());
+    assert!(!client::load_config(&config)?.web_files_enabled);
+    Ok(())
+}

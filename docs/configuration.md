@@ -12,9 +12,13 @@ Copier `deploy/.env.example` vers `deploy/.env`, puis renseigner les valeurs pro
 
 Créer ces deux dossiers séparément avant `make start`. La clé privée de signature et les invitations doivent rester hors du répertoire des releases. L'[installation serveur](install-server.md#preparer-le-stockage) donne un exemple complet.
 
+Docker Compose monte aussi `web/` dans `/web`, en lecture seule, pour servir l’interface native. Hors Docker, `mysync-server serve --web-dir CHEMIN` permet de choisir ce dossier (par défaut `web`). Les fichiers sont relus à chaque requête ; voir les [modifications à chaud](operations.md#modifier-linterface-web-a-chaud).
+
 La commande `device auth-configure` enregistre dans SQLite l'origine publique HTTPS exacte (`--public-url`) et les racines EK constructeur vérifiées (`--ek-roots`). Elles ne sont pas déduites des en-têtes du proxy et aucune racine de test n'est installée par défaut. La [procédure TPM](device-auth.md#configuration-du-serveur) donne la commande complète. Le proxy doit préserver le corps et les en-têtes d'authentification, sans mise en cache des routes protégées.
 
 ## Client
+
+`web_files_enabled` est une autorisation distincte, désactivée par défaut, y compris pour les profils existants. `mysync web-files enable` autorise les nouveaux challenges `files.read` après redémarrage du daemon ; `disable` les refuse. Le pont `web_status_enabled` doit aussi être actif. Le statut seul ne permet pas de lire les fichiers. Voir [l’explorateur web Atlas](web-files.md) pour les sessions de 30 minutes et la révocation.
 
 `web_status_enabled` est un booléen, `true` par défaut depuis la version 0.3.8, enregistré dans les nouveaux profils. Un ancien profil sans ce champ utilise `true` ; un `false` explicite reste conservé. À `true`, `mysync daemon` expose le pont de présence sur le port loopback 47831 pour la page `/status` du serveur. Utiliser `mysync web-status status`, `enable` ou `disable` pour consulter ou modifier ce réglage. L’installateur propose le choix et `mysync setup --web-status true|false` permet de le fixer pendant l’appairage. Un redémarrage du daemon est nécessaire après modification. Voir [le fonctionnement et les limites du statut web](web-status.md).
 

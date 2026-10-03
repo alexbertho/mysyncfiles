@@ -37,9 +37,12 @@ Après comparaison de l'empreinte TPM, le client effectue une première synchron
 
 - [Guide complet et architecture](docs/index.md)
 - [Installation du serveur](docs/install-server.md) et [du client](docs/install-client.md)
-- [Statut web et présence locale TPM](docs/web-status.md), à activer explicitement dans le daemon
+- [Explorateur web Atlas](docs/web-files.md) : consulter, rechercher et télécharger les fichiers depuis un appareil approuvé
+- [Statut web et présence locale TPM](docs/web-status.md)
 - [Sécurité et limites](docs/security.md), [déploiement](docs/operations.md) et [dépannage](docs/troubleshooting.md)
 
 Pour prévisualiser la documentation localement : `make docs` puis ouvrir `http://127.0.0.1:8000`. `make docs-stop` l'arrête ; `make docs-check` vérifie sa construction. Le service de documentation est optionnel et ne démarre pas le serveur.
 
 Le [guide de déploiement](docs/operations.md#publier-la-documentation) explique comment publier le site statique à `/docs/` sur la même origine HTTPS que l'API.
+
+L’interface web native est dans `web/` et se modifie [à chaud](docs/operations.md#modifier-linterface-web-a-chaud) : sauvegarder le HTML, le CSS ou le JavaScript, puis actualiser le navigateur. Aucun build frontend n’est nécessaire.

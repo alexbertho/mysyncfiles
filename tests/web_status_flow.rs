@@ -163,6 +163,88 @@ async fn two_tpms_loopback_presence_replay_revocation_and_daemon_lifecycle() -> 
         .await?;
     assert_eq!(presence_b.device_name, "device-b");
     assert_ne!(presence.device_id, presence_b.device_id);
+    // Atlas requires a distinct cookie, signed scope and explicit client consent.
+    let files_page = http
+        .get(format!("{}/files", server.url))
+        .send()
+        .await?
+        .error_for_status()?;
+    let files_cookie = files_page.headers()["set-cookie"]
+        .to_str()?
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let entries_url = format!("{}/v1/web/files/entries", server.url);
+    for cookie in [&cookie, &files_cookie] {
+        assert_eq!(
+            http.get(&entries_url)
+                .header("cookie", cookie)
+                .header("x-mysync-web", "1")
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let files_challenge: ChallengeResponse = http
+        .post(format!("{}/v1/web/files/challenges", server.url))
+        .header("cookie", &files_cookie)
+        .header("origin", &server.url)
+        .header("x-mysync-web", "1")
+        .json(&serde_json::json!({}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let file_proof = proof(&files_challenge.ticket, &server.url)?;
+    assert!(api.submit_presence(&file_proof).await.is_err());
+    let refused = http
+        .get(&endpoint)
+        .header("origin", &server.url)
+        .header(BRIDGE_HEADER, "1")
+        .header(CHALLENGE_HEADER, &files_challenge.ticket)
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        refused.json::<serde_json::Value>().await?["error"],
+        "files_read_disabled"
+    );
+    let mut consent = common::config(&server.url, &root, key_a.clone());
+    consent.web_files_enabled = true;
+    let files_api = Api::new(&consent)?;
+    files_api.submit_presence(&file_proof).await?;
+    assert!(files_api.submit_presence(&file_proof).await.is_err());
+    assert_eq!(
+        http.get(&entries_url)
+            .header("cookie", &files_cookie)
+            .header("x-mysync-web", "1")
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        http.get(&entries_url)
+            .header("cookie", &cookie)
+            .header("x-mysync-web", "1")
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let file_session: serde_json::Value = http
+        .get(format!("{}/v1/web/files/session", server.url))
+        .header("cookie", &files_cookie)
+        .header("x-mysync-web", "1")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(file_session["expires_at"].as_i64().unwrap() > now() + 1700);
     assert_eq!(
         result(&http, &server.url, &cookie, &first.challenge_id)
             .await?
@@ -170,6 +252,16 @@ async fn two_tpms_loopback_presence_replay_revocation_and_daemon_lifecycle() -> 
         StatusCode::OK
     );
     assert!(server::revoke_device(&server.state, "device-a")?);
+    assert_eq!(
+        http.get(&entries_url)
+            .header("cookie", &files_cookie)
+            .header("x-mysync-web", "1")
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    drop(files_api);
     assert_eq!(
         result(&http, &server.url, &cookie, &first.challenge_id)
             .await?

@@ -8,8 +8,8 @@ const http = require("node:http");
 const {chromium, firefox} = require("playwright");
 const origin = "https://sync.example.test";
 const id = "a".repeat(64);
-const root = path.join(__dirname, "../src/server");
-const csp = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' http://127.0.0.1:47831; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+const root = path.join(__dirname, "../web");
+const csp = fs.readFileSync(path.join(__dirname, "../src/server/web_status.rs"), "utf8").match(/const CSP: &str = "([^"]+)"/)[1];
 let mode;
 let verified;
 let probes;
@@ -79,10 +79,12 @@ async function run(type, name) {
       }
       await context.route(`${origin}/**`, async route => {
         const url = new URL(route.request().url());
-        const files = {"/status": ["status.html", "text/html"], "/status.js": ["status.js", "text/javascript"], "/status.css": ["status.css", "text/css"]};
+        const files = {"/status": ["index.html", "text/html"], "/status.js": ["status.js", "text/javascript"], "/status.css": ["status.css", "text/css"], "/atlas.js": ["atlas.js", "text/javascript"], "/atlas-icons.svg": ["atlas-icons.svg", "image/svg+xml"], "/atlas-brand.png": ["atlas-brand.png", "image/png"], "/atlas-brand-dark.png": ["atlas-brand-dark.png", "image/png"]};
         if (files[url.pathname]) {
           const [file, contentType] = files[url.pathname];
           await route.fulfill({contentType, headers: {"Content-Security-Policy": csp, "Cache-Control": "no-store"}, body: fs.readFileSync(path.join(root, file))});
+        } else if (url.pathname === "/v1/web/files/session") {
+          await route.fulfill({status: 401, json: {error: "session_expired"}});
         } else if (url.pathname === "/v1/web/status/challenges") {
           challenges++;
           assert.ok(probes > 0, "probe must precede challenge issuance");
