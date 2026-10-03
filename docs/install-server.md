@@ -58,6 +58,8 @@ curl -fsS http://127.0.0.1:8484/v1/health
 
 Pour déployer ensuite des modifications du serveur et de la documentation, utiliser `make deploy` après avoir configuré l'origine publique avec `device auth-configure`. La commande exécute les tests avant de reconstruire et de relancer le serveur ; voir le [détail du déploiement](operations.md#publier-la-documentation).
 
+Les retouches de l’interface HTML/CSS/JavaScript se font directement dans `web/`, monté en lecture seule par Compose. Après le déploiement initial de cette version, une actualisation du navigateur suffit ; voir les [modifications à chaud](operations.md#modifier-linterface-web-a-chaud).
+
 Les commandes directes `docker compose -f deploy/compose.yaml ...` restent disponibles. Ne jamais lancer deux serveurs sur la même base SQLite.
 
 ## Exposer une origine HTTPS

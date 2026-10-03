@@ -21,7 +21,7 @@ Une suppression apparaît comme une révision et peut être restaurée depuis la
 
 ## Identité et mises à jour
 
-Le daemon expose une [API de présence sur loopback](web-status.md), activée par défaut depuis la version 0.3.8 et désactivable à l’installation ou avec `mysync web-status disable`. Le navigateur transporte un challenge signé ; le daemon soumet sa preuve TPM directement au backend. Une session navigateur anonyme permet seulement de consulter le résultat temporaire. Il n’existe toujours aucun modèle utilisateur ni espace de fichiers propre à une machine.
+Le daemon expose une [API de présence sur loopback](web-status.md), activée par défaut depuis la version 0.3.8 et désactivable à l’installation ou avec `mysync web-status disable`. Le navigateur transporte un challenge signé ; le daemon soumet sa preuve TPM directement au backend. La session de statut permet seulement de consulter le résultat temporaire. L’[explorateur Atlas](web-files.md) utilise un autre cookie et un challenge `files.read`, autorisé explicitement sur le client, pour une session de lecture de 30 minutes. Il n’existe toujours aucun modèle utilisateur ni espace de fichiers propre à une machine.
 
 Chaque appareil crée une clé non exportable dans son TPM. Le client affiche un code que l'administrateur saisit localement sur le serveur ; le serveur vérifie ensuite la chaîne EK constructeur et l'appareil doit être approuvé après comparaison de l'empreinte. Les requêtes suivantes portent une preuve TPM fraîche. Le parcours manuel par invitation reste disponible. Voir le [guide d'identité](device-auth.md).
 

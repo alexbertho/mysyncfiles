@@ -38,6 +38,8 @@ client fonctionne avec les serveurs précédents ; le résumé signé utilisé p
 `status` nécessite le nouveau serveur pour réduire le nombre de requêtes. Les
 profils, signatures, contrôles de révision et copies de conflits restent compatibles.
 
+La version **0.3.10** ajoute l’autorisation de lecture web `mysync web-files` pour l’explorateur Atlas. Le client 0.3.9 publié ne peut vérifier que la présence `/status` ; publier cette nouvelle version cliente signée est nécessaire pour utiliser `/files`. Après `mysync update`, arrêter le daemon avant `mysync web-files enable`, puis relancer le service déjà installé. Ce consentement reste désactivé par défaut. Le serveur doit également inclure Atlas ; son interface HTML/CSS/JavaScript native se modifie ensuite à chaud dans `web/`. Voir le [guide d’activation](web-files.md).
+
 ```sh
 mysync-release publish --secret-key /chemin/prive/cle-signature \
   --binary target/release/mysync --version VERSION \
@@ -73,6 +75,18 @@ Sauvegarder de façon cohérente le répertoire de données privé, qui contient
 L'appartenance au groupe `docker` accorde des privilèges élevés sur l'hôte. Réserver les commandes Compose aux administrateurs autorisés.
 
 La documentation se prévisualise indépendamment avec `make docs` sur `http://127.0.0.1:8000`, s'arrête avec `make docs-stop` et se valide avec `make docs-check`. Ce service local n'expose ni les données du serveur ni `deploy/.env`.
+
+## Modifier l’interface web à chaud
+
+L’interface native est dans `web/` : `index.html` pour la page, `status.css` pour les styles, `atlas.js` et `status.js` pour les interactions, avec les images et icônes à côté. Ces fichiers sont indépendants du binaire Rust et ne nécessitent ni npm ni compilation.
+
+Docker Compose monte le dossier `web/` du dépôt dans `/web` en lecture seule. Après une modification, actualiser le navigateur : le serveur relit les fichiers à chaque requête et envoie `Cache-Control: no-store`. Une édition HTML/CSS/JavaScript ne nécessite ni `make install`, ni `make deploy`, ni redémarrage. Le montage porte sur le dossier entier, ce qui permet aussi les remplacements atomiques de fichiers par un éditeur.
+
+Pour passer d’un ancien serveur avec interface embarquée à ce fonctionnement, une première reconstruction de l’image et une recréation du conteneur sont nécessaires, par la procédure de déploiement habituelle. Les retouches suivantes se font directement dans `web/`. Une image utilisée sans Compose contient également une copie de ces fichiers dans `/web` ; monter un dossier externe pour pouvoir les modifier à chaud.
+
+Hors Docker, `mysync-server serve --web-dir /chemin/vers/web` indique le dossier public ; sa valeur par défaut est `web`, relative au répertoire de lancement. Conserver les autres arguments habituels, notamment `--data-dir`. Distribuer ce dossier avec le serveur lors d’une installation binaire.
+
+Les routes `/`, `/index.html`, `/files` et `/status` servent le même HTML. Seuls les fichiers de l’interface explicitement exposés sont accessibles, sans parcours de répertoire. Les lectures refusent les liens symboliques et les fichiers de plus de 1 Mio. Les clés, profils et données synchronisées restent dans leurs répertoires privés. Un fichier web absent ou invalide produit une erreur `503` ; le remplacer rétablit la page sans redémarrage.
 
 ## Mesurer les performances
 

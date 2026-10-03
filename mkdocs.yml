@@ -33,6 +33,7 @@ nav:
       - Fonctionnement du serveur: server.md
       - Fonctionnement du client: client.md
       - Présence locale et statut web: web-status.md
+      - Explorateur web Atlas: web-files.md
   - Administrer:
       - Configuration: configuration.md
       - Déploiement et publication: operations.md

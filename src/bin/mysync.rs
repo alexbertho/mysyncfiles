@@ -76,6 +76,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<WebStatusAction>,
     },
+    /// Allow read-only browser file sessions (disabled by default); restart the daemon
+    WebFiles {
+        #[command(subcommand)]
+        action: Option<WebStatusAction>,
+    },
     /// Run one synchronization pass
     Sync,
     /// Watch local changes and poll the server continuously
@@ -92,9 +97,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WebStatusAction {
-    /// Enable browser status in the client profile
+    /// Enable this browser capability in the client profile
     Enable,
-    /// Disable browser status in the client profile
+    /// Disable this browser capability in the client profile
     Disable,
     /// Show the saved setting without contacting the TPM or server
     Status,
@@ -232,6 +237,24 @@ async fn main() -> Result<()> {
                 println!(
                     "web_status_enabled={}",
                     client::load_config(&config_path)?.web_status_enabled
+                );
+            }
+        }
+        Command::WebFiles { action } => {
+            let enabled = match action {
+                Some(WebStatusAction::Enable) => Some(true),
+                Some(WebStatusAction::Disable) => Some(false),
+                Some(WebStatusAction::Status) | None => None,
+            };
+            if let Some(enabled) = enabled {
+                client::set_web_files(&config_path, enabled)?;
+                println!(
+                    "web_files_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
+                );
+            } else {
+                println!(
+                    "web_files_enabled={}",
+                    client::load_config(&config_path)?.web_files_enabled
                 );
             }
         }

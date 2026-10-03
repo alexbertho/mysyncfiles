@@ -31,6 +31,8 @@ use crate::model::{
 use crate::release;
 
 mod origin;
+mod web_assets;
+mod web_files;
 mod web_status;
 
 const RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -42,6 +44,7 @@ pub struct ServerState {
     pub(crate) origin_key: ed25519_dalek::SigningKey,
     data_dir: PathBuf,
     releases_dir: Option<crate::local_fs::Mirror>,
+    web_dir: PathBuf,
     pub(crate) db: Mutex<Connection>,
     pub(crate) enrollment_limit: tokio::sync::Semaphore,
     pair_ready_rate: Mutex<(std::time::Instant, u32)>,
@@ -247,6 +250,14 @@ pub fn open_with_releases(
     data_dir: impl AsRef<Path>,
     releases_dir: Option<PathBuf>,
 ) -> Result<Arc<ServerState>> {
+    open_with_web_dir(data_dir, releases_dir, PathBuf::from("web"))
+}
+
+pub fn open_with_web_dir(
+    data_dir: impl AsRef<Path>,
+    releases_dir: Option<PathBuf>,
+    web_dir: PathBuf,
+) -> Result<Arc<ServerState>> {
     let data_dir = data_dir.as_ref().to_path_buf();
     private_dir(&data_dir)?;
     private_dir(&data_dir.join("blobs"))?;
@@ -314,6 +325,7 @@ pub fn open_with_releases(
     Ok(Arc::new(ServerState {
         origin_key: origin::load_key(&conn)?,
         data_dir,
+        web_dir,
         releases_dir: releases_dir
             .as_deref()
             .map(crate::local_fs::Mirror::open)
@@ -1261,6 +1273,8 @@ pub fn purge_upload_sessions(state: &ServerState) -> Result<usize> {
 
 pub fn router(state: Arc<ServerState>) -> Router {
     let web = web_status::router()
+        .merge(web_assets::router())
+        .merge(web_files::router())
         .merge(
             Router::new()
                 .route(
@@ -1336,10 +1350,11 @@ pub async fn serve(
     data_dir: impl AsRef<Path>,
     listen: SocketAddr,
     releases_dir: Option<PathBuf>,
+    web_dir: PathBuf,
 ) -> Result<()> {
     private_dir(data_dir.as_ref())?;
     let _service_lock = service_lock(data_dir.as_ref())?;
-    let state = open_with_releases(data_dir, releases_dir)?;
+    let state = open_with_web_dir(data_dir, releases_dir, web_dir)?;
     recover_storage(&state).context("recovering interrupted storage operations")?;
     purge_expired(&state).context("purging expired trash")?;
     purge_upload_sessions(&state).context("purging expired upload sessions")?;

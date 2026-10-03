@@ -25,6 +25,8 @@ La page `/status` du serveur permet aussi une [vérification de présence locale
 | `mysync update` | Cherche et installe une version cliente signée plus récente. |
 | `mysync web-status status` | Affiche le réglage local de présence navigateur. |
 | `mysync web-status enable` / `disable` | Active ou désactive ce réglage ; relancer le daemon pour l’appliquer. |
+| `mysync web-files status` | Affiche l’autorisation locale de lecture web, désactivée par défaut. |
+| `mysync web-files enable` / `disable` | Autorise ou refuse les nouvelles sessions de lecture dans l’[explorateur Atlas](web-files.md) ; relancer le daemon. |
 
 La configuration et l'état du client résident hors du miroir, dans le répertoire de configuration utilisateur. Une clé TPM copiée sur un autre appareil ne permet pas d'utiliser l'identité. Voir la [configuration](configuration.md) et les [limites de cette garantie](device-auth.md#garanties-et-limites).
 

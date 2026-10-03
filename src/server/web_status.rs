@@ -1,5 +1,5 @@
-//! Anonymous, short-lived browser sessions. No file authority or user account.
-use super::{ApiError, ServerState};
+//! Browser challenges shared by presence and explicitly scoped file sessions.
+use super::{ApiError, ServerState, web_assets};
 use crate::{
     auth_protocol::{hash, now, random_secret},
     web_status_protocol::*,
@@ -22,9 +22,11 @@ const MAX_SESSIONS: i64 = 1024;
 const MAX_PENDING: i64 = 4;
 // Also bound consumed rows and repeated issuance within each five-minute session.
 const MAX_CHALLENGES: i64 = 32;
-const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' http://127.0.0.1:47831; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' http://127.0.0.1:47831; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 
 pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
+    let tx = db.unchecked_transaction()?;
+    let db = &tx;
     db.execute_batch("CREATE TABLE IF NOT EXISTS web_status_sessions(
         token_hash TEXT PRIMARY KEY, binding TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS web_status_sessions_expiry ON web_status_sessions(expires_at);
@@ -33,7 +35,21 @@ pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
         ticket_hash TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
         expected_device_id INTEGER, enrollment_id TEXT, device_id INTEGER,
         result TEXT, presence_expires_at INTEGER);
-        CREATE INDEX IF NOT EXISTS web_status_challenges_session ON web_status_challenges(session_hash);")
+        CREATE INDEX IF NOT EXISTS web_status_challenges_session ON web_status_challenges(session_hash);
+        CREATE TABLE IF NOT EXISTS web_file_grants(
+            session_hash TEXT PRIMARY KEY REFERENCES web_status_sessions(token_hash) ON DELETE CASCADE,
+            challenge_id TEXT NOT NULL, device_id INTEGER NOT NULL, enrollment_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL);")?;
+    let has_scope = db
+        .prepare("PRAGMA table_info(web_status_challenges)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "scope");
+    if !has_scope {
+        db.execute("ALTER TABLE web_status_challenges ADD COLUMN scope TEXT NOT NULL DEFAULT 'status.read'", [])?;
+    }
+    tx.commit()
 }
 
 pub(super) fn purge(db: &Connection) -> rusqlite::Result<()> {
@@ -51,7 +67,7 @@ fn denied() -> ApiError {
     error(StatusCode::FORBIDDEN, "authentication_refused")
 }
 
-fn public_origin(state: &ServerState) -> Result<String, ApiError> {
+pub(super) fn public_origin(state: &ServerState) -> Result<String, ApiError> {
     crate::device_auth::public_url(state)
         .and_then(|url| origin(&url))
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "server_unavailable"))
@@ -66,7 +82,7 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     Some(value)
 }
 
-fn browser_request(
+pub(super) fn browser_request(
     headers: &HeaderMap,
     expected: &str,
     require_origin: bool,
@@ -86,12 +102,12 @@ fn browser_request(
     Ok(())
 }
 
-fn cookie_hash(headers: &HeaderMap) -> Option<String> {
+pub(super) fn cookie_hash(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
     let mut found = None;
     for value in headers.get_all(header::COOKIE) {
         for cookie in value.to_str().ok()?.split(';') {
             if let Some((key, value)) = cookie.trim().split_once('=')
-                && key == COOKIE
+                && key == cookie_name
             {
                 if found.is_some() || !valid_secret(value) {
                     return None;
@@ -103,13 +119,20 @@ fn cookie_hash(headers: &HeaderMap) -> Option<String> {
     found
 }
 
-struct BrowserSession {
-    hash: String,
-    binding: String,
-    expires_at: i64,
+pub(super) struct BrowserSession {
+    pub hash: String,
+    pub binding: String,
+    pub expires_at: i64,
 }
 fn session(db: &Connection, headers: &HeaderMap) -> Result<BrowserSession, ApiError> {
-    let token_hash = cookie_hash(headers).ok_or_else(denied)?;
+    named_session(db, headers, COOKIE)
+}
+pub(super) fn named_session(
+    db: &Connection,
+    headers: &HeaderMap,
+    cookie_name: &str,
+) -> Result<BrowserSession, ApiError> {
+    let token_hash = cookie_hash(headers, cookie_name).ok_or_else(denied)?;
     let row: Option<(String, i64)> = db.query_row(
         "SELECT binding,expires_at FROM web_status_sessions WHERE token_hash=?1 AND expires_at>?2",
         params![token_hash, now()], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -125,8 +148,6 @@ fn session(db: &Connection, headers: &HeaderMap) -> Result<BrowserSession, ApiEr
 pub(super) fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/status", get(page))
-        .route("/status.js", get(script))
-        .route("/status.css", get(style))
         .route("/v1/web/status/challenges", post(create_challenge))
         .route("/v1/web/status/challenges/{id}", get(read_challenge))
 }
@@ -168,18 +189,25 @@ async fn page(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    public_origin(&state)?;
+    let html = web_assets::read(&state, "index.html").await?;
+    page_response(&state, &headers, COOKIE, SESSION_SECONDS, html)
+}
+
+pub(super) fn page_response(
+    state: &ServerState,
+    headers: &HeaderMap,
+    cookie_name: &str,
+    cookie_seconds: i64,
+    html: impl IntoResponse,
+) -> Result<Response, ApiError> {
+    public_origin(state)?;
     let mut db = state.db.lock().unwrap();
     let tx = db
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(ApiError::internal)?;
     purge(&tx).map_err(ApiError::internal)?;
-    let mut response = (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("status.html"),
-    )
-        .into_response();
-    if session(&tx, &headers).is_err() {
+    let mut response = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
+    if named_session(&tx, headers, cookie_name).is_err() {
         let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM web_status_sessions", [], |r| r.get(0))
             .map_err(ApiError::internal)?;
@@ -194,24 +222,11 @@ async fn page(
         )
         .map_err(ApiError::internal)?;
         response.headers_mut().insert(header::SET_COOKIE,
-            format!("{COOKIE}={token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_SECONDS}").parse().unwrap());
+            format!("{cookie_name}={token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={cookie_seconds}").parse().unwrap());
     }
     tx.commit().map_err(ApiError::internal)?;
     Ok(response)
 }
-async fn script() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("status.js"),
-    )
-}
-async fn style() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("status.css"),
-    )
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateChallenge {
@@ -223,19 +238,29 @@ async fn create_challenge(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<ChallengeResponse>, ApiError> {
-    let audience = public_origin(&state)?;
-    browser_request(&headers, &audience, true)?;
-    if single_header(&headers, "content-type") != Some("application/json") {
+    issue_challenge(&state, &headers, &body, COOKIE, "status.read").map(Json)
+}
+
+pub(super) fn issue_challenge(
+    state: &ServerState,
+    headers: &HeaderMap,
+    body: &[u8],
+    cookie_name: &str,
+    scope: &str,
+) -> Result<ChallengeResponse, ApiError> {
+    let audience = public_origin(state)?;
+    browser_request(headers, &audience, true)?;
+    if single_header(headers, "content-type") != Some("application/json") {
         return Err(denied());
     }
-    let input: CreateChallenge = serde_json::from_slice(&body)
+    let input: CreateChallenge = serde_json::from_slice(body)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let mut db = state.db.lock().unwrap();
     let tx = db
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(ApiError::internal)?;
     purge(&tx).map_err(ApiError::internal)?;
-    let session = session(&tx, &headers)?;
+    let session = named_session(&tx, headers, cookie_name)?;
     let expected_device_id = input
         .previous_challenge_id
         .as_deref()
@@ -254,7 +279,7 @@ async fn create_challenge(
         session_binding: session.binding,
         origin: audience.clone(),
         audience,
-        scope: "status.read".into(),
+        scope: scope.into(),
         issued_at: now(),
         expires_at: (now() + CHALLENGE_SECONDS).min(session.expires_at),
         expected_device_id,
@@ -262,14 +287,14 @@ async fn create_challenge(
     let ticket = challenge
         .sign(&state.origin_key)
         .map_err(ApiError::internal)?;
-    tx.execute("INSERT INTO web_status_challenges(id,session_hash,ticket_hash,issued_at,expires_at,expected_device_id)
-        VALUES(?1,?2,?3,?4,?5,?6)", params![challenge.challenge_id, session.hash, hash(&ticket), challenge.issued_at, challenge.expires_at, expected_device_id]).map_err(ApiError::internal)?;
+    tx.execute("INSERT INTO web_status_challenges(id,session_hash,ticket_hash,issued_at,expires_at,expected_device_id,scope)
+        VALUES(?1,?2,?3,?4,?5,?6,?7)", params![challenge.challenge_id, session.hash, hash(&ticket), challenge.issued_at, challenge.expires_at, expected_device_id, scope]).map_err(ApiError::internal)?;
     tx.commit().map_err(ApiError::internal)?;
-    Ok(Json(ChallengeResponse {
+    Ok(ChallengeResponse {
         challenge_id: challenge.challenge_id,
         ticket,
         expires_at: challenge.expires_at,
-    }))
+    })
 }
 
 /// Called only after machine authentication. Recheck approval and revocation in
@@ -317,8 +342,8 @@ fn accept_proof(
         params![device_id,enrollment_id], |r| r.get(0)).optional().map_err(ApiError::internal)?;
     let name = name.ok_or_else(denied)?;
     let session_expiry: Option<i64> = tx.query_row("SELECT s.expires_at FROM web_status_sessions s JOIN web_status_challenges c ON c.session_hash=s.token_hash
-        WHERE c.id=?1 AND s.binding=?2 AND s.expires_at>?3 AND c.expires_at>?3 AND c.result IS NULL AND c.ticket_hash=?4",
-        params![claims.challenge_id,claims.session_binding,now(),hash(&submission.ticket)], |r| r.get(0)).optional().map_err(ApiError::internal)?;
+        WHERE c.id=?1 AND s.binding=?2 AND s.expires_at>?3 AND c.expires_at>?3 AND c.result IS NULL AND c.ticket_hash=?4 AND c.scope=?5",
+        params![claims.challenge_id,claims.session_binding,now(),hash(&submission.ticket),claims.scope], |r| r.get(0)).optional().map_err(ApiError::internal)?;
     let session_expiry = session_expiry.ok_or_else(denied)?;
     let result = VerifiedPresence {
         challenge_id: claims.challenge_id.clone(),
@@ -337,6 +362,20 @@ fn accept_proof(
         WHERE id=?1 AND result IS NULL", params![claims.challenge_id, enrollment_id, device_id, json, result.presence_expires_at]).map_err(ApiError::internal)?;
     if updated != 1 {
         return Err(denied());
+    }
+    if claims.scope == "files.read" {
+        // Only a consumed files.read proof can extend a browser session. The
+        // status cookie and status.read tickets never receive file authority.
+        let expires = now() + FILES_SESSION_SECONDS;
+        tx.execute("INSERT INTO web_file_grants(session_hash,challenge_id,device_id,enrollment_id,expires_at)
+            SELECT session_hash,id,?2,?3,?4 FROM web_status_challenges WHERE id=?1
+            ON CONFLICT(session_hash) DO UPDATE SET challenge_id=excluded.challenge_id,device_id=excluded.device_id,enrollment_id=excluded.enrollment_id,expires_at=excluded.expires_at",
+            params![claims.challenge_id, device_id, enrollment_id, expires]).map_err(ApiError::internal)?;
+        tx.execute(
+            "UPDATE web_status_sessions SET expires_at=?2 WHERE binding=?1",
+            params![claims.session_binding, expires],
+        )
+        .map_err(ApiError::internal)?;
     }
     tx.commit().map_err(ApiError::internal)?;
     Ok(ProofAccepted {

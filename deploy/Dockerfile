@@ -28,7 +28,8 @@ RUN set -eu; \
 
 FROM scratch
 COPY --from=runtime-deps /runtime/ /
+COPY web /web
 USER 65532:65532
 EXPOSE 8484
 ENTRYPOINT ["/usr/local/bin/mysync-server"]
-CMD ["serve", "--data-dir", "/data", "--listen", "0.0.0.0:8484", "--releases-dir", "/releases"]
+CMD ["serve", "--data-dir", "/data", "--listen", "0.0.0.0:8484", "--releases-dir", "/releases", "--web-dir", "/web"]

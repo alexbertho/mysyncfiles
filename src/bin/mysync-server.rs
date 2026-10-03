@@ -40,6 +40,9 @@ enum Command {
         listen: SocketAddr,
         #[arg(long)]
         releases_dir: Option<PathBuf>,
+        /// Directory containing the static web interface, read on every request
+        #[arg(long, default_value = "web")]
+        web_dir: PathBuf,
     },
     /// Manage TPM-enrolled devices
     Device {
@@ -193,7 +196,8 @@ async fn main() -> Result<()> {
             data_dir,
             listen,
             releases_dir,
-        } => server::serve(data_dir, listen, releases_dir).await?,
+            web_dir,
+        } => server::serve(data_dir, listen, releases_dir, web_dir).await?,
         Command::Device { command } => match command {
             DeviceCommand::Pair { data_dir } => pair(data_dir).await?,
             DeviceCommand::AuthConfigure {

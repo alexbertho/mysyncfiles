@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Fichiers · MySyncFiles</title>
+  <link rel="icon" href="/atlas-brand.png">
+  <link rel="stylesheet" href="/status.css">
+  <script src="/atlas.js" defer></script>
+  <script src="/status.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Aller au contenu</a>
+  <aside id="sidebar" class="sidebar" aria-label="Navigation principale">
+    <a class="brand" href="/files"><span class="brand-mark" aria-hidden="true"></span>MySyncFiles</a>
+    <nav>
+      <a id="files-nav" class="nav-link" href="/files"><svg aria-hidden="true"><use href="/atlas-icons.svg#folder"></use></svg>Fichiers</a>
+      <a id="status-nav" class="nav-link" href="/status"><svg aria-hidden="true"><use href="/atlas-icons.svg#device"></use></svg>Statut de cet appareil</a>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="session-indicator"><span id="session-dot" class="session-dot"></span><div><span id="session-label">Accès non vérifié</span><small id="session-time"></small></div></div>
+      <button id="logout" class="nav-link" type="button" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#logout"></use></svg>Déconnexion</button>
+    </div>
+  </aside>
+  <div class="workspace">
+    <header class="toolbar">
+      <button id="sidebar-toggle" class="icon-button" type="button" aria-label="Masquer le menu" aria-expanded="true" aria-controls="sidebar"><svg aria-hidden="true"><use href="/atlas-icons.svg#left"></use></svg></button>
+      <span class="brand-mark compact-brand" aria-hidden="true"></span>
+      <div id="search-box" class="search-box">
+        <svg aria-hidden="true"><use href="/atlas-icons.svg#search"></use></svg>
+        <input id="search" type="search" placeholder="Rechercher un fichier" aria-label="Rechercher un fichier par nom ou chemin" maxlength="255" autocomplete="off" disabled>
+        <button id="clear-search" class="icon-button" type="button" aria-label="Effacer la recherche" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button>
+      </div>
+      <span id="toolbar-title" hidden>Statut de cet appareil</span>
+      <button id="refresh" class="icon-button refresh-button" type="button" aria-label="Actualiser les fichiers" title="Actualiser les fichiers" aria-controls="file-table" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#refresh"></use></svg></button>
+      <span id="listing-status" class="sr-only" role="status" aria-live="polite"></span>
+      <button id="theme-toggle" class="icon-button theme-button" type="button" aria-label="Passer au thème sombre"><svg aria-hidden="true"><use href="/atlas-icons.svg#moon"></use></svg></button>
+    </header>
+    <main id="main" tabindex="-1">
+      <section id="access" class="access" aria-labelledby="access-title">
+        <svg id="access-icon" class="state-icon" aria-hidden="true"><use href="/atlas-icons.svg#laptop"></use></svg>
+        <h1 id="access-title">Vérifier cet appareil</h1>
+        <p id="access-description">Le client MySyncFiles doit être lancé sur ce PC.<br>Le navigateur peut demander l’autorisation d’accéder à cet appareil.</p>
+        <p id="access-message" class="access-message" role="status" aria-live="polite"></p>
+        <div class="actions"><button id="file-verify" class="primary" type="button">Vérifier cet appareil</button><button id="file-cancel" class="secondary" type="button" hidden>Annuler</button></div>
+        <p id="access-note" class="note">Une fois l’appareil reconnu et la lecture autorisée, l’accès sera ouvert pour 30 minutes.</p>
+        <details id="access-help"><summary>Configurer l’accès sur cet appareil</summary><p>Autorisez la lecture web avec <code>mysync web-files enable</code>, puis relancez le daemon. Le pont local doit être activé avec <code>mysync web-status enable</code>. Ces commandes nécessitent un client disposant de l’explorateur web.</p><p>Si le navigateur a refusé l’accès local, ouvrez les permissions de ce site dans sa barre d’adresse, autorisez l’accès au réseau local et réessayez.</p></details>
+      </section>
+      <section id="explorer" class="explorer" aria-labelledby="listing-title" hidden>
+        <div class="file-list">
+          <nav id="breadcrumbs" class="breadcrumbs" aria-label="Chemin du dossier"></nav>
+          <h1 id="listing-title" tabindex="-1">Tous les fichiers</h1>
+          <p id="count" class="count" role="status" aria-live="polite"></p>
+          <div id="listing-message" class="listing-message" role="status" hidden></div>
+          <table id="file-table"><caption class="sr-only">Fichiers et dossiers synchronisés</caption><colgroup><col class="name-column"><col class="size-column"><col class="modified-column"><col class="actions-column"></colgroup><thead><tr><th scope="col" aria-sort="ascending">Nom <svg aria-hidden="true"><use href="/atlas-icons.svg#up"></use></svg></th><th scope="col">Taille</th><th scope="col" class="modified-heading" title="Date d’enregistrement sur le serveur ; pour un dossier, date la plus récente de ses fichiers présents.">Dernière modification</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody id="rows"></tbody></table>
+          <div id="empty" class="empty" hidden><svg class="state-icon" aria-hidden="true"><use href="/atlas-icons.svg#folder"></use></svg><h2 id="empty-title">Aucun fichier pour le moment</h2><p id="empty-description">Vos fichiers apparaîtront ici après la première synchronisation.</p><button id="empty-reset" class="secondary" type="button" hidden>Effacer la recherche</button></div>
+          <div class="pagination"><button id="previous-page" class="secondary" type="button" hidden>Page précédente</button><button id="next-page" class="secondary" type="button" hidden>Page suivante</button></div>
+        </div>
+        <aside id="details" class="details" aria-labelledby="detail-name" tabindex="-1" hidden>
+          <button id="details-close" class="icon-button" type="button" aria-label="Fermer les détails"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button>
+          <svg id="detail-icon" class="detail-icon" aria-hidden="true"><use href="/atlas-icons.svg#file"></use></svg>
+          <h2 id="detail-name"></h2><p id="detail-path" class="mono"></p>
+          <dl><dt>Taille</dt><dd id="detail-size"></dd><dt>Dernière modification</dt><dd id="detail-modified"></dd><dt>Révision</dt><dd id="detail-revision"></dd><dt>SHA-256</dt><dd id="detail-hash" class="mono"></dd></dl>
+          <button id="detail-download" class="primary" type="button"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button>
+        </aside>
+      </section>
+      <section id="status-panel" class="status-panel" aria-labelledby="status-title" hidden>
+        <nav class="breadcrumbs" aria-label="Section">Appareil</nav><h1 id="status-title">Statut de cet appareil</h1>
+        <p>Vérifiez qu’un client approuvé répond depuis ce navigateur. Le navigateur peut demander l’autorisation d’accéder à cet appareil.</p>
+        <p>Cette vérification nécessite MySyncFiles 0.3.7 ou une version ultérieure sur ce PC.</p>
+        <p>Le daemon doit être lancé. La présence navigateur est activée par défaut à partir de la version 0.3.8 ; utilisez <code>mysync web-status enable</code> pour la réactiver, puis relancez le daemon. Cette vérification ne donne pas accès aux fichiers.</p>
+        <div class="actions"><button id="verify" class="primary" type="button">Vérifier</button><button id="cancel" class="secondary" type="button" hidden>Annuler</button></div>
+        <p id="message" role="status" aria-live="polite">Aucune vérification effectuée.</p><dl id="result" hidden></dl>
+        <p class="note">Une absence de réponse peut signifier que le daemon est arrêté, que l’accès est bloqué ou que le client est absent. Elle ne prouve pas une désinstallation.</p>
+        <p class="note">La reconnaissance confirme la réponse d’une clé TPM approuvée. Elle ne garantit ni la proximité physique du TPM, ni l’intégrité du logiciel. Le statut est déclaré par le client.</p>
+        <p class="note">Session anonyme de cinq minutes, présence valable au plus deux minutes. <a href="/status">Recharger la page</a> pour ouvrir une nouvelle session après expiration.</p>
+      </section>
+      <noscript><p class="noscript">Activez JavaScript pour vérifier cet appareil et consulter les fichiers.</p></noscript>
+    </main>
+  </div>
+  <div id="file-menu" class="file-menu" role="menu" aria-label="Actions du fichier" hidden>
+    <button type="button" role="menuitem" data-action="download"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button>
+    <button type="button" role="menuitem" data-action="details"><svg aria-hidden="true"><use href="/atlas-icons.svg#info"></use></svg>Voir les détails</button>
+    <button type="button" role="menuitem" data-action="copy"><svg aria-hidden="true"><use href="/atlas-icons.svg#copy"></use></svg>Copier le chemin</button>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg><span id="toast-message"></span><button id="download-cancel" class="text-button" type="button" hidden>Annuler</button><button id="toast-close" class="icon-button" type="button" aria-label="Fermer le message"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
+</body>
+</html>

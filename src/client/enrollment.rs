@@ -533,6 +533,7 @@ pub async fn enroll_with_tcti(
             root,
             auto_update: true,
             web_status_enabled: super::default_web_status_enabled(),
+            web_files_enabled: false,
             update_public_key: default_update_public_key(),
         };
         if let Some(enabled) = pairing_web_status(config_path, &config)? {

@@ -2,6 +2,8 @@
 
 La page `/status` du serveur reconnaît une clé TPM approuvée qui répond à un challenge court. Elle affiche le nom enregistré de l’appareil, la version du client, l’activité du daemon et son dernier état de communication authentifiée. Elle ne donne accès à aucun fichier et ne crée aucun compte utilisateur.
 
+La consultation et le téléchargement se font dans l’[explorateur Atlas](web-files.md), avec une autorisation locale `files.read` et une session distinctes. Activer le statut seul n’autorise pas la lecture des fichiers.
+
 ## Activer et consulter
 
 Le client doit disposer de la fonctionnalité introduite en **0.3.7**. Vérifier `mysync --version` sur le PC du navigateur. Si nécessaire, lancer `mysync update` après publication de cette release par l'administrateur. Le redéploiement Docker du serveur ne distribue pas automatiquement un nouveau client. Un ancien client 0.3.6 ne reconnaît pas le champ `web_status_enabled`.
@@ -31,6 +33,15 @@ Avec le client 0.3.7, le réglage se fait encore dans le [profil client privé](
 Le daemon écoute uniquement sur `127.0.0.1:47831` et, si IPv6 est disponible, `[::1]:47831`. La page utilise IPv4, sans résolution de nom ni balayage de ports. Les sources CSP ne permettent pas de cibler une adresse IPv6 littérale ([CSP Level 3](https://www.w3.org/TR/CSP/#framework-directive-source-list)). Le repli IPv6 prévu initialement est donc omis du navigateur pour conserver une CSP limitée à l’adresse locale exacte ; la socket IPv6 reste disponible pour un appel direct respectant les mêmes contrôles. Une collision sur l’une des adresses disponibles désactive le pont entier et produit un message dans les logs ; la synchronisation continue. L’arrêt du daemon, une erreur terminale ou son redémarrage après mise à jour ferment le pont et les requêtes en cours.
 
 Un seul profil peut être exposé sur ce port à la fois. Plusieurs profils ou utilisateurs Linux peuvent entrer en collision. Une connexion loopback ne permet pas d'identifier l'utilisateur Linux du navigateur.
+
+Si le daemon affiche `web status bridge disabled: cannot bind IPv4 loopback`, la synchronisation continue mais ce processus n’expose pas le pont web. Les clients récents affichent aussi l’adresse et l’erreur système : `Address already in use` indique un port occupé ; `Permission denied` ou `Operation not permitted` indiquent une restriction locale. Vérifier sur le PC client :
+
+```sh
+ss -ltnp 'sport = :47831'
+systemctl --user is-active mysync.service
+```
+
+Si `mysync.service` est actif et possède ce port pour le profil voulu, utiliser ce daemon et quitter celui lancé manuellement avec `Ctrl+C`. Pour travailler au premier plan, arrêter d’abord ce service avec `systemctl --user stop mysync.service`, puis relancer `mysync daemon`. Si le port appartient à un autre programme ou profil, identifier ce propriétaire avant de l’arrêter. Le pont utilise un port fixe ; il ne choisit pas un autre port automatiquement.
 
 | Message | Interprétation |
 | --- | --- |
