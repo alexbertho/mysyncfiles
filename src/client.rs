@@ -46,6 +46,9 @@ pub struct ClientConfig {
     /// Separate consent to add files from the browser. Never enabled by read consent.
     #[serde(default, skip_serializing_if = "is_false")]
     pub web_uploads_enabled: bool,
+    /// Separate consent to rename and delete directories from the browser.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web_management_enabled: bool,
     #[serde(default = "default_update_public_key")]
     pub update_public_key: String,
 }
@@ -212,6 +215,15 @@ pub fn set_web_uploads(config_path: &Path, enabled: bool) -> Result<()> {
         .context("client profile is busy; stop the daemon or retry after synchronization")?;
     let mut config = load_config(config_path)?;
     config.web_uploads_enabled = enabled;
+    private_write_json(config_path, &config)
+}
+
+pub fn set_web_management(config_path: &Path, enabled: bool) -> Result<()> {
+    let lock = open_profile_lock(config_path)?;
+    FileExt::try_lock_exclusive(&lock)
+        .context("client profile is busy; stop the daemon or retry after synchronization")?;
+    let mut config = load_config(config_path)?;
+    config.web_management_enabled = enabled;
     private_write_json(config_path, &config)
 }
 

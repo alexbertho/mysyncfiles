@@ -109,13 +109,17 @@ enum WebStatusAction {
 enum WebFilesAction {
     /// Allow read-only browser file sessions
     Enable,
-    /// Refuse new browser file sessions, including uploads
+    /// Refuse new browser file sessions, including uploads and directory management
     Disable,
     /// Allow browser uploads as well (requires read access to be enabled)
     EnableUpload,
     /// Refuse new browser upload authorizations
     DisableUpload,
-    /// Show saved read and upload settings without contacting the TPM or server
+    /// Allow browser directory renames and deletions (requires read access)
+    EnableManage,
+    /// Refuse new browser directory management authorizations
+    DisableManage,
+    /// Show saved browser permissions without contacting the TPM or server
     Status,
 }
 
@@ -269,11 +273,20 @@ async fn main() -> Result<()> {
                     "web_uploads_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
                 );
             }
+            Some(WebFilesAction::EnableManage | WebFilesAction::DisableManage) => {
+                let enabled = matches!(action, Some(WebFilesAction::EnableManage));
+                client::set_web_management(&config_path, enabled)?;
+                println!(
+                    "web_management_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
+                );
+            }
             Some(WebFilesAction::Status) | None => {
                 let config = client::load_config(&config_path)?;
                 println!(
-                    "web_files_enabled={}\nweb_uploads_enabled={}",
-                    config.web_files_enabled, config.web_uploads_enabled
+                    "web_files_enabled={}\nweb_uploads_enabled={}\nweb_management_enabled={}",
+                    config.web_files_enabled,
+                    config.web_uploads_enabled,
+                    config.web_management_enabled
                 );
             }
         },

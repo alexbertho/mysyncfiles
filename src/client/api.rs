@@ -25,6 +25,7 @@ pub struct Api {
     origin_key: ed25519_dalek::VerifyingKey,
     web_files_enabled: bool,
     web_uploads_enabled: bool,
+    web_management_enabled: bool,
     communication: Arc<Mutex<(crate::web_status_protocol::CommunicationState, Option<i64>)>>,
 }
 
@@ -122,6 +123,7 @@ impl Api {
             origin_key,
             web_files_enabled: config.web_files_enabled,
             web_uploads_enabled: config.web_uploads_enabled,
+            web_management_enabled: config.web_management_enabled,
             http,
             base: config.server.trim_end_matches('/').to_owned(),
             signer: crate::tpm::RequestSigner::new(
@@ -223,13 +225,19 @@ impl Api {
             crate::auth_protocol::now(),
         )?;
         anyhow::ensure!(
-            !matches!(claims.scope.as_str(), "files.read" | "files.write")
-                || self.web_files_enabled,
+            !matches!(
+                claims.scope.as_str(),
+                "files.read" | "files.write" | "files.manage"
+            ) || self.web_files_enabled,
             "files_read_disabled"
         );
         anyhow::ensure!(
             claims.scope != "files.write" || self.web_uploads_enabled,
             "files_write_disabled"
+        );
+        anyhow::ensure!(
+            claims.scope != "files.manage" || self.web_management_enabled,
+            "files_manage_disabled"
         );
         Ok(claims)
     }

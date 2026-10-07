@@ -42,6 +42,8 @@ La version **0.3.10** ajoute l’autorisation de lecture web `mysync web-files` 
 
 La version **0.3.11** ajoute des routes d’envoi au serveur et le consentement client distinct `mysync web-files enable-upload` pour le glisser-déposer. Elle nécessite une reconstruction du serveur et la publication de cette release cliente signée ; remplacer seulement les fichiers `web/` ne suffit pas. Un client 0.3.10 ne connaît pas `enable-upload`. La reconstruction, le déploiement, la publication signée et l’activation du consentement sont des opérations distinctes. Voir [ajouter des fichiers](web-files.md#ajouter-des-fichiers).
 
+La version **0.3.12** ajoute la gestion des dossiers Atlas et le consentement client distinct `mysync web-files enable-manage`. Elle exige une mise à jour du serveur et une release cliente signée publiée séparément. Les consentements de lecture et d’envoi n’accordent pas la gestion des dossiers. Voir [gérer les dossiers](web-files.md#gerer-les-dossiers).
+
 ```sh
 mysync-release publish --secret-key /chemin/prive/cle-signature \
   --binary target/release/mysync --version VERSION \

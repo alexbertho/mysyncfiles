@@ -61,14 +61,14 @@
         </div>
         <button id="details-dismiss" class="panel-backdrop" type="button" tabindex="-1" aria-label="Fermer les détails" hidden></button>
         <aside id="details" class="details" aria-labelledby="detail-name" tabindex="-1" hidden>
-          <div class="details-header"><span>Détails du fichier</span><button id="details-close" class="icon-button" type="button" aria-label="Fermer les détails"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
+          <div class="details-header"><span id="detail-heading">Détails du fichier</span><button id="details-close" class="icon-button" type="button" aria-label="Fermer les détails"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
           <div class="details-content" tabindex="0" role="group" aria-label="Informations du fichier">
             <svg id="detail-icon" class="detail-icon" aria-hidden="true"><use href="/atlas-icons.svg#file"></use></svg>
             <h2 id="detail-name"></h2>
             <p class="detail-path-label">Chemin</p><p id="detail-path" class="mono"></p>
-            <dl><div><dt>Taille</dt><dd id="detail-size"></dd></div><div><dt>Dernière modification</dt><dd id="detail-modified"></dd></div><div class="detail-technical"><dt>Révision</dt><dd id="detail-revision"></dd></div><div><dt>SHA-256</dt><dd id="detail-hash" class="mono"></dd></div></dl>
+            <dl><div><dt>Taille</dt><dd id="detail-size"></dd></div><div><dt>Dernière modification</dt><dd id="detail-modified"></dd></div><div id="detail-count-row" hidden><dt>Fichiers, sous-dossiers compris</dt><dd id="detail-count"></dd></div><div id="detail-revision-row" class="detail-technical"><dt>Révision</dt><dd id="detail-revision"></dd></div><div id="detail-hash-row"><dt>SHA-256</dt><dd id="detail-hash" class="mono"></dd></div></dl>
           </div>
-          <div class="details-footer"><button id="detail-download" class="primary" type="button"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button></div>
+          <div class="details-footer"><button id="detail-download" class="primary" type="button"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button><button id="detail-open" class="primary" type="button" hidden>Ouvrir le dossier</button></div>
         </aside>
       </section>
       <section id="status-panel" class="status-panel" aria-labelledby="status-title" hidden>
@@ -86,10 +86,22 @@
     </main>
   </div>
   <div id="file-menu" class="file-menu" role="menu" aria-label="Actions du fichier" hidden>
+    <button type="button" role="menuitem" data-action="open" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#directory"></use></svg>Ouvrir</button>
     <button type="button" role="menuitem" data-action="download"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button>
     <button type="button" role="menuitem" data-action="details"><svg aria-hidden="true"><use href="/atlas-icons.svg#info"></use></svg>Voir les détails</button>
     <button type="button" role="menuitem" data-action="copy"><svg aria-hidden="true"><use href="/atlas-icons.svg#copy"></use></svg>Copier le chemin</button>
+    <button type="button" role="menuitem" data-action="rename" hidden>Renommer</button>
+    <button type="button" role="menuitem" data-action="delete" class="danger" hidden>Supprimer</button>
   </div>
+  <dialog id="folder-dialog" class="folder-dialog" aria-labelledby="folder-title" aria-describedby="folder-description">
+    <form id="folder-form">
+      <h2 id="folder-title"></h2><p id="folder-description"></p>
+      <div id="folder-name-field"><label for="folder-name">Nouveau nom</label><input id="folder-name" type="text" maxlength="255" autocomplete="off"></div>
+      <p id="folder-error" role="alert" hidden></p>
+      <p id="folder-help" hidden>Autorisez la gestion des dossiers avec <code>mysync web-files enable-manage</code>, puis relancez le client. Cette commande nécessite un client compatible et la lecture web activée.</p>
+      <div class="folder-buttons"><button id="folder-cancel" class="text-button" type="button">Annuler</button><button id="folder-confirm" class="primary" type="submit" disabled></button></div>
+    </form>
+  </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg><span id="toast-message"></span><button id="download-cancel" class="text-button" type="button" hidden>Annuler</button><button id="toast-close" class="icon-button" type="button" aria-label="Fermer le message"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
   <section id="upload-status" class="upload-status" aria-label="Envoi de fichiers" hidden>
     <div class="upload-status-heading"><p id="upload-message" role="status" aria-live="polite"></p><button id="upload-cancel" class="text-button" type="button">Annuler</button><button id="upload-close" class="icon-button" type="button" aria-label="Fermer le suivi d’envoi" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>

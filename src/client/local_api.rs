@@ -297,6 +297,7 @@ async fn handle_allowed(state: &BridgeState, request: Request<Body>) -> Response
                 match error.to_string().as_str() {
                     "files_read_disabled" => "files_read_disabled",
                     "files_write_disabled" => "files_write_disabled",
+                    "files_manage_disabled" => "files_manage_disabled",
                     _ => "invalid_challenge",
                 },
             );

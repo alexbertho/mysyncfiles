@@ -23,6 +23,9 @@ const MAX_PENDING: i64 = 4;
 // Also bound consumed rows and repeated issuance within each five-minute session.
 const MAX_CHALLENGES: i64 = 32;
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' http://127.0.0.1:47831; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+// Browser PDF readers install their own privileged viewer document. The HTML
+// shell's resource restrictions prevent Chromium from rendering that viewer.
+const PDF_CSP: &str = "base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 
 pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
     let tx = db.unchecked_transaction()?;
@@ -41,6 +44,9 @@ pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
             challenge_id TEXT NOT NULL, device_id INTEGER NOT NULL, enrollment_id TEXT NOT NULL,
             expires_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS web_file_write_grants(
+            session_hash TEXT PRIMARY KEY REFERENCES web_file_grants(session_hash) ON DELETE CASCADE,
+            challenge_id TEXT NOT NULL, expires_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS web_file_manage_grants(
             session_hash TEXT PRIMARY KEY REFERENCES web_file_grants(session_hash) ON DELETE CASCADE,
             challenge_id TEXT NOT NULL, expires_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS web_file_uploads(
@@ -79,7 +85,7 @@ pub(super) fn public_origin(state: &ServerState) -> Result<String, ApiError> {
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "server_unavailable"))
 }
 
-fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(super) fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     let mut values = headers.get_all(name).iter();
     let value = values.next()?.to_str().ok()?;
     if values.next().is_some() {
@@ -164,6 +170,7 @@ pub(super) async fn middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    let pdf = request.uri().path() == "/v1/web/files/pdf";
     let result = async {
         let _permit = state
             .web_status_limit
@@ -175,11 +182,18 @@ pub(super) async fn middleware(
                 .path()
                 .strip_prefix("/v1/web/files/uploads/")
                 .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+        let directory = request.method() == axum::http::Method::POST
+            && matches!(
+                request.uri().path(),
+                "/v1/web/files/directories/rename" | "/v1/web/files/directories/delete"
+            );
         let (parts, body) = request.into_parts();
         let bytes = to_bytes(
             body,
             if chunk {
                 crate::model::UPLOAD_CHUNK_BYTES as usize
+            } else if directory {
+                32 * 1024
             } else {
                 MAX_JSON_BYTES
             },
@@ -200,7 +214,16 @@ pub(super) async fn middleware(
     headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
-    headers.insert("content-security-policy", CSP.parse().unwrap());
+    let csp = if pdf
+        && headers
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|value| value == "application/pdf")
+    {
+        PDF_CSP
+    } else {
+        CSP
+    };
+    headers.insert("content-security-policy", csp.parse().unwrap());
     response
 }
 
@@ -285,7 +308,7 @@ pub(super) fn issue_challenge(
         .as_deref()
         .map(|id| verified_result(&tx, &session, id).map(|p| p.device_id))
         .transpose()?;
-    if scope == "files.write" {
+    if matches!(scope, "files.write" | "files.manage") {
         // A write challenge belongs to the device whose read grant is open.
         expected_device_id = Some(
             tx.query_row(
@@ -400,6 +423,7 @@ fn accept_proof(
         // status cookie and status.read tickets never receive file authority.
         let expires = now() + FILES_SESSION_SECONDS;
         tx.execute("DELETE FROM web_file_write_grants WHERE session_hash=(SELECT session_hash FROM web_status_challenges WHERE id=?1)", [&claims.challenge_id]).map_err(ApiError::internal)?;
+        tx.execute("DELETE FROM web_file_manage_grants WHERE session_hash=(SELECT session_hash FROM web_status_challenges WHERE id=?1)", [&claims.challenge_id]).map_err(ApiError::internal)?;
         tx.execute("INSERT INTO web_file_grants(session_hash,challenge_id,device_id,enrollment_id,expires_at)
             SELECT session_hash,id,?2,?3,?4 FROM web_status_challenges WHERE id=?1
             ON CONFLICT(session_hash) DO UPDATE SET challenge_id=excluded.challenge_id,device_id=excluded.device_id,enrollment_id=excluded.enrollment_id,expires_at=excluded.expires_at",
@@ -414,6 +438,17 @@ fn accept_proof(
         // Explicit write proof only; never extends the read session or allows
         // another enrollment to inherit its contents or outstanding uploads.
         let updated = tx.execute("INSERT INTO web_file_write_grants(session_hash,challenge_id,expires_at)
+            SELECT g.session_hash,?1,g.expires_at FROM web_file_grants g
+            JOIN web_status_challenges c ON c.session_hash=g.session_hash
+            WHERE c.id=?1 AND g.device_id=?2 AND g.enrollment_id=?3 AND g.expires_at>?4
+            ON CONFLICT(session_hash) DO UPDATE SET challenge_id=excluded.challenge_id,expires_at=excluded.expires_at",
+            params![claims.challenge_id, device_id, enrollment_id, now()]).map_err(ApiError::internal)?;
+        if updated != 1 {
+            return Err(denied());
+        }
+    }
+    if claims.scope == "files.manage" {
+        let updated = tx.execute("INSERT INTO web_file_manage_grants(session_hash,challenge_id,expires_at)
             SELECT g.session_hash,?1,g.expires_at FROM web_file_grants g
             JOIN web_status_challenges c ON c.session_hash=g.session_hash
             WHERE c.id=?1 AND g.device_id=?2 AND g.enrollment_id=?3 AND g.expires_at>?4

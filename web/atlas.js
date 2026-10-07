@@ -85,7 +85,7 @@
   let upload, pickerContext, dragDepth = 0, dragCancelled = false;
   let directory = "", search = "", cursors = [""], pageIndex = 0, next;
   let displayedQuery, displayedEntries, retryView;
-  let selected, selectedButton, menuEntry, menuButton, searchTimer, toastTimer;
+  let selected, selectedButton, menuEntry, menuButton, searchTimer, toastTimer, detailsTimer, folderAction, folderRequest;
   let epoch = 0;
   let channel;
   try { channel = new BroadcastChannel("mysync-files"); channel.onmessage = event => { if (event.data === "logout") lock("expired"); }; } catch (_) {}
@@ -119,12 +119,14 @@
     menuEntry = undefined; menuButton = undefined;
   }
   function closeDetails(focus = false) {
+    clearTimeout(detailsTimer);
     $("details").hidden = true;
     $("details-dismiss").hidden = true;
     document.querySelector(".file-list").inert = false;
     for (const id of ["detail-name", "detail-path", "detail-size", "detail-modified", "detail-revision", "detail-hash"]) $(id).textContent = "";
     document.querySelectorAll("tr.selected").forEach(row => row.classList.remove("selected"));
     selectedButton?.setAttribute("aria-expanded", "false");
+    if (selected?.kind === "directory") selectedButton?.setAttribute("aria-pressed", "false");
     if (focus && selectedButton?.isConnected) selectedButton.focus();
     selected = undefined; selectedButton = undefined;
     updateUploadButton();
@@ -132,6 +134,7 @@
   function hideToast() { clearTimeout(toastTimer); $("toast").hidden = true; $("toast-message").textContent = ""; }
   function lock(state = "initial", message = "") {
     epoch++;
+    folderRequest?.abort(); $("folder-dialog").close(); folderAction = undefined;
     session = undefined;
     clearTimeout(expiry); clearInterval(countdown); clearTimeout(searchTimer);
     listingRequest?.abort(); verification?.abort(); transfer?.abort(); upload?.abort();
@@ -324,6 +327,7 @@
   }
   async function load(view = currentView()) {
     if (!session) return;
+    clearTimeout(detailsTimer);
     listingRequest?.abort(); closeMenu();
     const controller = new AbortController(); listingRequest = controller;
     const current = epoch;
@@ -365,20 +369,43 @@
           if (search) row.classList.add("search-row");
           const nameCell = document.createElement("td");
           const button = document.createElement("button"); button.type = "button"; button.className = "entry-button"; button.title = entry.path;
-          if (entry.kind === "file") { button.setAttribute("aria-controls", "details"); button.setAttribute("aria-expanded", "false"); }
+          button.setAttribute("aria-controls", "details"); button.setAttribute("aria-expanded", "false");
+          if (entry.kind === "directory") button.setAttribute("aria-pressed", "false");
           const text = document.createElement("span"); text.className = "entry-text";
           const name = document.createElement("span"); name.className = "entry-name"; highlighted(name, basename(entry.path)); text.append(name);
           if (search) { const path = document.createElement("span"); path.className = "entry-path"; highlighted(path, entry.path); text.append(path); }
           button.append(icon(kindIcon(entry), `file-icon ${kindIcon(entry)}`), text);
-          button.addEventListener("click", () => entry.kind === "directory" ? navigate(entry.path) : details(entry, button));
-          row.addEventListener("click", event => { if (!event.target.closest("button") && !getSelection()?.toString()) button.click(); });
+          const selectEntry = event => {
+            clearTimeout(detailsTimer);
+            if (entry.kind === "directory") { selectDirectory(entry, button); return; }
+            // Leave time for the second click before the narrow-screen details
+            // overlay makes the file list inert. Keyboard activation is immediate.
+            if (/\.pdf$/i.test(entry.path) && event.detail && matchMedia("(max-width: 1100px)").matches) {
+              const current = epoch;
+              detailsTimer = setTimeout(() => { if (current === epoch && session && button.isConnected) details(entry, button); }, 500);
+            } else details(entry, button);
+          };
+          button.addEventListener("click", selectEntry);
+          if (entry.kind === "directory") {
+            button.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); navigate(entry.path); } });
+            row.addEventListener("dblclick", event => { if (!event.target.closest("button") || button.contains(event.target)) navigate(entry.path); });
+          }
+          row.addEventListener("click", event => { if (!event.target.closest("button") && !getSelection()?.toString()) selectEntry(event); });
+          if (entry.kind === "file" && /\.pdf$/i.test(entry.path)) row.addEventListener("dblclick", event => {
+            if (event.target.closest("button") && !button.contains(event.target)) return;
+            clearTimeout(detailsTimer);
+            if (!session) return;
+            if (entry.size > session.download_limit) { toast("Ce fichier dépasse la limite web de 256 Mio. Retrouvez-le dans votre dossier synchronisé."); return; }
+            const query = new URLSearchParams({path: entry.path, revision: String(entry.revision)});
+            window.open(`/v1/web/files/pdf?${query}`, "_blank", "noopener,noreferrer");
+          });
           nameCell.append(button); row.append(nameCell);
           const sizeCell = document.createElement("td"); sizeCell.textContent = size(entry.size);
           if (entry.kind === "directory") sizeCell.className = "folder-meta";
           const modifiedCell = document.createElement("td"); modifiedCell.append(modifiedTime(entry.updated_at));
           row.append(sizeCell, modifiedCell);
           const actions = document.createElement("td");
-          if (entry.kind === "file") {
+          {
             const more = document.createElement("button"); more.type = "button"; more.className = "more-button";
             more.setAttribute("aria-label", `Actions pour ${basename(entry.path)}`); more.setAttribute("aria-haspopup", "menu"); more.setAttribute("aria-expanded", "false"); more.setAttribute("aria-controls", "file-menu"); more.append(icon("more"));
             more.addEventListener("click", () => openMenu(entry, more)); actions.append(more);
@@ -387,9 +414,16 @@
         }
         $("rows").replaceChildren(rows);
         if (selected) {
-          const index = value.entries.findIndex(entry => entry.kind === "file" && entry.path === selected.path);
+          const index = value.entries.findIndex(entry => entry.kind === selected.kind && entry.path === selected.path);
           if (index < 0) closeDetails();
-          else details(value.entries[index], $("rows").children[index].querySelector(".entry-button"), false);
+          else if (selected.kind === "directory" && $("details").hidden) selectDirectory(value.entries[index], $("rows").children[index].querySelector(".entry-button"));
+          else {
+            const entry = value.entries[index], button = $("rows").children[index].querySelector(".entry-button");
+            details(entry, button, false);
+            if (entry.kind === "directory") {
+              directoryInfo(entry).then(info => { if (current === epoch && selected?.path === entry.path && button.isConnected && !$("details").hidden) details({...entry, ...info}, button, false); }).catch(error => { if (current === epoch && error.code === "session_expired") lock("expired"); });
+            }
+          }
         }
       }
       displayedQuery = query;
@@ -416,13 +450,29 @@
     closeMenu(); closeDetails(); selected = entry; selectedButton = button;
     button.closest("tr")?.classList.add("selected");
     button.setAttribute("aria-expanded", "true");
+    const folder = entry.kind === "directory";
+    if (folder) button.setAttribute("aria-pressed", "true");
+    $("detail-heading").textContent = folder ? "Propriétés du dossier" : "Détails du fichier";
+    $("detail-download").hidden = folder; $("detail-open").hidden = !folder;
+    $("detail-revision-row").hidden = folder; $("detail-hash-row").hidden = folder; $("detail-count-row").hidden = !folder;
+    $("detail-count").textContent = entry.file_count ?? "—";
     $("detail-name").textContent = basename(entry.path); $("detail-path").textContent = entry.path;
-    $("detail-size").textContent = size(entry.size); $("detail-revision").textContent = entry.revision; $("detail-hash").textContent = entry.sha256;
+    $("detail-size").textContent = size(entry.size); $("detail-revision").textContent = entry.revision ?? ""; $("detail-hash").textContent = entry.sha256 ?? "";
     $("detail-modified").replaceChildren(modifiedTime(entry.updated_at, true));
     $("detail-icon").setAttribute("class", `detail-icon ${kindIcon(entry)}`); setIcon("detail-icon", kindIcon(entry));
     $("details").hidden = false;
     detailsLayout();
     if (focus) { document.querySelector(".details-content").scrollTop = 0; $("details").focus({preventScroll: true}); }
+  }
+  function selectDirectory(entry, button) {
+    closeDetails(); selected = entry; selectedButton = button;
+    button.closest("tr")?.classList.add("selected"); button.setAttribute("aria-pressed", "true");
+  }
+  async function directoryInfo(entry, signal) {
+    const value = await request(`/v1/web/files/directories?${new URLSearchParams({path: entry.path})}`, {signal, limit: 32768});
+    if (value.path !== entry.path || !Number.isSafeInteger(value.size) || value.size < 0 || !Number.isSafeInteger(value.file_count) || value.file_count < 1 ||
+        !Number.isSafeInteger(value.updated_at) || value.updated_at < 0 || value.updated_at > 8640000000000 || (value.snapshot !== null && !/^[a-f0-9]{64}$/.test(value.snapshot))) throw new Failure("invalid_response");
+    return value;
   }
   function detailsLayout() {
     const overlay = !$("details").hidden && matchMedia("(max-width: 1100px)").matches;
@@ -433,14 +483,22 @@
   function openMenu(entry, button) {
     if (menuButton === button) { closeMenu(true); return; }
     closeMenu(); menuEntry = entry; menuButton = button;
+    const folder = entry.kind === "directory";
+    if (folder) selectDirectory(entry, button.closest("tr").querySelector(".entry-button"));
+    menu.setAttribute("aria-label", folder ? "Actions du dossier" : "Actions du fichier");
+    for (const action of ["open", "rename", "delete"]) menu.querySelector(`[data-action="${action}"]`).hidden = !folder;
+    menu.querySelector('[data-action="download"]').hidden = folder;
+    menu.querySelector('[data-action="copy"]').hidden = folder;
+    menu.querySelector('[data-action="details"]').lastChild.textContent = folder ? "Propriétés" : "Voir les détails";
+    for (const action of ["rename", "delete"]) { const control = menu.querySelector(`[data-action="${action}"]`); control.disabled = !session?.manage_limit; control.title = control.disabled ? "La gestion nécessite une mise à jour du serveur" : ""; }
     menu.hidden = false; button.setAttribute("aria-expanded", "true");
     const rect = button.getBoundingClientRect();
     menu.style.left = `${Math.max(8, Math.min(innerWidth - menu.offsetWidth - 8, rect.right - menu.offsetWidth))}px`;
     menu.style.top = `${Math.max(8, rect.bottom + menu.offsetHeight + 8 > innerHeight ? rect.top - menu.offsetHeight - 4 : rect.bottom + 4)}px`;
-    menu.querySelector("button").focus();
+    menu.querySelector("button:not([hidden]):not(:disabled)").focus();
   }
   menu.addEventListener("keydown", event => {
-    const buttons = [...menu.querySelectorAll("button")];
+    const buttons = [...menu.querySelectorAll("button:not([hidden]):not(:disabled)")];
     const index = buttons.indexOf(document.activeElement);
     if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
       event.preventDefault();
@@ -452,7 +510,15 @@
     const entry = menuEntry, button = menuButton;
     if (!entry || !action) return;
     closeMenu(true);
-    if (action === "details") details(entry, button.closest("tr").querySelector(".entry-button"));
+    if (action === "open") navigate(entry.path);
+    if (action === "details") {
+      const current = epoch;
+      try {
+        const info = entry.kind === "directory" ? await directoryInfo(entry) : {};
+        if (current === epoch && session && button.isConnected && (entry.kind !== "directory" || selected?.path === entry.path)) details({...entry, ...info}, button.closest("tr").querySelector(".entry-button"));
+      } catch (error) { if (current === epoch && session) { if (error.code === "session_expired") lock("expired"); else toast("Propriétés indisponibles. Actualisez la liste et réessayez."); } }
+    }
+    if (["rename", "delete"].includes(action)) editDirectory(entry, action);
     if (action === "download") download(entry);
     if (action === "copy") {
       const current = epoch;
@@ -475,11 +541,13 @@
   $("details-close").addEventListener("click", () => closeDetails(true));
   $("details-dismiss").addEventListener("click", () => closeDetails(true));
   $("detail-download").addEventListener("click", () => { if (selected) download(selected); });
+  $("detail-open").addEventListener("click", () => { if (selected?.kind === "directory") navigate(selected.path); });
   $("refresh").addEventListener("click", () => { if (!listingRequest) { clearTimeout(searchTimer); load(retryView || currentView()); } });
   $("next-page").addEventListener("click", () => { if (next && !listingRequest) load({...currentView(), pageIndex: pageIndex + 1, cursors: [...cursors.slice(0, pageIndex + 1), next]}); });
   $("previous-page").addEventListener("click", () => { if (pageIndex && !listingRequest) load({...currentView(), pageIndex: pageIndex - 1}); });
   const searchChanged = () => {
     if (!session) return;
+    clearTimeout(detailsTimer);
     clearTimeout(searchTimer); listingRequest?.abort(); closeMenu();
     const view = {directory, search: $("search").value.trim(), pageIndex: 0, cursors: [""]};
     $("clear-search").hidden = !$("search").value;
@@ -602,10 +670,10 @@
     files_write_required: "L’autorisation d’envoi a expiré. Réessayez.",
     invalid_response: "Réponse du serveur invalide. Actualisez la liste avant de réessayer."
   };
-  async function authorizeUpload(signal) {
-    try { await request("/v1/web/files/write/session", {signal}); return; }
-    catch (error) { if (error.code !== "files_write_required") throw error; }
-    const challenge = await post("/v1/web/files/write/challenges", signal);
+  async function authorizeUpload(signal, scope = "write") {
+    try { await request(`/v1/web/files/${scope}/session`, {signal}); return; }
+    catch (error) { if (error.code !== `files_${scope}_required`) throw error; }
+    const challenge = await post(`/v1/web/files/${scope}/challenges`, signal);
     if (!/^[a-f0-9]{64}$/.test(challenge.challenge_id) || typeof challenge.ticket !== "string" || challenge.ticket.length > 2048) throw new Failure("invalid_response");
     let localError;
     try {
@@ -614,13 +682,90 @@
       if (!local.response.ok) localError = local.data.error;
     } catch (_) { /* Check the server even when the bridge acknowledgement is lost. */ }
     if (signal.aborted) throw new Failure("cancelled");
-    try { await request(`/v1/web/files/write/challenges/${challenge.challenge_id}`, {signal}); }
+    try { await request(`/v1/web/files/${scope}/challenges/${challenge.challenge_id}`, {signal}); }
     catch (error) {
-      if (error.code === "pending" && ["files_write_disabled", "files_read_disabled"].includes(localError)) throw new Failure(localError);
+      if (error.code === "pending" && ["files_write_disabled", "files_manage_disabled", "files_read_disabled"].includes(localError)) throw new Failure(localError);
       if (error.code === "pending" && localError === "invalid_challenge") throw new Failure("local_rejected");
       throw error;
     }
   }
+  function closeFolderDialog() {
+    if (folderAction?.sent) return;
+    folderRequest?.abort(); folderAction = undefined; $("folder-dialog").close();
+  }
+  $("folder-cancel").addEventListener("click", closeFolderDialog);
+  $("folder-dialog").addEventListener("cancel", event => { event.preventDefault(); closeFolderDialog(); });
+  async function editDirectory(entry, action) {
+    if (!session || folderAction || upload || transfer) { toast("Attendez la fin de l’opération en cours."); return; }
+    const current = epoch, controller = new AbortController(); folderRequest = controller;
+    const operation = {entry, action, snapshot: undefined, sent: false}; folderAction = operation;
+    const rename = action === "rename";
+    $("folder-title").textContent = rename ? "Renommer le dossier" : "Supprimer le dossier";
+    $("folder-description").textContent = `Chargement des propriétés · ${entry.path}`;
+    $("folder-name-field").hidden = !rename; $("folder-name").value = basename(entry.path); $("folder-name").disabled = false;
+    $("folder-confirm").textContent = rename ? "Renommer" : "Supprimer"; $("folder-confirm").disabled = true;
+    $("folder-cancel").disabled = false; $("folder-error").hidden = true; $("folder-help").hidden = true;
+    $("folder-dialog").showModal();
+    try {
+      const info = await directoryInfo(entry, controller.signal);
+      if (current !== epoch || folderAction !== operation) return;
+      operation.snapshot = info.snapshot;
+      $("folder-description").textContent = rename ? `Le nouveau nom s’appliquera au dossier « ${entry.path} » et à ses ${info.file_count} fichiers, sous-dossiers compris.` :
+        `Supprimer « ${entry.path} » et ses ${info.file_count} fichiers, sous-dossiers compris ? La suppression sera synchronisée sur les appareils. Les fichiers seront conservés 30 jours dans la corbeille serveur.`;
+      if (info.snapshot === null) throw new Failure("directory_too_large");
+      $("folder-confirm").disabled = false;
+      if (rename) { $("folder-name").focus(); $("folder-name").select(); } else $("folder-cancel").focus();
+    } catch (error) {
+      if (current !== epoch || folderAction !== operation || controller.signal.aborted) return;
+      if (error.code === "session_expired") { lock("expired"); return; }
+      $("folder-error").textContent = error.code === "directory_too_large" ? "La gestion web est limitée à 10 000 fichiers par dossier. Utilisez votre dossier synchronisé." : "Propriétés indisponibles. Fermez cette fenêtre, actualisez la liste et réessayez.";
+      $("folder-error").hidden = false;
+    }
+  }
+  $("folder-form").addEventListener("submit", async event => {
+    event.preventDefault();
+    const operation = folderAction;
+    if (!operation?.snapshot || $("folder-confirm").disabled || !session) return;
+    const name = $("folder-name").value;
+    if (operation.action === "rename" && (!name || name === basename(operation.entry.path) || name.includes("/") || name.includes("\\") || new TextEncoder().encode(name).length > 255 || [".", "..", ".mysync-conflicts", ".mysync-staging"].includes(name))) {
+      $("folder-error").textContent = "Saisissez un nouveau nom valide, sans séparateur de dossier (255 octets maximum)."; $("folder-error").hidden = false; $("folder-name").focus(); return;
+    }
+    const current = epoch, controller = new AbortController(); folderRequest = controller;
+    $("folder-confirm").disabled = true; $("folder-name").disabled = true; $("folder-error").hidden = true; $("folder-help").hidden = true;
+    try {
+      await authorizeUpload(controller.signal, "manage");
+      if (controller.signal.aborted || current !== epoch || folderAction !== operation) return;
+      operation.sent = true; $("folder-cancel").disabled = true;
+      const value = await request(`/v1/web/files/directories/${operation.action}`, {method: "POST", signal: controller.signal, limit: 32768,
+        headers: {"Content-Type": "application/json"}, body: JSON.stringify({path: operation.entry.path, snapshot: operation.snapshot, ...(operation.action === "rename" ? {name} : {})})});
+      if (typeof value.path !== "string" || !Number.isSafeInteger(value.file_count) || value.file_count < 1) throw new Failure("invalid_response");
+      if (current !== epoch || folderAction !== operation) return;
+      folderAction = undefined; $("folder-dialog").close();
+      toast(operation.action === "rename" ? "Dossier renommé." : "Dossier supprimé. Les fichiers sont dans la corbeille serveur.");
+      await load();
+    } catch (error) {
+      if (current !== epoch || folderAction !== operation || controller.signal.aborted) return;
+      if (["session_expired", "authentication_refused"].includes(error.code)) { lock("expired"); return; }
+      const messages = {
+        directory_changed: "Le contenu du dossier a changé. Fermez cette fenêtre et actualisez la liste avant de réessayer.",
+        directory_exists: "Ce nom est déjà utilisé par un dossier ou un fichier. Choisissez un autre nom.",
+        directory_not_found: "Ce dossier n’existe plus. Fermez cette fenêtre et actualisez la liste.",
+        invalid_name: "Le nouveau nom ou les chemins résultants dépassent les limites autorisées.",
+        directory_too_large: "La gestion web est limitée à 10 000 fichiers par dossier.",
+        files_manage_disabled: "La gestion des dossiers n’est pas autorisée sur cet appareil.",
+        files_read_disabled: "La lecture web doit aussi être autorisée sur cet appareil.",
+        local_rejected: "Mettez à jour le client local pour autoriser la gestion des dossiers.",
+        files_manage_required: "L’autorisation de gestion a expiré. Réessayez."
+      };
+      $("folder-error").textContent = messages[error.code] || (operation.sent ? "Opération non confirmée. Fermez cette fenêtre et actualisez la liste pour vérifier le résultat." : "Autorisation non confirmée. Vérifiez le client local et réessayez.");
+      $("folder-error").hidden = false;
+      $("folder-help").hidden = !["files_manage_disabled", "files_read_disabled", "local_rejected"].includes(error.code);
+      const retry = !operation.sent || error.code === "directory_exists" || error.code === "invalid_name";
+      $("folder-confirm").disabled = !retry;
+    } finally {
+      if (folderAction === operation) { operation.sent = false; $("folder-cancel").disabled = false; $("folder-name").disabled = false; }
+    }
+  });
   async function sendFiles(files, destination) {
     if (!canUpload() || !files.length) return;
     if (files.length > 50) { toast("Ajoutez au maximum 50 fichiers à la fois."); return; }

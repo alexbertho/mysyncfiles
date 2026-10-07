@@ -110,7 +110,7 @@ fn file_read_consent_is_separate_and_disabled_for_existing_profiles() -> Result<
     assert!(!client::load_config(&config)?.web_files_enabled);
     assert_eq!(
         cli(&config, &["web-files", "status"])?.stdout,
-        b"web_files_enabled=false\nweb_uploads_enabled=false\n"
+        b"web_files_enabled=false\nweb_uploads_enabled=false\nweb_management_enabled=false\n"
     );
     for (action, enabled) in [("enable", true), ("disable", false)] {
         let output = cli(&config, &["web-files", action])?;
@@ -160,5 +160,39 @@ fn upload_consent_requires_a_separate_local_command_and_profile_lock() -> Result
             .success()
     );
     assert!(!client::load_config(&config)?.web_uploads_enabled);
+    Ok(())
+}
+
+#[test]
+fn directory_management_is_disabled_by_default_and_requires_its_own_local_consent() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = temp.path().join("client.json");
+    fs::write(
+        &config,
+        serde_json::to_vec(
+            &serde_json::json!({"server":"https://sync.example.test", "root":temp.path(), "web_files_enabled":true, "web_uploads_enabled":true}),
+        )?,
+    )?;
+    assert!(!client::load_config(&config)?.web_management_enabled);
+    for (action, enabled) in [("enable-manage", true), ("disable-manage", false)] {
+        let output = cli(&config, &["web-files", action])?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let saved = client::load_config(&config)?;
+        assert_eq!(saved.web_management_enabled, enabled);
+        assert!(saved.web_files_enabled && saved.web_uploads_enabled);
+        assert_eq!(fs::metadata(&config)?.permissions().mode() & 0o777, 0o600);
+    }
+    let lock = fs::File::create(config.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    assert!(
+        !cli(&config, &["web-files", "enable-manage"])?
+            .status
+            .success()
+    );
+    assert!(!client::load_config(&config)?.web_management_enabled);
     Ok(())
 }

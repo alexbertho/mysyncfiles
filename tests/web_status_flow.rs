@@ -344,6 +344,76 @@ async fn two_tpms_loopback_presence_replay_revocation_and_daemon_lifecycle() -> 
         .bytes()
         .await?;
         assert_eq!(read.as_ref(), b"uuu");
+        let management: ChallengeResponse =
+            web(reqwest::Method::POST, "/v1/web/files/manage/challenges")
+                .json(&serde_json::json!({}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+        let submission = proof(&management.ticket, &server.url)?;
+        assert_eq!(
+            upload_api
+                .submit_presence(&submission)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "files_manage_disabled"
+        );
+        drop(upload_api);
+        consent.web_management_enabled = true;
+        let manage_api = Api::new(&consent)?;
+        manage_api.submit_presence(&submission).await?;
+        assert_eq!(
+            web(reqwest::Method::POST, "/v1/web/files/directories/delete")
+                .header("content-type", "application/json")
+                .body(vec![b' '; 32 * 1024 + 1])
+                .send()
+                .await?
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let info: serde_json::Value = web(
+            reqwest::Method::GET,
+            "/v1/web/files/directories?path=Projets",
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        let renamed: serde_json::Value = web(
+            reqwest::Method::POST,
+            "/v1/web/files/directories/rename",
+        )
+        .json(
+            &serde_json::json!({"path":"Projets", "snapshot":info["snapshot"], "name":"Archives"}),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(renamed["path"], "Archives");
+        let info: serde_json::Value = web(
+            reqwest::Method::GET,
+            "/v1/web/files/directories?path=Archives",
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        let deleted: serde_json::Value =
+            web(reqwest::Method::POST, "/v1/web/files/directories/delete")
+                .json(&serde_json::json!({"path":"Archives", "snapshot":info["snapshot"]}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+        assert_eq!(deleted["file_count"], 1);
     }
     assert_eq!(
         result(&http, &server.url, &cookie, &first.challenge_id)

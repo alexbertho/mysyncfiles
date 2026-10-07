@@ -1,4 +1,5 @@
 //! Scoped browser access. Status, reading and uploading have separate authority.
+mod directories;
 mod uploads;
 use super::{ApiError, ServerState, web_assets, web_status};
 use crate::{auth_protocol::now, web_status_protocol::*};
@@ -16,6 +17,8 @@ use std::{
     io::{Read, Seek, SeekFrom},
     sync::Arc,
 };
+use tokio::io::AsyncReadExt;
+use tokio_util::io::ReaderStream;
 
 const COOKIE: &str = "__Host-mysync-files";
 const PAGE_SIZE: usize = 200;
@@ -36,7 +39,9 @@ pub(super) fn router() -> Router<Arc<ServerState>> {
         .route("/v1/web/files/challenges/{id}", get(challenge_result))
         .route("/v1/web/files/entries", get(entries))
         .route("/v1/web/files/chunk", get(chunk))
+        .route("/v1/web/files/pdf", get(pdf))
         .merge(uploads::router())
+        .merge(directories::router())
 }
 
 fn failure(status: StatusCode, code: &str) -> ApiError {
@@ -67,6 +72,7 @@ struct FileSession {
     download_limit: i64,
     chunk_bytes: u64,
     upload_limit: i64,
+    manage_limit: usize,
 }
 
 /// Rechecks the specific enrollment and logical device on every metadata/chunk
@@ -87,6 +93,7 @@ fn authorize(db: &Connection, headers: &HeaderMap) -> Result<FileSession, ApiErr
                 download_limit: DOWNLOAD_BYTES,
                 chunk_bytes: CHUNK_BYTES,
                 upload_limit: DOWNLOAD_BYTES,
+                manage_limit: directories::FILE_LIMIT,
             })
         },
     )
@@ -302,6 +309,147 @@ struct ChunkQuery {
     offset: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PdfQuery {
+    path: String,
+    revision: i64,
+}
+
+/// Native PDF navigation cannot attach the fetch-only X-MySync-Web header.
+/// Keep the same scoped cookie authority and reject foreign browser origins.
+async fn pdf(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<PdfQuery>,
+) -> Result<Response, ApiError> {
+    let expected = web_status::public_origin(&state)?;
+    if (headers.contains_key(header::ORIGIN)
+        && web_status::single_header(&headers, "origin") != Some(expected.as_str()))
+        || (headers.contains_key("sec-fetch-site")
+            && !matches!(
+                web_status::single_header(&headers, "sec-fetch-site"),
+                Some("same-origin" | "none")
+            ))
+    {
+        return Err(failure(StatusCode::FORBIDDEN, "authentication_refused"));
+    }
+    state
+        .blocking(move |state| {
+            let db = state.db.lock().unwrap();
+            authorize(&db, &headers)?;
+            super::validate_path(&query.path)?;
+            if !query.path.to_ascii_lowercase().ends_with(".pdf") {
+                return Err(failure(StatusCode::BAD_REQUEST, "invalid_request"));
+            }
+            let entry = super::stored_entry(&db, &query.path)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| failure(StatusCode::NOT_FOUND, "file_not_found"))?;
+            if entry.public.deleted || entry.public.revision != query.revision {
+                return Err(failure(StatusCode::CONFLICT, "revision_changed"));
+            }
+            let size = entry
+                .public
+                .size
+                .ok_or_else(|| ApiError::internal("missing size"))?;
+            if !(0..=DOWNLOAD_BYTES).contains(&size) {
+                return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, "download_too_large"));
+            }
+            let size = size as u64;
+            let range = match pdf_range(&headers, size) {
+                Ok(range) => range,
+                Err(()) => {
+                    return Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+                        .body(Body::empty())
+                        .map_err(ApiError::internal);
+                }
+            };
+            let blob = entry
+                .blob
+                .ok_or_else(|| ApiError::internal("missing blob"))?;
+            let root = crate::local_fs::Mirror::open(&state.data_dir.join("blobs"))
+                .map_err(ApiError::internal)?;
+            let mut file = root
+                .read(&blob)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| failure(StatusCode::NOT_FOUND, "file_not_found"))?;
+            drop(db);
+            let (offset, count) = range.unwrap_or((0, size));
+            file.seek(SeekFrom::Start(offset))
+                .map_err(ApiError::internal)?;
+            let filename: String = query
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .bytes()
+                .map(|byte| format!("%{byte:02X}"))
+                .collect();
+            let mut response = Response::builder()
+                .header(header::CONTENT_TYPE, "application/pdf")
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    format!("inline; filename*=UTF-8''{filename}"),
+                )
+                .header(header::CONTENT_LENGTH, count)
+                .header(header::ACCEPT_RANGES, "bytes");
+            if range.is_some() {
+                response = response.status(StatusCode::PARTIAL_CONTENT).header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {offset}-{}/{size}", offset + count - 1),
+                );
+            }
+            response
+                .body(Body::from_stream(ReaderStream::with_capacity(
+                    tokio::fs::File::from_std(file).take(count),
+                    super::FILE_STREAM_BUFFER_BYTES,
+                )))
+                .map_err(ApiError::internal)
+        })
+        .await
+}
+
+/// Support a single byte range (including open-ended and suffix ranges) used
+/// by browser PDF readers. Reject multipart ranges rather than assembling them.
+fn pdf_range(headers: &HeaderMap, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    if !headers.contains_key(header::RANGE) {
+        return Ok(None);
+    }
+    let range = web_status::single_header(headers, "range")
+        .and_then(|value| value.strip_prefix("bytes="))
+        .ok_or(())?;
+    let (start, end) = range.split_once('-').ok_or(())?;
+    let number = |value: &str| {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(());
+        }
+        value.parse::<u64>().map_err(|_| ())
+    };
+    if size == 0 {
+        return Err(());
+    }
+    if start.is_empty() {
+        let count = number(end)?.min(size);
+        return if count == 0 {
+            Err(())
+        } else {
+            Ok(Some((size - count, count)))
+        };
+    }
+    let start = number(start)?;
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        number(end)?.min(size - 1)
+    };
+    if start > end {
+        return Err(());
+    }
+    Ok(Some((start, end - start + 1)))
+}
+
 async fn chunk(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -440,6 +588,22 @@ mod tests {
                 params![path, blob, contents.len() as i64],
             )?;
             Ok(())
+        }
+        async fn pdf(
+            &self,
+            headers: &HeaderMap,
+            path: &str,
+            revision: i64,
+        ) -> Result<Response, ApiError> {
+            pdf(
+                State(self.state.clone()),
+                headers.clone(),
+                Query(PdfQuery {
+                    path: path.into(),
+                    revision,
+                }),
+            )
+            .await
         }
     }
     #[tokio::test]
@@ -709,6 +873,226 @@ mod tests {
         assert_eq!(root.entries[0].updated_at, Some(500));
         Ok(())
     }
+    #[tokio::test]
+    async fn pdf_url_serves_inline_content_and_browser_byte_ranges() -> Result<()> {
+        let f = Fixture::new()?;
+        let mut headers = f.browser().await?;
+        f.grant(&headers, "files.read").await?;
+        headers.remove("x-mysync-web");
+        headers.remove(header::ORIGIN);
+        headers.insert("sec-fetch-site", "same-origin".parse()?);
+        let content = b"%PDF-1.4\nPDF fixture\n%%EOF\n";
+        let path = "Documents/rapport été #1.PDF";
+        f.entry(path, content)?;
+
+        // Exercise the actual URL and middleware, with navigation headers and
+        // the session cookie rather than the custom fetch header.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/v1/web/files/pdf", listener.local_addr()?);
+        let state = f.state.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, super::super::router(state))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let response = client
+            .get(&url)
+            .headers(headers.clone())
+            .query(&[("path", path), ("revision", "1")])
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+        let disposition = response.headers()[header::CONTENT_DISPOSITION].to_str()?;
+        assert!(disposition.starts_with("inline; filename*=UTF-8''"));
+        assert!(disposition.contains("%C3%A9"));
+        assert!(disposition.contains("%23"));
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            content.len().to_string()
+        );
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let csp = response.headers()["content-security-policy"].to_str()?;
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(
+            !csp.contains("default-src 'none'"),
+            "native PDF readers must be able to render"
+        );
+        assert_eq!(response.bytes().await?.as_ref(), content);
+
+        for (range, start, end) in [
+            ("bytes=0-4", 0, 4),
+            ("bytes=5-", 5, content.len() - 1),
+            ("bytes=-5", content.len() - 5, content.len() - 1),
+            ("bytes=5-999", 5, content.len() - 1),
+        ] {
+            let response = client
+                .get(&url)
+                .headers(headers.clone())
+                .header(header::RANGE, range)
+                .query(&[("path", path), ("revision", "1")])
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                response.headers()[header::CONTENT_RANGE],
+                format!("bytes {start}-{end}/{}", content.len())
+            );
+            assert_eq!(response.bytes().await?.as_ref(), &content[start..=end]);
+        }
+        for range in [
+            "bytes=999-",
+            "bytes=5-2",
+            "bytes=-0",
+            "bytes=0-1,3-4",
+            "bytes=oops",
+            "items=0-1",
+        ] {
+            let response = client
+                .get(&url)
+                .headers(headers.clone())
+                .header(header::RANGE, range)
+                .query(&[("path", path), ("revision", "1")])
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(
+                response.headers()[header::CONTENT_RANGE],
+                format!("bytes */{}", content.len())
+            );
+        }
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pdf_url_requires_scoped_session_and_rechecks_revocation() -> Result<()> {
+        let f = Fixture::new()?;
+        let mut headers = f.browser().await?;
+        headers.remove("x-mysync-web");
+        f.entry("private.pdf", b"%PDF-1.4\n")?;
+        assert_eq!(
+            f.pdf(&headers, "private.pdf", 1).await.err().unwrap().0,
+            StatusCode::UNAUTHORIZED
+        );
+        let proof_headers = f.browser().await?;
+        f.grant(&proof_headers, "status.read").await?;
+        assert_eq!(
+            f.pdf(&proof_headers, "private.pdf", 1)
+                .await
+                .err()
+                .unwrap()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        headers.insert("x-mysync-web", "1".parse()?);
+        f.grant(&headers, "files.read").await?;
+        headers.remove("x-mysync-web");
+        checked(f.pdf(&headers, "private.pdf", 1).await)?;
+        let mut no_cookie = headers.clone();
+        no_cookie.remove(header::COOKIE);
+        assert_eq!(
+            f.pdf(&no_cookie, "private.pdf", 1).await.err().unwrap().0,
+            StatusCode::UNAUTHORIZED
+        );
+        for (name, value) in [
+            ("origin", "https://foreign.example"),
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-site", "same-site"),
+        ] {
+            let mut foreign = headers.clone();
+            foreign.insert(name, value.parse()?);
+            assert_eq!(
+                f.pdf(&foreign, "private.pdf", 1).await.err().unwrap().0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut direct = headers.clone();
+        direct.remove(header::ORIGIN);
+        direct.insert("sec-fetch-site", "none".parse()?);
+        checked(f.pdf(&direct, "private.pdf", 1).await)?;
+        direct.append("sec-fetch-site", "same-origin".parse()?);
+        assert_eq!(
+            f.pdf(&direct, "private.pdf", 1).await.err().unwrap().0,
+            StatusCode::FORBIDDEN
+        );
+        for sql in [
+            "UPDATE devices SET revoked_at=1",
+            "UPDATE devices SET revoked_at=NULL; UPDATE device_enrollments SET approved_at=NULL",
+            "UPDATE device_enrollments SET approved_at=1; UPDATE web_file_grants SET expires_at=1",
+        ] {
+            f.state.db.lock().unwrap().execute_batch(sql)?;
+            assert_eq!(
+                f.pdf(&headers, "private.pdf", 1).await.err().unwrap().0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pdf_url_is_revision_pinned_bounded_and_confined() -> Result<()> {
+        let f = Fixture::new()?;
+        let headers = f.browser().await?;
+        f.grant(&headers, "files.read").await?;
+        f.entry("report.pdf", b"%PDF-1.4\n")?;
+        for (path, revision, status) in [
+            ("report.pdf", 2, StatusCode::CONFLICT),
+            ("missing.pdf", 1, StatusCode::NOT_FOUND),
+            ("../secret.pdf", 1, StatusCode::BAD_REQUEST),
+            ("report.html", 1, StatusCode::BAD_REQUEST),
+        ] {
+            assert_eq!(
+                f.pdf(&headers, path, revision).await.err().unwrap().0,
+                status
+            );
+        }
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE entries SET deleted=1", [])?;
+        assert_eq!(
+            f.pdf(&headers, "report.pdf", 1).await.err().unwrap().0,
+            StatusCode::CONFLICT
+        );
+        f.state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE entries SET deleted=0,size=?1", [DOWNLOAD_BYTES + 1])?;
+        assert_eq!(
+            f.pdf(&headers, "report.pdf", 1).await.err().unwrap().0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        f.entry("empty.pdf", b"")?;
+        let response = checked(f.pdf(&headers, "empty.pdf", 1).await)?;
+        assert!(to_bytes(response.into_body(), 1).await?.is_empty());
+        let mut ranged = headers.clone();
+        ranged.insert(header::RANGE, "bytes=0-0".parse()?);
+        assert_eq!(
+            checked(f.pdf(&ranged, "empty.pdf", 1).await)?.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        ranged.append(header::RANGE, "bytes=1-1".parse()?);
+        assert_eq!(
+            checked(f.pdf(&ranged, "empty.pdf", 1).await)?.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        let blob = f
+            .state
+            .data_dir
+            .join("blobs")
+            .join(crate::auth_protocol::hash(b""));
+        std::fs::remove_file(&blob)?;
+        std::os::unix::fs::symlink("/etc/passwd", blob)?;
+        assert!(f.pdf(&headers, "empty.pdf", 1).await.is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn downloads_are_bounded_revision_pinned_and_refuse_symlinks() -> Result<()> {
         let f = Fixture::new()?;

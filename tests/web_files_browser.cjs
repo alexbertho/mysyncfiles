@@ -9,10 +9,26 @@ const {chromium, firefox} = require("playwright");
 const origin = "https://sync.example.test";
 const root = path.join(__dirname, "../web");
 const csp = fs.readFileSync(path.join(__dirname, "../src/server/web_status.rs"), "utf8").match(/const CSP: &str = "([^"]+)"/)[1];
+const pdfCsp = fs.readFileSync(path.join(__dirname, "../src/server/web_status.rs"), "utf8").match(/const PDF_CSP: &str = "([^"]+)"/)[1];
 const id = "a".repeat(64);
 const screenshotDir = process.env.MYSYNC_SCREENSHOTS;
 const content = Buffer.from("A verified file.\n");
 const digest = crypto.createHash("sha256").update(content).digest("hex");
+const pdfContent = (() => {
+  let data = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const [index, object] of [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << >> >>",
+  ].entries()) {
+    offsets.push(Buffer.byteLength(data));
+    data += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xref = Buffer.byteLength(data);
+  data += `xref\n0 4\n0000000000 65535 f \n${offsets.slice(1).map(offset=>String(offset).padStart(10,"0")+" 00000 n \n").join("")}trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(data);
+})();
 const fixtureTime = Date.parse("2026-10-01T10:00:00Z")/1000;
 const file = (name, size = content.length, revision = 1) => ({kind:"file", path:name, size, revision, sha256:digest, updated_at:fixtureTime+revision*60});
 const fixtures = [
@@ -38,7 +54,7 @@ function listing(entries, query) {
 }
 async function run(type,name) {
   const executablePath=name==="chromium"?process.env.MYSYNC_CHROMIUM:process.env.MYSYNC_FIREFOX;
-  const browser=await type.launch({headless:true,...(executablePath?{executablePath}:{})});
+  const browser=await type.launch({headless:true,...(name==="firefox"?{firefoxUserPrefs:{"pdfjs.disabled":false}}:{}),...(executablePath?{executablePath}:{})});
   console.log(`${name} ${browser.version()}`);
   let counter=0;
   async function setup(options={}) {
@@ -52,8 +68,10 @@ async function run(type,name) {
     page.on("pageerror", e=>errors.push(e.message));
     page.on("console", msg=>{if(msg.type()==="error" && /Content Security Policy|Refused to|violates/.test(msg.text()))violations.push(msg.text());});
     let authorized=options.authorized!==false, entries=options.entries || fixtures, expires=Math.floor(Date.now()/1000)+1800;
-    let mode=options.mode || "normal", calls=0, chunks=0, loggedOut=false;
+    let mode=options.mode || "normal", calls=0, chunks=0, loggedOut=false, pdfs=0;
     let writeAuthorized=false, uploadChunks=0;
+    let manageAuthorized=false;
+    const mutations=[];
     const uploads=new Map(), uploaded=[], cancelled=[], pendingUploads=[];
     const releaseUploads=()=>pendingUploads.splice(0).forEach(resolve=>resolve());
     if(name==="chromium") await context.grantPermissions(["local-network-access"],{origin}).catch(()=>{});
@@ -68,6 +86,13 @@ async function run(type,name) {
         if(mode==="write_impostor") {await route.fulfill({headers,json:{challenge_id:id}});return;}
         writeAuthorized=true;
         if(mode==="write_lost_ack") {await route.abort();return;}
+        await route.fulfill({headers,json:{}});return;
+      }
+      if(route.request().headers()["x-mysync-challenge"]==="manage-ticket") {
+        if(mode==="manage_disabled") {await route.fulfill({status:403,headers,json:{error:"files_manage_disabled"}});return;}
+        if(mode==="manage_impostor") {await route.fulfill({headers,json:{}});return;}
+        manageAuthorized=true;
+        if(mode==="manage_lost_ack") {await route.abort();return;}
         await route.fulfill({headers,json:{}});return;
       }
       if(mode==="disabled") {await route.fulfill({status:403,headers,json:{error:"files_read_disabled"}});return;}
@@ -87,8 +112,42 @@ async function run(type,name) {
         const [asset,contentType]=assets[url.pathname];
         await route.fulfill({contentType,headers:{"Content-Security-Policy":csp,"Cache-Control":"no-store"},body:fs.readFileSync(path.join(root,asset))});return;
       }
+      if(url.pathname.endsWith("/pdf")) {
+        assert.equal(route.request().headers()["x-mysync-web"],undefined,"the PDF uses direct navigation");
+        assert.equal(route.request().isNavigationRequest(),true);
+        assert.equal(authorized,true);
+        const entry=entries.find(entry=>entry.path===url.searchParams.get("path"));
+        assert.ok(entry,"the complete PDF path is preserved");
+        assert.equal(url.searchParams.get("revision"),String(entry.revision));
+        pdfs++;
+        await route.fulfill({contentType:"application/pdf",headers:{"Content-Disposition":"inline","Content-Security-Policy":pdfCsp,"Cache-Control":"no-store"},body:pdfContent});return;
+      }
       assert.equal(route.request().headers()["x-mysync-web"],"1");
-      const fileSession={device_name:"Approved fixture",expires_at:expires,download_limit:268435456,chunk_bytes:8388608,...(!options.oldServer?{upload_limit:268435456}:{})};
+      const fileSession={device_name:"Approved fixture",expires_at:expires,download_limit:268435456,chunk_bytes:8388608,...(!options.oldServer?{upload_limit:268435456,manage_limit:10000}:{})};
+      if(url.pathname.includes("/manage/")) {
+        if(!authorized || expires*1000<=Date.now()) {await route.fulfill({status:401,json:{error:"session_expired"}});return;}
+        if(url.pathname.endsWith("/challenges")) {await route.fulfill({json:{challenge_id:id,ticket:"manage-ticket"}});return;}
+        await route.fulfill(manageAuthorized?{json:fileSession}:url.pathname.endsWith("/session")?{status:403,json:{error:"files_manage_required"}}:{status:202,json:{error:"pending"}});return;
+      }
+      if(url.pathname.startsWith("/v1/web/files/directories")) {
+        if(!authorized || expires*1000<=Date.now()) {await route.fulfill({status:401,json:{error:"session_expired"}});return;}
+        const input=route.request().method()==="GET"?{path:url.searchParams.get("path")}:route.request().postDataJSON();
+        const children=entries.filter(entry=>entry.path.startsWith(input.path+"/"));
+        if(!children.length) {await route.fulfill({status:404,json:{error:"directory_not_found"}});return;}
+        const snapshot=crypto.createHash("sha256").update(JSON.stringify(children.map(e=>[e.path,e.revision]))).digest("hex");
+        if(route.request().method()==="GET") {await route.fulfill({json:{path:input.path,size:children.reduce((sum,e)=>sum+e.size,0),file_count:children.length,updated_at:Math.max(...children.map(e=>e.updated_at)),snapshot}});return;}
+        assert.equal(manageAuthorized,true,"management requires its own local authorization");
+        if(input.snapshot!==snapshot || mode==="directory_changed") {await route.fulfill({status:409,json:{error:"directory_changed"}});return;}
+        let target=input.path;
+        if(url.pathname.endsWith("/rename")) {
+          const slash=input.path.lastIndexOf("/");target=(slash>=0?input.path.slice(0,slash+1):"")+input.name;
+          if(entries.some(e=>e.path===target || e.path.startsWith(target+"/"))) {await route.fulfill({status:409,json:{error:"directory_exists"}});return;}
+          entries=entries.map(e=>children.includes(e)?{...e,path:target+e.path.slice(input.path.length),revision:e.revision+1}:e);
+        } else entries=entries.filter(e=>!children.includes(e));
+        mutations.push({action:url.pathname.split("/").pop(),path:input.path,target});
+        if(mode==="mutation_lost_ack") {await route.abort();return;}
+        await route.fulfill({json:{path:target,file_count:children.length}});return;
+      }
       if(url.pathname.includes("/write/")) {
         if(!authorized || expires*1000<=Date.now()) {await route.fulfill({status:401,json:{error:"session_expired"}});return;}
         if(url.pathname.endsWith("/challenges")) {await route.fulfill({json:{challenge_id:id,ticket:"upload-ticket"}});return;}
@@ -177,7 +236,7 @@ async function run(type,name) {
       releaseListings();releaseUploads();
       await context.close();console.log(`  ${++counter}. ${label}: passed`);
     }
-    return {page,context,capture,matrix,finish,releaseListings,releaseUploads,uploaded,cancelled,uploadChunks:()=>uploadChunks,setMode:v=>mode=v,setEntries:v=>entries=v,setAuthorized:v=>authorized=v,setExpiry:v=>expires=v,calls:()=>calls,chunks:()=>chunks,loggedOut:()=>loggedOut,navigations:()=>navigations};
+    return {page,context,capture,matrix,finish,releaseListings,releaseUploads,uploaded,cancelled,mutations,uploadChunks:()=>uploadChunks,setMode:v=>mode=v,setEntries:v=>entries=v,setAuthorized:v=>authorized=v,setExpiry:v=>expires=v,calls:()=>calls,chunks:()=>chunks,pdfs:()=>pdfs,loggedOut:()=>loggedOut,navigations:()=>navigations};
   }
   async function choose(page, files) {
     const [chooser]=await Promise.all([page.waitForEvent("filechooser"),page.locator("#upload-add").click()]);
@@ -194,12 +253,78 @@ async function run(type,name) {
     },{type,target,files,folder});
   }
   try {
+    for(const viewport of [{width:1440,height:900},{width:390,height:844}]) {
+      const t=await setup({viewport,entries:[file("Documents/a.txt",3),file("Documents/Sub/b.txt",5),file("Other/keep.txt")]});const {page}=t;
+      const folder=page.getByRole("button",{name:"Documents",exact:true});
+      await folder.click();
+      assert.equal(await folder.getAttribute("aria-pressed"),"true");
+      assert.equal(await page.locator("tr.selected").count(),1);
+      assert.equal(await page.locator("#listing-title").textContent(),"Tous les fichiers");
+      assert.equal(await page.locator("#details").isVisible(),false,"single-click only selects a directory");
+      await folder.press("Space");assert.equal(await page.locator("#listing-title").textContent(),"Tous les fichiers");
+      await page.getByRole("button",{name:"Actions pour Documents",exact:true}).click();
+      for(const label of ["Renommer","Supprimer","Propriétés"])assert.equal(await page.getByRole("menuitem",{name:label,exact:true}).isVisible(),true);
+      await page.getByRole("menuitem",{name:"Propriétés",exact:true}).click();
+      await page.locator("#details").waitFor();
+      assert.equal(await page.locator("#detail-count").textContent(),"2");
+      assert.equal(await page.locator("#detail-size").textContent(),"8 o");
+      assert.equal(await page.locator("#detail-hash-row").isVisible(),false);
+      assert.equal(await page.locator("#detail-download").isVisible(),false);
+      t.setEntries([file("Documents/a.txt",3),file("Documents/Sub/b.txt",5),file("Documents/new.txt",1),file("Other/keep.txt")]);
+      // The refresh control stays reachable outside the narrow-screen overlay.
+      if(viewport.width>1100) {
+        await page.locator("#refresh").click();
+        await page.waitForFunction(()=>document.querySelector("#detail-count").textContent==="3");
+      }
+      t.setEntries([file("Documents/a.txt",3),file("Documents/Sub/b.txt",5),file("Other/keep.txt")]);
+      await page.locator("#details-close").click();
+      await folder.dblclick();
+      await page.waitForFunction(()=>document.querySelector("#listing-title").textContent==="Documents");
+      await page.getByRole("button",{name:"Fichiers",exact:true}).click();
+      await folder.press("Enter");
+      await page.waitForFunction(()=>document.querySelector("#listing-title").textContent==="Documents");
+      await page.getByRole("button",{name:"Fichiers",exact:true}).click();
+      await page.getByRole("button",{name:"Actions pour Documents",exact:true}).click();
+      await page.getByRole("menuitem",{name:"Renommer",exact:true}).click();
+      await page.waitForFunction(()=>!document.querySelector("#folder-confirm").disabled);
+      await page.locator("#folder-name").fill("Renamed");await page.locator("#folder-confirm").click();
+      await page.getByRole("button",{name:"Renamed",exact:true}).waitFor();
+      assert.equal(t.mutations[0].action,"rename");
+      await page.getByRole("button",{name:"Actions pour Renamed",exact:true}).click();
+      await page.getByRole("menuitem",{name:"Supprimer",exact:true}).click();
+      await page.waitForFunction(()=>!document.querySelector("#folder-confirm").disabled);
+      assert.match(await page.locator("#folder-description").textContent(),/2 fichiers/);
+      await page.locator("#folder-cancel").click();assert.equal(t.mutations.length,1,"cancellation never submits a deletion");
+      await page.getByRole("button",{name:"Actions pour Renamed",exact:true}).click();
+      await page.getByRole("menuitem",{name:"Supprimer",exact:true}).click();
+      await page.waitForFunction(()=>!document.querySelector("#folder-confirm").disabled);
+      await page.locator("#folder-confirm").click();
+      await page.waitForFunction(()=>document.querySelectorAll("#rows tr").length===1);
+      assert.equal(t.mutations.length,2);assert.match(await page.locator("#rows").textContent(),/Other/);
+      await t.finish(`directory selection, properties, rename and confirmed deletion at ${viewport.width}px`);
+    }
+    for(const mode of ["manage_disabled","manage_impostor","manage_lost_ack","directory_changed","mutation_lost_ack"]) {
+      const t=await setup({mode,entries:[file("Documents/a.txt")]});const {page}=t;
+      await page.getByRole("button",{name:"Actions pour Documents",exact:true}).click();
+      await page.getByRole("menuitem",{name:"Renommer",exact:true}).click();
+      await page.waitForFunction(()=>!document.querySelector("#folder-confirm").disabled);
+      await page.locator("#folder-name").fill("Renamed");await page.locator("#folder-confirm").click();
+      if(mode==="manage_lost_ack") {await page.getByRole("button",{name:"Renamed",exact:true}).waitFor();assert.equal(t.mutations.length,1);}
+      else {
+        await page.locator("#folder-error").waitFor();
+        assert.equal(t.mutations.length,mode==="mutation_lost_ack"?1:0);
+        if(mode==="manage_disabled")assert.equal(await page.locator("#folder-help").isVisible(),true);
+        if(["directory_changed","mutation_lost_ack"].includes(mode))assert.equal(await page.locator("#folder-confirm").isDisabled(),true);
+        await page.locator("#folder-cancel").click();
+      }
+      await t.finish(`directory management ${mode}`);
+    }
     {
       const t=await setup({viewport:{width:1487,height:1058},entries:[
         file("Projets/Application/source.rs"),file("Projets/Documentation/guide.md"),file("Projets/Ressources/image.png"),
         file("Projets/README.md"),file("Projets/architecture-technique.pdf"),file("Projets/notes-projet.txt"),file("Projets/planning.csv")
       ]});const {page}=t;
-      await page.getByRole("button",{name:"Projets",exact:true}).click();
+      await page.getByRole("button",{name:"Projets",exact:true}).dblclick();
       await page.waitForFunction(()=>document.querySelector("#listing-title").textContent==="Projets");
       await drag(page,"dragenter");
       assert.equal(await page.locator("#drop-overlay").isVisible(),true);
@@ -214,6 +339,7 @@ async function run(type,name) {
       await page.waitForFunction(()=>!document.querySelector("#upload-close").hidden);
       assert.equal(t.uploaded[0].path,"Projets/incoming.txt");
       assert.equal(t.uploaded[0].bytes.toString(),"hello");
+      await page.getByRole("button",{name:"incoming.txt",exact:true}).waitFor();
       assert.match(await page.locator("#rows").textContent(),/incoming.txt/);
       await t.finish("direct drop, nested enter/leave, Escape, target path and refresh");
     }
@@ -247,7 +373,7 @@ async function run(type,name) {
       if(action==="cancel")await page.locator("#upload-cancel").click();
       if(action==="logout")await page.locator("#logout").click();
       if(action==="expire")await page.clock.fastForward(3000);
-      if(action==="navigate")await page.getByRole("button",{name:"Projets",exact:true}).click();
+      if(action==="navigate")await page.getByRole("button",{name:"Projets",exact:true}).dblclick();
       t.releaseUploads();
       if(["logout","expire"].includes(action)) {
         await page.locator("#access").waitFor();
@@ -293,7 +419,7 @@ async function run(type,name) {
     {
       const t=await setup();const {page}=t;
       assert.equal(await page.locator("#rows tr").count(),12);
-      assert.equal(await page.locator(".more-button").count(),8,"directories have no action menu");
+      assert.equal(await page.locator(".more-button").count(),12,"files and directories have action menus");
       assert.equal(await page.getByRole("button",{name:"Configurations",exact:true}).locator("xpath=ancestor::tr").locator("td").nth(1).textContent(),"4 Ko");
       assert.equal(await page.getByRole("button",{name:"Projets",exact:true}).locator("xpath=ancestor::tr").locator("td").nth(1).textContent(),"7 Ko");
       assert.equal(await page.locator("#file-table th").nth(2).textContent(),"Dernière modification");
@@ -326,7 +452,7 @@ async function run(type,name) {
       assert.equal(await page.locator("#detail-hash").textContent(),digest);await t.capture("03-details");
       await t.matrix("details");
       await page.keyboard.press("Escape");assert.equal(await page.locator("#details").isVisible(),false);
-      await page.getByRole("button",{name:"Configurations",exact:true}).click();
+      await page.getByRole("button",{name:"Configurations",exact:true}).dblclick();
       await page.waitForFunction(()=>document.querySelector("#listing-title").textContent==="Configurations" && document.querySelectorAll("#rows tr").length===2);
       assert.match(await page.locator("#rows").textContent(),/client.example.json/);
       await page.locator("#breadcrumbs button").first().click();await page.locator("#rows tr").nth(11).waitFor();
@@ -367,7 +493,7 @@ async function run(type,name) {
       const t=await setup({entries:[file(long),file(unsafe)],mobile:true});const {page}=t;
       assert.equal(await page.locator("#sidebar").isVisible(),false);
       assert.equal(await page.locator("#rows img").count(),0);
-      await page.getByRole("button",{name:long,exact:true}).click();assert.equal(await page.locator("#detail-name").textContent(),long);
+      await page.getByRole("button",{name:long,exact:true}).click();await page.locator("#details").waitFor();assert.equal(await page.locator("#detail-name").textContent(),long);
       await t.capture("09-nom-long-mobile");
       await t.matrix("long-name-mobile");
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
@@ -401,7 +527,7 @@ async function run(type,name) {
       const rows=await page.locator("#rows").textContent();
       const listBounds=await page.locator("#file-table").boundingBox();
       t.setMode("held");
-      await page.getByRole("button",{name:"Configurations",exact:true}).click();
+      await page.getByRole("button",{name:"Configurations",exact:true}).dblclick();
       await page.locator("#refresh.is-loading").waitFor();
       assert.equal(await page.locator("#rows").textContent(),rows,"keep the previous listing while waiting");
       assert.equal(await page.locator("#listing-title").textContent(),title,"commit title and rows together");
@@ -439,7 +565,7 @@ async function run(type,name) {
       await page.waitForFunction(()=>document.querySelector("#detail-modified time")?.dateTime==="2026-10-01T11:00:00.000Z");
       assert.equal(await page.getByRole("button",{name:"README.md",exact:true}).locator("xpath=ancestor::tr").locator("time").textContent(),"01/10/2026 13:00","a date-only change must refresh the row");
       await page.locator("#details-close").click();
-      t.setMode("listing_error");await page.getByRole("button",{name:"Configurations",exact:true}).click();
+      t.setMode("listing_error");await page.getByRole("button",{name:"Configurations",exact:true}).dblclick();
       await page.locator("#listing-message").waitFor();
       assert.equal(await page.locator("#rows tr").count(),12,"a failed navigation keeps the previous view");
       assert.equal(await page.locator("#listing-title").textContent(),"Tous les fichiers");
@@ -515,7 +641,7 @@ async function run(type,name) {
       const fullPath=[...folders,long].join("/");
       const t=await setup({mobile:true,entries:[file(fullPath)]});const {page}=t;
       for(const folder of folders) {
-        await page.getByRole("button",{name:folder,exact:true}).click();
+        await page.getByRole("button",{name:folder,exact:true}).dblclick();
         await page.waitForFunction(title=>document.querySelector("#listing-title").textContent===title,folder);
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,"deep paths stay within the page");
       }
@@ -523,6 +649,7 @@ async function run(type,name) {
       assert.equal(await page.locator("#breadcrumbs button").nth(1).getAttribute("title"),folders[0]);
       await t.capture("deep-path-mobile");
       await page.getByRole("button",{name:long,exact:true}).click();
+      await page.locator("#details").waitFor();
       assert.equal(await page.locator("#detail-path").textContent(),fullPath,"details retain the complete path");
       const download=await page.locator("#detail-download").boundingBox();
       assert.ok(download && download.y+download.height<=844,"long names cannot push the download off screen");
@@ -554,6 +681,61 @@ async function run(type,name) {
       await page.locator("#search").fill("README");await page.waitForTimeout(250);await page.locator("#search").fill("Cargo");
       await page.waitForFunction(()=>document.querySelectorAll("#rows tr").length===2);await page.waitForTimeout(700);
       assert.doesNotMatch(await page.locator("#rows").textContent(),/README/);await t.finish("stale search responses");
+    }
+    {
+      const pdfName="rapport été #1.PDF";
+      const t=await setup({entries:[file(`Documents/${pdfName}`,pdfContent.length,7),file("sample.txt"),file("too-large.pdf",268435457)]});
+      const {page,context}=t;
+      let downloaded=false;context.on("page",popup=>popup.on("download",()=>downloaded=true));
+      await page.getByRole("button",{name:"sample.txt",exact:true}).dblclick();
+      assert.equal(context.pages().length,1,"other files keep their details behavior");
+      await page.locator("#details-close").click();
+      await page.getByRole("button",{name:"too-large.pdf",exact:true}).dblclick();
+      assert.match(await page.locator("#toast-message").textContent(),/256 Mio/);
+      assert.equal(context.pages().length,1,"oversized PDFs do not open a new tab");
+      await page.locator("#details-close").click();
+      await page.getByRole("button",{name:"Documents",exact:true}).dblclick();
+      const entry=page.getByRole("button",{name:pdfName,exact:true});
+      await entry.click();
+      assert.equal(context.pages().length,1,"a single click still opens the details");
+      const before=t.navigations();
+      const opened=context.waitForEvent("page");
+      await entry.dblclick();
+      const popup=await opened;
+      await popup.waitForURL(url=>url.pathname==="/v1/web/files/pdf");
+      const url=new URL(popup.url());
+      assert.equal(url.searchParams.get("path"),`Documents/${pdfName}`);
+      assert.equal(url.searchParams.get("revision"),"7");
+      if(name==="firefox") await popup.locator("#viewerContainer .page canvas").waitFor();
+      else {
+        const viewerUrl=url=>url.startsWith("chrome-extension://");
+        let viewer=popup.frames().find(frame=>viewerUrl(frame.url()));
+        if(!viewer) viewer=await popup.waitForEvent("framenavigated",{predicate:frame=>viewerUrl(frame.url())});
+        await viewer.locator("pdf-viewer").waitFor();
+      }
+      assert.equal(await popup.evaluate(()=>window.opener===null),true,"the PDF tab has no access to Atlas");
+      assert.equal(downloaded,false,"the browser displays the PDF inline");
+      assert.equal(t.navigations(),before,"Atlas stays on the current folder");
+      assert.equal(t.chunks(),0,"opening does not assemble a download in JavaScript");
+      assert.equal(t.pdfs(),1);
+      await t.finish("PDF double-click opens a direct URL in an isolated tab");
+    }
+    for(const width of [1100,390]) {
+      const t=await setup({viewport:{width,height:900},entries:[file("report.pdf",pdfContent.length)]});
+      const {page,context}=t;
+      const entry=page.getByRole("button",{name:"report.pdf",exact:true});
+      await entry.click();
+      await page.locator("#details").waitFor();
+      assert.equal(await page.locator(".file-list").evaluate(el=>el.inert),true);
+      await page.locator("#details-close").click();
+      const opened=context.waitForEvent("page");
+      await entry.locator("xpath=ancestor::tr").locator("td").nth(1).dblclick();
+      const popup=await opened;
+      await popup.waitForURL(url=>url.pathname==="/v1/web/files/pdf");
+      await page.waitForTimeout(600);
+      assert.equal(await page.locator("#details").isVisible(),false,"the overlay cannot interrupt a PDF double-click");
+      assert.equal(t.pdfs(),1);
+      await t.finish(`PDF double-click on the row at ${width}px`);
     }
     for(const mode of ["normal","corrupt","changed","download_wait"]) {
       const t=await setup({entries:[file("sample.txt")],mode});const {page}=t;

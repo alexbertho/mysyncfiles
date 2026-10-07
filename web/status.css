@@ -928,6 +928,26 @@ code {
 .file-menu svg {
   color: var(--muted);
 }
+.folder-dialog {
+  width: min(480px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  padding: var(--space-6);
+  box-shadow: var(--shadow);
+}
+.folder-dialog::backdrop { background: #10182788; }
+.folder-dialog h2 { margin: 0 0 var(--space-4); }
+.folder-dialog p { margin: var(--space-4) 0; overflow-wrap: anywhere; }
+.folder-dialog label { display: block; margin-bottom: var(--space-2); }
+.folder-dialog input { width: 100%; padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); }
+.folder-dialog input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.folder-buttons { display: flex; justify-content: flex-end; gap: var(--space-3); margin-top: var(--space-6); }
+.danger, #folder-error { color: #bc3636; }
+:root[data-theme=dark] .danger, :root[data-theme=dark] #folder-error { color: #ff9696; }
 .toast {
   position: fixed;
   z-index: 15;
