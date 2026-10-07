@@ -76,10 +76,10 @@ enum Command {
         #[command(subcommand)]
         action: Option<WebStatusAction>,
     },
-    /// Allow read-only browser file sessions (disabled by default); restart the daemon
+    /// Configure browser file access (disabled by default); restart the daemon
     WebFiles {
         #[command(subcommand)]
-        action: Option<WebStatusAction>,
+        action: Option<WebFilesAction>,
     },
     /// Run one synchronization pass
     Sync,
@@ -102,6 +102,20 @@ enum WebStatusAction {
     /// Disable this browser capability in the client profile
     Disable,
     /// Show the saved setting without contacting the TPM or server
+    Status,
+}
+
+#[derive(Subcommand)]
+enum WebFilesAction {
+    /// Allow read-only browser file sessions
+    Enable,
+    /// Refuse new browser file sessions, including uploads
+    Disable,
+    /// Allow browser uploads as well (requires read access to be enabled)
+    EnableUpload,
+    /// Refuse new browser upload authorizations
+    DisableUpload,
+    /// Show saved read and upload settings without contacting the TPM or server
     Status,
 }
 
@@ -240,24 +254,29 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::WebFiles { action } => {
-            let enabled = match action {
-                Some(WebStatusAction::Enable) => Some(true),
-                Some(WebStatusAction::Disable) => Some(false),
-                Some(WebStatusAction::Status) | None => None,
-            };
-            if let Some(enabled) = enabled {
+        Command::WebFiles { action } => match action {
+            Some(WebFilesAction::Enable | WebFilesAction::Disable) => {
+                let enabled = matches!(action, Some(WebFilesAction::Enable));
                 client::set_web_files(&config_path, enabled)?;
                 println!(
                     "web_files_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
                 );
-            } else {
+            }
+            Some(WebFilesAction::EnableUpload | WebFilesAction::DisableUpload) => {
+                let enabled = matches!(action, Some(WebFilesAction::EnableUpload));
+                client::set_web_uploads(&config_path, enabled)?;
                 println!(
-                    "web_files_enabled={}",
-                    client::load_config(&config_path)?.web_files_enabled
+                    "web_uploads_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
                 );
             }
-        }
+            Some(WebFilesAction::Status) | None => {
+                let config = client::load_config(&config_path)?;
+                println!(
+                    "web_files_enabled={}\nweb_uploads_enabled={}",
+                    config.web_files_enabled, config.web_uploads_enabled
+                );
+            }
+        },
         Command::Sync => print_report(client::sync(&config_path).await?),
         Command::Daemon => client::daemon(&config_path).await?,
         Command::Status => {

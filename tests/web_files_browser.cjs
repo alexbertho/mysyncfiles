@@ -42,7 +42,7 @@ async function run(type,name) {
   console.log(`${name} ${browser.version()}`);
   let counter=0;
   async function setup(options={}) {
-    const context=await browser.newContext({viewport:options.mobile?{width:390,height:844}:{width:1240,height:823}, acceptDownloads:true, timezoneId:"Europe/Paris"});
+    const context=await browser.newContext({viewport:options.viewport || (options.mobile?{width:390,height:844}:{width:1240,height:823}), acceptDownloads:true, timezoneId:"Europe/Paris"});
     const page=await context.newPage();
     const errors=[]; const violations=[];
     let navigations=0;
@@ -53,6 +53,9 @@ async function run(type,name) {
     page.on("console", msg=>{if(msg.type()==="error" && /Content Security Policy|Refused to|violates/.test(msg.text()))violations.push(msg.text());});
     let authorized=options.authorized!==false, entries=options.entries || fixtures, expires=Math.floor(Date.now()/1000)+1800;
     let mode=options.mode || "normal", calls=0, chunks=0, loggedOut=false;
+    let writeAuthorized=false, uploadChunks=0;
+    const uploads=new Map(), uploaded=[], cancelled=[], pendingUploads=[];
+    const releaseUploads=()=>pendingUploads.splice(0).forEach(resolve=>resolve());
     if(name==="chromium") await context.grantPermissions(["local-network-access"],{origin}).catch(()=>{});
     await context.route("http://127.0.0.1:47831/**",async route=>{
       const headers={"Access-Control-Allow-Origin":origin,"Access-Control-Allow-Headers":"X-MySync-Bridge, X-MySync-Challenge","Access-Control-Allow-Private-Network":"true"};
@@ -60,6 +63,13 @@ async function run(type,name) {
       if(mode==="denied") {await route.abort();return;}
       if(mode==="waiting") {await new Promise(resolve=>setTimeout(resolve,4500));await route.fulfill({status:401,headers,json:{error:"challenge_required"}}).catch(()=>{});return;}
       if(!route.request().headers()["x-mysync-challenge"]) {await route.fulfill({status:401,headers,json:{error:"challenge_required"}});return;}
+      if(route.request().headers()["x-mysync-challenge"]==="upload-ticket") {
+        if(mode==="write_disabled") {await route.fulfill({status:403,headers,json:{error:"files_write_disabled"}});return;}
+        if(mode==="write_impostor") {await route.fulfill({headers,json:{challenge_id:id}});return;}
+        writeAuthorized=true;
+        if(mode==="write_lost_ack") {await route.abort();return;}
+        await route.fulfill({headers,json:{}});return;
+      }
       if(mode==="disabled") {await route.fulfill({status:403,headers,json:{error:"files_read_disabled"}});return;}
       if(mode==="rejected" || mode==="misleading_rejection") {
         if(mode==="misleading_rejection")authorized=true;
@@ -78,12 +88,50 @@ async function run(type,name) {
         await route.fulfill({contentType,headers:{"Content-Security-Policy":csp,"Cache-Control":"no-store"},body:fs.readFileSync(path.join(root,asset))});return;
       }
       assert.equal(route.request().headers()["x-mysync-web"],"1");
+      const fileSession={device_name:"Approved fixture",expires_at:expires,download_limit:268435456,chunk_bytes:8388608,...(!options.oldServer?{upload_limit:268435456}:{})};
+      if(url.pathname.includes("/write/")) {
+        if(!authorized || expires*1000<=Date.now()) {await route.fulfill({status:401,json:{error:"session_expired"}});return;}
+        if(url.pathname.endsWith("/challenges")) {await route.fulfill({json:{challenge_id:id,ticket:"upload-ticket"}});return;}
+        await route.fulfill(writeAuthorized?{json:fileSession}:url.pathname.endsWith("/session")?{status:403,json:{error:"files_write_required"}}:{status:202,json:{error:"pending"}});return;
+      }
+      if(url.pathname.startsWith("/v1/web/files/uploads")) {
+        if(!authorized || expires*1000<=Date.now()) {await route.fulfill({status:401,json:{error:"session_expired"}});return;}
+        assert.equal(writeAuthorized,true,"write authority precedes any upload");
+        const method=route.request().method(), uploadId=url.pathname.split("/")[5];
+        if(method==="POST" && !uploadId) {
+          const value=route.request().postDataJSON();
+          if(entries.some(e=>e.path===value.path)) {await route.fulfill({status:409,json:{error:"file_exists"}});return;}
+          const uuid=crypto.randomUUID();uploads.set(uuid,{...value,parts:[],offset:0});
+          await route.fulfill({json:{id:uuid,offset:0}});return;
+        }
+        const value=uploads.get(uploadId);
+        if(!value) {await route.fulfill({status:404,json:{error:"upload_not_found"}});return;}
+        if(method==="DELETE") {cancelled.push(uploadId);uploads.delete(uploadId);await route.fulfill({json:{}});return;}
+        if(method==="PUT") {
+          uploadChunks++;
+          assert.equal(Number(url.searchParams.get("offset")),value.offset);
+          const part=route.request().postDataBuffer();assert.ok(part.length<=8388608);
+          if(mode==="upload_wait")await new Promise(resolve=>pendingUploads.push(resolve));
+          value.parts.push(part);value.offset+=part.length;
+          await route.fulfill({json:{id:uploadId,offset:value.offset}}).catch(()=>{});return;
+        }
+        if(url.pathname.endsWith("/commit")) {
+          const bytes=Buffer.concat(value.parts);
+          assert.equal(bytes.length,value.size);assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"),value.sha256);
+          uploaded.push({...value,bytes});
+          const entry={path:value.path,size:value.size,sha256:value.sha256,revision:42,deleted:false};
+          entries=[...entries,{...entry,kind:"file",updated_at:fixtureTime}];uploads.delete(uploadId);
+          if(mode==="upload_lost_commit") {await route.abort();return;}
+          await route.fulfill({json:entry});return;
+        }
+        throw Error(`Unexpected upload request ${method} ${url.pathname}`);
+      }
       if(url.pathname.endsWith("/logout")) {authorized=false;loggedOut=true;await route.fulfill({json:{}});return;}
       if(url.pathname.endsWith("/session") && route.request().method()==="POST") {loggedOut=false;await route.fulfill({json:{}});return;}
       if(url.pathname.endsWith("/challenges")) {await route.fulfill({json:{challenge_id:id,ticket:"fixture-ticket",expires_at:Math.floor(Date.now()/1000)+60}});return;}
       if(url.pathname.endsWith(`/challenges/${id}`) && !authorized) {await route.fulfill({status:202,json:{error:"pending"}});return;}
       if(!authorized || expires*1000<=Date.now()) {await route.fulfill({status:401,json:{error:"session_expired"}});return;}
-      if(url.pathname.endsWith("/session") || url.pathname.endsWith(`/challenges/${id}`)) {await route.fulfill({json:{device_name:"Approved fixture",expires_at:expires,download_limit:268435456,chunk_bytes:8388608}});return;}
+      if(url.pathname.endsWith("/session") || url.pathname.endsWith(`/challenges/${id}`)) {await route.fulfill({json:fileSession});return;}
       if(url.pathname.endsWith("/entries")) {
         calls++;
         if(mode==="held")await new Promise(resolve=>pendingListings.push(resolve));
@@ -101,7 +149,7 @@ async function run(type,name) {
       throw Error(`Unexpected URL ${url.pathname}`);
     });
     await page.goto(`${origin}/files`);
-    if(authorized)await page.locator("#rows tr").first().waitFor({state:entries.length?"visible":"hidden"});
+    if(authorized && !options.pending)await page.locator("#rows tr").first().waitFor({state:entries.length?"visible":"hidden"});
     async function capture(label) {
       if(screenshotDir){fs.mkdirSync(screenshotDir,{recursive:true});await page.screenshot({path:path.join(screenshotDir,`${name}-${label}.png`)});}
     }
@@ -116,7 +164,7 @@ async function run(type,name) {
           assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${label}: no horizontal overflow`);
           for (const control of ["#theme-toggle", "#sidebar-toggle"]) {
             const box = await page.locator(control).boundingBox();
-            assert.ok(box && box.x >= 0 && box.y >= 0 && box.x + box.width <= (options.mobile ? 390 : 1240));
+          assert.ok(box && box.x >= 0 && box.y >= 0 && box.x + box.width <= page.viewportSize().width);
           }
           await capture(`matrix-${label}-${theme}-${closed ? "closed" : "open"}`);
         }
@@ -126,12 +174,122 @@ async function run(type,name) {
     }
     async function finish(label) {
       assert.deepEqual(errors,[],"JavaScript errors");assert.deepEqual(violations,[],"CSP violations");
-      releaseListings();
+      releaseListings();releaseUploads();
       await context.close();console.log(`  ${++counter}. ${label}: passed`);
     }
-    return {page,context,capture,matrix,finish,releaseListings,setMode:v=>mode=v,setEntries:v=>entries=v,setAuthorized:v=>authorized=v,setExpiry:v=>expires=v,calls:()=>calls,chunks:()=>chunks,loggedOut:()=>loggedOut,navigations:()=>navigations};
+    return {page,context,capture,matrix,finish,releaseListings,releaseUploads,uploaded,cancelled,uploadChunks:()=>uploadChunks,setMode:v=>mode=v,setEntries:v=>entries=v,setAuthorized:v=>authorized=v,setExpiry:v=>expires=v,calls:()=>calls,chunks:()=>chunks,loggedOut:()=>loggedOut,navigations:()=>navigations};
+  }
+  async function choose(page, files) {
+    const [chooser]=await Promise.all([page.waitForEvent("filechooser"),page.locator("#upload-add").click()]);
+    await chooser.setFiles(files);
+  }
+  async function drag(page, type, target="#drop-target", files=[{name:"incoming.txt",text:"hello"}], folder=false) {
+    await page.evaluate(({type,target,files,folder})=>{
+      const data=new DataTransfer();
+      for(const file of files)data.items.add(new File([file.text],file.name,{type:"text/plain"}));
+      const old=Object.getOwnPropertyDescriptor(DataTransferItem.prototype,"webkitGetAsEntry");
+      if(folder)Object.defineProperty(DataTransferItem.prototype,"webkitGetAsEntry",{configurable:true,value:()=>({isDirectory:true})});
+      document.querySelector(target).dispatchEvent(new DragEvent(type,{bubbles:true,cancelable:true,dataTransfer:data}));
+      if(folder) {if(old)Object.defineProperty(DataTransferItem.prototype,"webkitGetAsEntry",old);else delete DataTransferItem.prototype.webkitGetAsEntry;}
+    },{type,target,files,folder});
   }
   try {
+    {
+      const t=await setup({viewport:{width:1487,height:1058},entries:[
+        file("Projets/Application/source.rs"),file("Projets/Documentation/guide.md"),file("Projets/Ressources/image.png"),
+        file("Projets/README.md"),file("Projets/architecture-technique.pdf"),file("Projets/notes-projet.txt"),file("Projets/planning.csv")
+      ]});const {page}=t;
+      await page.getByRole("button",{name:"Projets",exact:true}).click();
+      await page.waitForFunction(()=>document.querySelector("#listing-title").textContent==="Projets");
+      await drag(page,"dragenter");
+      assert.equal(await page.locator("#drop-overlay").isVisible(),true);
+      assert.match(await page.locator("#drop-path").textContent(),/Fichiers \/ Projets/);
+      await drag(page,"dragenter","#rows tr:first-child");await drag(page,"dragleave","#rows tr:first-child");
+      assert.equal(await page.locator("#drop-overlay").isVisible(),true,"nested drag events do not flicker");
+      await t.capture("dragdrop-direct-light");
+      await t.matrix("dragdrop",async()=>{if(!await page.locator("#drop-overlay").isVisible())await drag(page,"dragenter");});
+      await page.keyboard.press("Escape");await drag(page,"drop");
+      assert.equal(t.uploaded.length,0,"Escape cancels the drop");
+      await drag(page,"dragenter");await drag(page,"drop");
+      await page.waitForFunction(()=>!document.querySelector("#upload-close").hidden);
+      assert.equal(t.uploaded[0].path,"Projets/incoming.txt");
+      assert.equal(t.uploaded[0].bytes.toString(),"hello");
+      assert.match(await page.locator("#rows").textContent(),/incoming.txt/);
+      await t.finish("direct drop, nested enter/leave, Escape, target path and refresh");
+    }
+    for(const mode of ["normal","write_lost_ack"]) {
+      const t=await setup({mode});const {page}=t;
+      const files=[{name:"large.bin",mimeType:"application/octet-stream",buffer:Buffer.alloc(8388611,97)},
+        {name:"empty.txt",mimeType:"text/plain",buffer:Buffer.alloc(0)},
+        {name:"README.md",mimeType:"text/plain",buffer:Buffer.from("must not replace")}];
+      await choose(page,files);
+      await page.waitForFunction(()=>!document.querySelector("#upload-close").hidden);
+      assert.equal(t.uploadChunks(),2,"8 MiB chunks, no chunk for an empty file");
+      assert.equal(t.uploaded.length,2);
+      assert.match(await page.locator("#upload-message").textContent(),/2 fichiers envoyés · 1 non envoyé/);
+      assert.match(await page.locator("#upload-results").textContent(),/existant a été conservé/);
+      await t.capture(`upload-${mode}`);await t.finish(`picker, multichunk, zero length, conflict and ${mode}`);
+    }
+    for(const mode of ["write_disabled","write_impostor","upload_lost_commit"]) {
+      const t=await setup({mode});const {page}=t;
+      await choose(page,{name:"sample.txt",mimeType:"text/plain",buffer:Buffer.from("test")});
+      await page.waitForFunction(()=>!document.querySelector("#upload-close").hidden);
+      assert.equal(t.uploaded.length,mode==="upload_lost_commit"?1:0);
+      assert.match(await page.locator("#upload-status").textContent(),mode==="write_disabled"?/n’est pas autorisé/:mode==="write_impostor"?/pas été confirmée/:/non confirmé/);
+      assert.equal(await page.locator("#upload-help").isVisible(),mode==="write_disabled");
+      await t.finish(`upload ${mode}`);
+    }
+    for(const action of ["cancel","logout","expire","navigate"]) {
+      const t=await setup({mode:"upload_wait"});const {page}=t;
+      if(action==="expire") {await page.clock.install();t.setExpiry(Math.floor(Date.now()/1000)+2);await page.reload();await page.locator("#rows tr").first().waitFor();}
+      await choose(page,{name:"pending.txt",mimeType:"text/plain",buffer:Buffer.from("pending")});
+      await page.waitForFunction(()=>document.querySelector("#upload-message").textContent.startsWith("Envoi ·"));
+      if(action==="cancel")await page.locator("#upload-cancel").click();
+      if(action==="logout")await page.locator("#logout").click();
+      if(action==="expire")await page.clock.fastForward(3000);
+      if(action==="navigate")await page.getByRole("button",{name:"Projets",exact:true}).click();
+      t.releaseUploads();
+      if(["logout","expire"].includes(action)) {
+        await page.locator("#access").waitFor();
+        assert.equal(await page.locator("#upload-status").isVisible(),false);
+        assert.equal(await page.locator("#upload-results").textContent(),"");
+      } else {
+        await page.waitForFunction(()=>!document.querySelector("#upload-close").hidden);
+        if(action==="cancel") {assert.equal(t.cancelled.length,1);assert.match(await page.locator("#upload-message").textContent(),/annulé/);}
+        if(action==="navigate") {assert.equal(t.uploaded[0].path,"pending.txt");assert.equal(await page.locator("#listing-title").textContent(),"Projets");}
+      }
+      if(action!=="navigate")assert.equal(t.uploaded.length,0);
+      await t.finish(`upload ${action}`);
+    }
+    {
+      const t=await setup();const {page}=t;
+      await drag(page,"drop","#sidebar");assert.equal(t.uploaded.length,0);
+      await drag(page,"drop","#drop-target",[{name:"folder",text:""}],true);
+      assert.match(await page.locator("#toast-message").textContent(),/fichiers uniquement/);
+      await page.locator("#search").fill("README");
+      await page.waitForFunction(()=>document.querySelector("#listing-title").textContent==="Résultats de recherche");
+      await drag(page,"dragenter");assert.equal(await page.locator("#drop-overlay").isVisible(),false);
+      assert.equal(await page.locator("#upload-add").isDisabled(),true);
+      assert.equal(t.navigations(),1,"dropping outside never navigates");
+      await t.finish("folders and non-target drops refused, search has no ambiguous destination");
+    }
+    {
+      const t=await setup({mobile:true,entries:[]});const {page}=t;
+      await choose(page,{name:"first.txt",mimeType:"text/plain",buffer:Buffer.from("first")});
+      await page.waitForFunction(()=>!document.querySelector("#upload-close").hidden);
+      assert.equal(t.uploaded[0].path,"first.txt");
+      for(const width of [320,390,760,1100]) {
+        await page.setViewportSize({width,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+        const box=await page.locator("#upload-add").boundingBox();assert.ok(box.x>=0&&box.x+box.width<=width);
+      }
+      await page.setViewportSize({width:390,height:844});await t.capture("dragdrop-mobile");
+      await t.finish("empty folder, mobile picker and responsive upload controls");
+    }
+    {
+      const t=await setup({oldServer:true});assert.equal(await t.page.locator("#upload-add").isDisabled(),true);
+      await t.finish("read-only compatibility with previous servers");
+    }
     {
       const t=await setup();const {page}=t;
       assert.equal(await page.locator("#rows tr").count(),12);
@@ -241,11 +399,13 @@ async function run(type,name) {
       const t=await setup();const {page}=t;
       const title=await page.locator("#listing-title").textContent();
       const rows=await page.locator("#rows").textContent();
+      const listBounds=await page.locator("#file-table").boundingBox();
       t.setMode("held");
       await page.getByRole("button",{name:"Configurations",exact:true}).click();
       await page.locator("#refresh.is-loading").waitFor();
       assert.equal(await page.locator("#rows").textContent(),rows,"keep the previous listing while waiting");
       assert.equal(await page.locator("#listing-title").textContent(),title,"commit title and rows together");
+      assert.deepEqual(await page.locator("#file-table").boundingBox(),listBounds,"loading must not move or resize the list");
       assert.equal(await page.locator("#listing-message").isVisible(),false);
       assert.equal(await page.locator("#refresh").getAttribute("aria-disabled"),"true");
       await page.emulateMedia({reducedMotion:"reduce"});
@@ -289,6 +449,95 @@ async function run(type,name) {
       await page.waitForFunction(()=>document.querySelectorAll("#rows tr").length===12);
       assert.equal(t.navigations(),1,"the brand link must not reload the document");
       await t.finish("stable navigation, refresh, details and retry after failure");
+    }
+    for (const viewport of [{width:1920,height:1080},{width:1440,height:900},{width:1100,height:900},{width:768,height:1024},{width:760,height:900},{width:390,height:844},{width:320,height:740}]) {
+      const t=await setup({viewport});const {page}=t;
+      const inViewport=async selector=>{
+        const box=await page.locator(selector).boundingBox();
+        assert.ok(box && box.x>=0 && box.y>=0 && box.x+box.width<=viewport.width+1 && box.y+box.height<=viewport.height+1,`${selector} must remain reachable at ${viewport.width}px`);
+      };
+      for (const theme of ["light","dark"]) {
+        if(await page.locator("html").getAttribute("data-theme")!==theme)await page.locator("#theme-toggle").click();
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,"no page overflow");
+        for(const control of ["#search-box","#sidebar-toggle","#theme-toggle","#refresh"])await inViewport(control);
+        assert.ok((await page.locator("#rows tr").first().locator("td").last().boundingBox()).width>=40,"actions retain their own column when dates are hidden");
+        if(viewport.width<=760)assert.ok((await page.locator("#search-box").boundingBox()).width>=240,"mobile search has room for a useful query");
+        await t.capture(`viewport-${viewport.width}-${theme}-list`);
+        const entry=page.getByRole("button",{name:"README.md",exact:true});
+        const row=entry.locator("xpath=ancestor::tr");
+        await row.locator("td").nth(1).click();
+        assert.equal(await entry.getAttribute("aria-expanded"),"true","row click opens the associated details");
+        assert.equal(await page.locator("tr.selected").count(),1);
+        assert.equal(await page.locator("#detail-name").textContent(),"README.md");
+        for(const control of ["#details-close","#detail-download"])await inViewport(control);
+        assert.equal(await page.locator(".file-list").evaluate(el=>el.inert),viewport.width<=1100,"overlay prevents focus on covered files");
+        await t.capture(`viewport-${viewport.width}-${theme}-details`);
+        if(viewport.width>480 && viewport.width<=1100)await page.locator("#details-dismiss").click({position:{x:8,y:80}});
+        else await page.keyboard.press("Escape");
+        assert.equal(await entry.getAttribute("aria-expanded"),"false");
+        assert.equal(await entry.evaluate(el=>el===document.activeElement),true,"closing details restores file focus");
+        assert.equal(await page.locator(".file-list").evaluate(el=>el.inert),false);
+        await page.getByRole("button",{name:"Actions pour README.md",exact:true}).click();
+        await inViewport("#file-menu");
+        await t.capture(`viewport-${viewport.width}-${theme}-menu`);
+        await page.keyboard.press("Escape");
+        await page.locator("#search").fill("config");
+        await page.waitForFunction(()=>document.querySelectorAll("#rows tr").length===5);
+        await t.capture(`viewport-${viewport.width}-${theme}-search`);
+        await page.locator("#clear-search").click();
+        await page.locator("#rows tr").nth(11).waitFor();
+      }
+      await t.finish(`responsive list, search, menu and details at ${viewport.width}px`);
+    }
+    {
+      const t=await setup({mode:"held",pending:true,mobile:true});const {page}=t;
+      await page.locator("#refresh.is-loading").waitFor();
+      assert.equal(await page.locator("#empty").isVisible(),false,"initial loading cannot claim the space is empty");
+      assert.match(await page.locator("#count").textContent(),/Chargement/);
+      const initialTableTop=(await page.locator("#file-table").boundingBox()).y;
+      await t.capture("initial-loading-mobile");
+      t.setMode("listing_error");t.releaseListings();
+      await page.locator("#listing-message").waitFor();
+      assert.match(await page.locator("#count").textContent(),/indisponible/);
+      await t.capture("initial-error-mobile");
+      t.setMode("normal");await page.locator("#refresh").click();
+      await page.locator("#rows tr").nth(11).waitFor();
+      assert.equal((await page.locator("#file-table").boundingBox()).y,initialTableTop,"initial loading reserves the breadcrumb height");
+      t.setMode("listing_error");await page.locator("#refresh").click();
+      await page.locator("#listing-message").waitFor();
+      assert.equal(await page.locator("#rows tr").count(),12);
+      await t.capture("refresh-error-mobile");
+      await t.finish("initial loading, visible errors and recovery on mobile");
+    }
+    {
+      const folders=["Archives-"+"documentation-".repeat(5),"Rapports-"+"synchronisation-".repeat(4),"2026"];
+      const long="rapport-"+"documentation-".repeat(13)+"final.pdf";
+      const fullPath=[...folders,long].join("/");
+      const t=await setup({mobile:true,entries:[file(fullPath)]});const {page}=t;
+      for(const folder of folders) {
+        await page.getByRole("button",{name:folder,exact:true}).click();
+        await page.waitForFunction(title=>document.querySelector("#listing-title").textContent===title,folder);
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,"deep paths stay within the page");
+      }
+      assert.equal(await page.locator("#breadcrumbs [aria-current=page]").textContent(),"2026");
+      assert.equal(await page.locator("#breadcrumbs button").nth(1).getAttribute("title"),folders[0]);
+      await t.capture("deep-path-mobile");
+      await page.getByRole("button",{name:long,exact:true}).click();
+      assert.equal(await page.locator("#detail-path").textContent(),fullPath,"details retain the complete path");
+      const download=await page.locator("#detail-download").boundingBox();
+      assert.ok(download && download.y+download.height<=844,"long names cannot push the download off screen");
+      await t.capture("deep-path-mobile-details");
+      await page.locator(".details-content").evaluate(el=>{el.scrollTop=el.scrollHeight;});
+      const hash=await page.locator("#detail-hash").boundingBox();
+      assert.ok(hash && hash.y>=0 && hash.y+hash.height<=download.y,"all metadata is reachable independently of the action");
+      await t.capture("deep-path-mobile-metadata");
+      await page.setViewportSize({width:1440,height:900});
+      await page.waitForFunction(()=>!document.querySelector(".file-list").inert);
+      await page.setViewportSize({width:768,height:1024});
+      await page.waitForFunction(()=>document.querySelector(".file-list").inert);
+      await page.locator("#details-close").click();
+      assert.equal(await page.locator("#details-dismiss").isVisible(),false);
+      await t.finish("deep breadcrumbs, long details and resizing between panel modes");
     }
     {
       const t=await setup({entries:Array.from({length:201},(_,i)=>file(`page-${String(i).padStart(3,"0")}.txt`))});const {page}=t;

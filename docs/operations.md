@@ -40,6 +40,8 @@ profils, signatures, contrôles de révision et copies de conflits restent compa
 
 La version **0.3.10** ajoute l’autorisation de lecture web `mysync web-files` pour l’explorateur Atlas. Le client 0.3.9 publié ne peut vérifier que la présence `/status` ; publier cette nouvelle version cliente signée est nécessaire pour utiliser `/files`. Après `mysync update`, arrêter le daemon avant `mysync web-files enable`, puis relancer le service déjà installé. Ce consentement reste désactivé par défaut. Le serveur doit également inclure Atlas ; son interface HTML/CSS/JavaScript native se modifie ensuite à chaud dans `web/`. Voir le [guide d’activation](web-files.md).
 
+La version **0.3.11** ajoute des routes d’envoi au serveur et le consentement client distinct `mysync web-files enable-upload` pour le glisser-déposer. Elle nécessite une reconstruction du serveur et la publication de cette release cliente signée ; remplacer seulement les fichiers `web/` ne suffit pas. Un client 0.3.10 ne connaît pas `enable-upload`. La reconstruction, le déploiement, la publication signée et l’activation du consentement sont des opérations distinctes. Voir [ajouter des fichiers](web-files.md#ajouter-des-fichiers).
+
 ```sh
 mysync-release publish --secret-key /chemin/prive/cle-signature \
   --binary target/release/mysync --version VERSION \

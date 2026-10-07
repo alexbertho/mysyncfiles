@@ -743,9 +743,22 @@ fn commit_upload(
     digest: String,
     size: i64,
 ) -> Result<Entry, ApiError> {
+    commit_upload_checked(state, path, base, temp_path, digest, size, |_| Ok(()))
+}
+
+fn commit_upload_checked(
+    state: &ServerState,
+    path: &str,
+    base: i64,
+    temp_path: &Path,
+    digest: String,
+    size: i64,
+    authorize: impl FnOnce(&Connection) -> Result<(), ApiError>,
+) -> Result<Entry, ApiError> {
     validate_path(path)?;
     let mut db = state.db.lock().unwrap();
     let tx = db.transaction().map_err(ApiError::internal)?;
+    authorize(&tx)?;
     check_path_namespace(&tx, path)?;
     let previous = stored_entry(&tx, path).map_err(ApiError::internal)?;
     let current_revision = previous
@@ -845,7 +858,9 @@ async fn begin_upload(
                 .query_row(
                     "SELECT id, received_size, temp_name FROM uploads
              WHERE device_id = ?1 AND path = ?2 AND base_revision = ?3
-               AND size = ?4 AND sha256 = ?5 ORDER BY touched_at DESC LIMIT 1",
+               AND size = ?4 AND sha256 = ?5
+               AND NOT EXISTS(SELECT 1 FROM web_file_uploads w WHERE w.upload_id=uploads.id)
+               ORDER BY touched_at DESC LIMIT 1",
                     params![
                         device_id,
                         request.path,
@@ -1253,9 +1268,14 @@ pub fn purge_trash_item(state: &ServerState, id: i64) -> Result<bool> {
 pub fn purge_upload_sessions(state: &ServerState) -> Result<usize> {
     let active = state.active_uploads.lock().unwrap();
     let db = state.db.lock().unwrap();
-    let mut query = db.prepare("SELECT id, temp_name FROM uploads WHERE touched_at < ?1")?;
+    // Keep web ownership rows after logout so abandoned temporary files can
+    // be collected; their upload foreign key is removed with the upload.
+    let mut query = db.prepare("SELECT id, temp_name FROM uploads WHERE touched_at < ?1
+        OR EXISTS(SELECT 1 FROM web_file_uploads w WHERE w.upload_id=uploads.id
+            AND NOT EXISTS(SELECT 1 FROM web_file_write_grants g
+                WHERE g.session_hash=w.session_hash AND g.challenge_id=w.grant_id AND g.expires_at>?2))")?;
     let stale = query
-        .query_map([now() - UPLOAD_SESSION_SECONDS], |row| {
+        .query_map([now() - UPLOAD_SESSION_SECONDS, now()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

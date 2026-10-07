@@ -294,10 +294,10 @@ async fn handle_allowed(state: &BridgeState, request: Request<Body>) -> Response
         Err(error) => {
             return failure(
                 StatusCode::FORBIDDEN,
-                if error.to_string() == "files_read_disabled" {
-                    "files_read_disabled"
-                } else {
-                    "invalid_challenge"
+                match error.to_string().as_str() {
+                    "files_read_disabled" => "files_read_disabled",
+                    "files_write_disabled" => "files_write_disabled",
+                    _ => "invalid_challenge",
                 },
             );
         }

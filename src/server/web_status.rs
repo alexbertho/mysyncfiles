@@ -39,7 +39,13 @@ pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS web_file_grants(
             session_hash TEXT PRIMARY KEY REFERENCES web_status_sessions(token_hash) ON DELETE CASCADE,
             challenge_id TEXT NOT NULL, device_id INTEGER NOT NULL, enrollment_id TEXT NOT NULL,
-            expires_at INTEGER NOT NULL);")?;
+            expires_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS web_file_write_grants(
+            session_hash TEXT PRIMARY KEY REFERENCES web_file_grants(session_hash) ON DELETE CASCADE,
+            challenge_id TEXT NOT NULL, expires_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS web_file_uploads(
+            upload_id TEXT PRIMARY KEY REFERENCES uploads(id) ON DELETE CASCADE,
+            session_hash TEXT NOT NULL, grant_id TEXT NOT NULL);")?;
     let has_scope = db
         .prepare("PRAGMA table_info(web_status_challenges)")?
         .query_map([], |r| r.get::<_, String>(1))?
@@ -163,16 +169,29 @@ pub(super) async fn middleware(
             .web_status_limit
             .try_acquire()
             .map_err(|_| error(StatusCode::TOO_MANY_REQUESTS, "status_busy"))?;
+        let chunk = request.method() == axum::http::Method::PUT
+            && request
+                .uri()
+                .path()
+                .strip_prefix("/v1/web/files/uploads/")
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
         let (parts, body) = request.into_parts();
-        let bytes = to_bytes(body, MAX_JSON_BYTES)
-            .await
-            .map_err(|_| error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"))?;
+        let bytes = to_bytes(
+            body,
+            if chunk {
+                crate::model::UPLOAD_CHUNK_BYTES as usize
+            } else {
+                MAX_JSON_BYTES
+            },
+        )
+        .await
+        .map_err(|_| error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"))?;
         Ok::<_, ApiError>(
             next.run(Request::from_parts(parts, Body::from(bytes)))
                 .await,
         )
     };
-    let mut response = match tokio::time::timeout(Duration::from_secs(10), result).await {
+    let mut response = match tokio::time::timeout(Duration::from_secs(30), result).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => error.into_response(),
         Err(_) => error(StatusCode::REQUEST_TIMEOUT, "status_timeout").into_response(),
@@ -261,11 +280,24 @@ pub(super) fn issue_challenge(
         .map_err(ApiError::internal)?;
     purge(&tx).map_err(ApiError::internal)?;
     let session = named_session(&tx, headers, cookie_name)?;
-    let expected_device_id = input
+    let mut expected_device_id = input
         .previous_challenge_id
         .as_deref()
         .map(|id| verified_result(&tx, &session, id).map(|p| p.device_id))
         .transpose()?;
+    if scope == "files.write" {
+        // A write challenge belongs to the device whose read grant is open.
+        expected_device_id = Some(
+            tx.query_row(
+                "SELECT device_id FROM web_file_grants WHERE session_hash=?1 AND expires_at>?2",
+                params![session.hash, now()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(ApiError::internal)?
+            .ok_or_else(denied)?,
+        );
+    }
     let (pending, total, recent): (i64, i64, i64) = tx.query_row(
         "SELECT COALESCE(SUM(result IS NULL AND expires_at>?2),0),COUNT(*),COALESCE(SUM(issued_at>?2-60),0)
          FROM web_status_challenges WHERE session_hash=?1", params![session.hash, now()],
@@ -367,6 +399,7 @@ fn accept_proof(
         // Only a consumed files.read proof can extend a browser session. The
         // status cookie and status.read tickets never receive file authority.
         let expires = now() + FILES_SESSION_SECONDS;
+        tx.execute("DELETE FROM web_file_write_grants WHERE session_hash=(SELECT session_hash FROM web_status_challenges WHERE id=?1)", [&claims.challenge_id]).map_err(ApiError::internal)?;
         tx.execute("INSERT INTO web_file_grants(session_hash,challenge_id,device_id,enrollment_id,expires_at)
             SELECT session_hash,id,?2,?3,?4 FROM web_status_challenges WHERE id=?1
             ON CONFLICT(session_hash) DO UPDATE SET challenge_id=excluded.challenge_id,device_id=excluded.device_id,enrollment_id=excluded.enrollment_id,expires_at=excluded.expires_at",
@@ -376,6 +409,19 @@ fn accept_proof(
             params![claims.session_binding, expires],
         )
         .map_err(ApiError::internal)?;
+    }
+    if claims.scope == "files.write" {
+        // Explicit write proof only; never extends the read session or allows
+        // another enrollment to inherit its contents or outstanding uploads.
+        let updated = tx.execute("INSERT INTO web_file_write_grants(session_hash,challenge_id,expires_at)
+            SELECT g.session_hash,?1,g.expires_at FROM web_file_grants g
+            JOIN web_status_challenges c ON c.session_hash=g.session_hash
+            WHERE c.id=?1 AND g.device_id=?2 AND g.enrollment_id=?3 AND g.expires_at>?4
+            ON CONFLICT(session_hash) DO UPDATE SET challenge_id=excluded.challenge_id,expires_at=excluded.expires_at",
+            params![claims.challenge_id, device_id, enrollment_id, now()]).map_err(ApiError::internal)?;
+        if updated != 1 {
+            return Err(denied());
+        }
     }
     tx.commit().map_err(ApiError::internal)?;
     Ok(ProofAccepted {
