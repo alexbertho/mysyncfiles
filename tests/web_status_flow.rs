@@ -245,6 +245,106 @@ async fn two_tpms_loopback_presence_replay_revocation_and_daemon_lifecycle() -> 
         .json()
         .await?;
     assert!(file_session["expires_at"].as_i64().unwrap() > now() + 1700);
+    // Uploads require another TPM-signed scope and cannot inherit read consent.
+    {
+        let web = |method, path: &str| {
+            http.request(method, format!("{}{path}", server.url))
+                .header("cookie", &files_cookie)
+                .header("origin", &server.url)
+                .header("x-mysync-web", "1")
+        };
+        let upload_url = "/v1/web/files/uploads";
+        let data = vec![b'u'; 8 * 1024 * 1024 + 3];
+        let digest = mysyncfiles::auth_protocol::hash(&data);
+        let metadata = serde_json::json!({"path":"Projets/from-browser.bin","size":data.len(),"sha256":digest});
+        assert_eq!(
+            web(reqwest::Method::POST, upload_url)
+                .json(&metadata)
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let write_challenge: ChallengeResponse =
+            web(reqwest::Method::POST, "/v1/web/files/write/challenges")
+                .json(&serde_json::json!({}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+        let submission = proof(&write_challenge.ticket, &server.url)?;
+        assert_eq!(
+            files_api
+                .submit_presence(&submission)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "files_write_disabled"
+        );
+        drop(files_api);
+        consent.web_uploads_enabled = true;
+        let upload_api = Api::new(&consent)?;
+        upload_api.submit_presence(&submission).await?;
+        assert!(upload_api.submit_presence(&submission).await.is_err());
+        let progress: serde_json::Value = web(reqwest::Method::POST, upload_url)
+            .json(&metadata)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let path = format!("{upload_url}/{}", progress["id"].as_str().unwrap());
+        // Exercise the real router and middleware limits, not just handlers.
+        assert_eq!(
+            web(reqwest::Method::PUT, &format!("{path}?offset=0"))
+                .body(data.clone())
+                .send()
+                .await?
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        for (offset, chunk) in data.chunks(8 * 1024 * 1024).enumerate() {
+            web(
+                reqwest::Method::PUT,
+                &format!("{path}?offset={}", offset * 8 * 1024 * 1024),
+            )
+            .body(chunk.to_vec())
+            .send()
+            .await?
+            .error_for_status()?;
+        }
+        let entry: serde_json::Value = web(reqwest::Method::POST, &format!("{path}/commit"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(entry["sha256"], digest);
+        assert_eq!(entry["size"], data.len());
+        assert_eq!(
+            web(reqwest::Method::POST, upload_url)
+                .json(&metadata)
+                .send()
+                .await?
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let read = web(
+            reqwest::Method::GET,
+            &format!(
+                "/v1/web/files/chunk?path=Projets/from-browser.bin&revision={}&offset=8388608",
+                entry["revision"]
+            ),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+        assert_eq!(read.as_ref(), b"uuu");
+    }
     assert_eq!(
         result(&http, &server.url, &cookie, &first.challenge_id)
             .await?
@@ -261,7 +361,6 @@ async fn two_tpms_loopback_presence_replay_revocation_and_daemon_lifecycle() -> 
             .status(),
         StatusCode::UNAUTHORIZED
     );
-    drop(files_api);
     assert_eq!(
         result(&http, &server.url, &cookie, &first.challenge_id)
             .await?

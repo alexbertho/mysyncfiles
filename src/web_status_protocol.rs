@@ -66,7 +66,11 @@ impl Challenge {
         key.verify_strict(&[DOMAIN, &bytes].concat(), &signature)?;
         let claims: Self = serde_json::from_slice(&bytes)?;
         ensure!(
-            claims.version == 1 && matches!(claims.scope.as_str(), "status.read" | "files.read"),
+            claims.version == 1
+                && matches!(
+                    claims.scope.as_str(),
+                    "status.read" | "files.read" | "files.write"
+                ),
             "invalid_scope"
         );
         ensure!(

@@ -1,8 +1,8 @@
 # Explorateur web Atlas
 
-Ouvrir `https://sync.example.com/files` (ou la racine `/` du serveur) pour consulter l’espace synchronisé. Atlas permet de parcourir les dossiers, rechercher par nom ou chemin, consulter les détails et télécharger des fichiers. L’interface est **en lecture seule** : elle ne modifie, ne supprime et ne restaure aucun fichier.
+Ouvrir `https://sync.example.com/files` (ou la racine `/` du serveur) pour consulter l’espace synchronisé. Atlas permet de parcourir les dossiers, rechercher par nom ou chemin, consulter les détails et télécharger des fichiers. Avec une autorisation locale supplémentaire, il permet aussi d’**ajouter des fichiers par glisser-déposer**. Il ne remplace, ne supprime et ne restaure aucun fichier existant.
 
-Le menu latéral se masque entièrement avec le bouton en haut à gauche. Le bouton lune/soleil en haut à droite change le thème. Ces deux préférences sont conservées dans le navigateur ; les noms et le contenu des fichiers ne sont pas enregistrés dans le stockage local de la page.
+Le menu latéral se masque entièrement avec le bouton en haut à gauche. Sans préférence enregistrée, il est replié sur les écrans de 1100 pixels ou moins pour laisser la place aux fichiers. Le bouton lune/soleil en haut à droite change le thème. Ces deux préférences sont conservées dans le navigateur ; les noms et le contenu des fichiers ne sont pas enregistrés dans le stockage local de la page.
 
 L’interface est constituée de fichiers HTML, CSS et JavaScript natifs dans `web/`, sans framework ni compilation frontend. Le serveur les lit à chaque requête. Avec Docker Compose, ce dossier est monté en lecture seule dans le conteneur : modifier `web/index.html`, `web/status.css` ou les scripts, puis actualiser le navigateur suffit. Voir [modifier l’interface à chaud](operations.md#modifier-linterface-web-a-chaud) pour la configuration et la mise en place initiale.
 
@@ -33,15 +33,43 @@ La colonne **Dernière modification** affiche la date d’enregistrement de la v
 
 Chaque ligne de fichier propose un menu **…** : **Télécharger**, **Voir les détails**, **Copier le chemin**. Un clic sur son nom ouvre aussi le panneau latéral. Celui-ci affiche le nom et le chemin complets, la taille, la date avec les secondes et le fuseau horaire, la révision et l’empreinte SHA-256 complète. Les noms trop longs sont seulement tronqués dans la liste.
 
+La ligne sélectionnée est repérée en bleu et reste liée au panneau de détails. Sur les écrans de 1100 pixels ou moins, le panneau se superpose à la liste ; **Échap**, le bouton de fermeture ou un clic dans la zone à côté du panneau ramène au fichier sélectionné. Sur téléphone, il occupe toute la largeur, avec les informations défilantes et le bouton **Télécharger** toujours accessible. Sous 480 pixels, la liste privilégie le nom et la taille ; la date du fichier reste consultable dans les détails. Les chemins longs du fil d’Ariane défilent horizontalement et restent navigables au clavier.
+
 La liste affiche au plus **200 éléments par page**, dossiers en premier, dans l’ordre des chemins. Utiliser les boutons de pagination pour continuer. L’icône **Actualiser les fichiers**, près de la recherche, met à jour la page courante en conservant les détails ouverts si le fichier est encore présent ; les changements du serveur ne sont pas sondés en permanence. Les lignes restent affichées pendant une requête, puis les résultats et le chemin sont remplacés ensemble. Une erreur de connexion conserve la liste précédente et permet de réessayer la navigation demandée avec l’icône d’actualisation. Le navigateur masque les données affichées à l’expiration ou à la déconnexion, et revérifie l’autorisation avant de restaurer une page depuis son historique.
 
 Le téléchargement utilise des blocs d’au plus **8 Mio**, liés à une révision précise. Si le fichier change ou est supprimé pendant le transfert, actualiser la liste et recommencer. Le navigateur compare l’empreinte SHA-256 du contenu reçu à celle des métadonnées avant de lancer l’enregistrement. Le message **Téléchargement lancé** confirme la remise au navigateur, pas l’écriture finale sur le disque.
 
 Cette première version limite les téléchargements web à **256 Mio par fichier**, avec un seul transfert à la fois, afin de borner la mémoire utilisée pour l’assemblage et la vérification. Les fichiers plus volumineux restent accessibles par la synchronisation Linux. Le bouton **Annuler** interrompt la préparation du téléchargement.
 
+## Ajouter des fichiers
+
+L’envoi nécessite le client **0.3.11 ou ultérieur** et un serveur incluant cette fonctionnalité. Le client 0.3.10 permet la lecture, mais ne connaît pas `enable-upload`. Les anciens serveurs restent consultables, mais le bouton d’ajout y est désactivé. La publication d’une release cliente signée et son installation sont distinctes d’une modification du code web.
+
+L’autorisation d’envoi est **désactivée par défaut**, même si la lecture est déjà autorisée. Sur le PC du navigateur, arrêter le daemon s’il verrouille le profil, puis exécuter :
+
+```sh
+mysync web-files enable
+mysync web-files enable-upload
+mysync web-files status
+```
+
+Relancer ensuite le client ou son service déjà installé. `status` affiche les deux réglages `web_files_enabled` et `web_uploads_enabled`. Le pont local doit aussi être actif.
+
+Ouvrir le dossier de destination puis déposer les fichiers sur sa liste, ou utiliser **Ajouter des fichiers**, également accessible au clavier et sur téléphone. La zone bleue affiche le chemin de destination ; **Échap** annule le dépôt avant son relâchement. Les résultats de recherche et la navigation en cours n’acceptent pas de dépôt. Un dépôt sur le menu ou hors de la liste n’ajoute rien et n’ouvre pas le fichier dans le navigateur.
+
+Au premier envoi, une preuve TPM distincte `files.write` est demandée au client local et confirmée par le serveur. L’autorisation reste liée au même appareil, au même appairage et à la même session que la lecture. Elle ne prolonge pas la session de 30 minutes.
+
+La sélection accepte jusqu’à **50 fichiers**, de **256 Mio maximum chacun**. Les dossiers ne sont pas pris en charge. Les fichiers sont traités successivement : calcul SHA-256, transfert par blocs d’au plus **8 Mio**, vérification serveur et publication. Le contenu n’apparaît dans la liste qu’après publication. L’indication **Envoyé** exige une confirmation du serveur ; une confirmation perdue invite à actualiser avant de réessayer. Les appareils Linux synchroniseront les fichiers ajoutés lors de leur prochain passage.
+
+Un nom déjà présent est refusé, y compris si le fichier apparaît pendant le transfert. Le fichier local et la version serveur restent conservés ; renommer le fichier local pour l’ajouter sous un autre nom. Les chemins dangereux et les collisions entre fichier et dossier sont aussi refusés.
+
+Le suivi permet d’annuler les fichiers restant à envoyer. Les fichiers déjà confirmés restent sur le serveur. Une annulation pendant la confirmation peut arriver après la publication : vérifier la liste. Changer de dossier ne change pas la destination d’un envoi déjà commencé. Le serveur borne les sessions d’envoi en attente à quatre par session navigateur et seize par appareil, transferts du client Linux compris ; les temporaires abandonnés sont purgés après expiration de l’autorisation ou par le nettoyage des transferts.
+
+Pour refuser les **nouvelles** autorisations d’envoi, utiliser `mysync web-files disable-upload`, puis relancer le client. `mysync web-files disable` refuse également les nouvelles preuves d’envoi. Les autorisations déjà accordées expirent avec la session ; la déconnexion ou la révocation de l’appareil invalide les prochaines opérations.
+
 ## Expiration et révocation
 
-**Déconnexion** supprime la session sur le serveur, ses challenges et son autorisation de lecture. Les autres onglets ouverts sur la même origine effacent aussi leur affichage lorsqu’ils reçoivent cette déconnexion. Après 30 minutes, une nouvelle vérification explicite est nécessaire ; consulter un dossier ne prolonge pas la session.
+**Déconnexion** supprime la session sur le serveur, ses challenges et ses autorisations de lecture et d’envoi. Les autres onglets ouverts sur la même origine effacent aussi leur affichage lorsqu’ils reçoivent cette déconnexion. Après 30 minutes, une nouvelle vérification explicite est nécessaire ; consulter un dossier ne prolonge pas la session.
 
 ```sh
 mysync web-files disable
@@ -57,16 +85,16 @@ Si `/status` reconnaît l’appareil mais que `/files` affiche « Vérification 
 
 La session utilise le cookie distinct `__Host-mysync-files`, `Secure`, `HttpOnly`, `SameSite=Strict`, avec `Path=/`. Seul son hash est enregistré sur le serveur. La phase anonyme expire après cinq minutes ; une preuve `files.read` valide prolonge l’autorisation jusqu’à 30 minutes après sa réception. Le cookie peut vivre 35 minutes pour couvrir ces deux phases, mais sa présence seule n’accorde aucun accès. Les sessions et challenges partagent les quotas bornés du [protocole de présence](web-status.md#protocole-et-limites).
 
-Le ticket signé lie le scope, l’origine, l’audience, la session, l’appareil attendu le cas échéant et les dates. Le client contrôle le consentement local avant de signer une preuve avec le TPM. Le serveur consomme le challenge une seule fois, puis contrôle l’appairage, l’approbation, la révocation et l’expiration à chaque lecture de métadonnées ou de bloc. Les routes de lecture web n’autorisent aucune mutation. Les réponses sont `no-store`, les erreurs sont génériques et les libellés sont insérés comme texte.
+Le ticket signé lie le scope, l’origine, l’audience, la session, l’appareil attendu le cas échéant et les dates. Le client contrôle les consentements locaux avant de signer une preuve avec le TPM. Le serveur consomme le challenge une seule fois, puis contrôle l’appairage, l’approbation, la révocation et l’expiration à chaque lecture ou envoi de bloc, ainsi que dans la transaction qui publie un fichier. Les routes de lecture web n’autorisent aucune mutation ; les routes d’envoi exigent `files.write` et vérifient aussi la propriété du transfert par cette session. Les réponses sont `no-store`, les erreurs sont génériques et les libellés sont insérés comme texte.
 
 Comme pour la page de statut, le navigateur doit recevoir un HTML et un JavaScript de confiance. Un site compromis ou un proxy capable de remplacer l’application web peut altérer son affichage ; la vérification SHA-256 dans cette application ne constitue pas une authentification indépendante du code servi. Le client Linux conserve sa vérification des réponses signées avec la clé serveur épinglée. Atlas n’est ni un chiffrement de bout en bout ni une sauvegarde : les fichiers sont en clair sur le serveur et les écrasements ordinaires n’ont pas d’historique restaurable.
 
 ## Validation développeur
 
-`make test` valide les sessions, les scopes, les chemins, la pagination, les limites de blocs, la révocation et le consentement local, ainsi qu’un échange de lecture avec un TPM simulé. La suite navigateur utilise les mêmes outils isolés que la [suite de présence](web-status.md#validation-developpeur) :
+`make test` valide les sessions, les scopes, les chemins, la pagination, les limites de blocs, la révocation et les consentements locaux, ainsi qu’un échange de lecture et d’envoi avec un TPM simulé. Les régressions d’envoi couvrent également les collisions concurrentes, les empreintes, les quotas, l’annulation et l’isolation des sessions. La suite navigateur utilise les mêmes outils isolés que la [suite de présence](web-status.md#validation-developpeur) :
 
 ```sh
 NODE_PATH=/chemin/vers/node_modules node tests/web_files_browser.cjs
 ```
 
-Elle couvre les thèmes, la navigation repliable, les dossiers, les menus au clavier, les noms longs, la recherche, la pagination, les états d’accès, l’expiration, les téléchargements et leur intégrité. Le backend de cette suite est simulé ; l’autorité cryptographique est vérifiée par les tests Rust. Les icônes Phosphor sont distribuées avec leur licence MIT dans `web/atlas-icons.LICENSE` ; la marque provient des références Atlas fournies dans `design/atlas`.
+Elle couvre les thèmes, la navigation repliable, les dossiers, les menus au clavier, les noms longs, la recherche, la pagination, les états d’accès, l’expiration, les téléchargements et leur intégrité. Les envois couvrent le dépôt, le sélecteur de fichiers, les fichiers vides, les blocs, les refus d’autorisation, les accusés perdus, les doublons, l’annulation et le changement de dossier pendant l’envoi. Les contrôles de mise en page couvrent les largeurs de 320, 390, 760, 768, 1100, 1440 et 1920 pixels, les chemins profonds, la stabilité du chargement et le retour du focus après fermeture des détails. Définir `MYSYNC_SCREENSHOTS=/tmp/atlas-captures` pour conserver les captures. Le backend de cette suite est simulé ; l’autorité cryptographique est vérifiée par les tests Rust. Les icônes Phosphor sont distribuées avec leur licence MIT dans `web/atlas-icons.LICENSE` ; la marque provient des références Atlas fournies dans `design/atlas`.

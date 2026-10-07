@@ -17,6 +17,7 @@
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     setIcon("theme-toggle", dark ? "sun" : "moon");
     $("theme-toggle").setAttribute("aria-label", dark ? "Passer au thème clair" : "Passer au thème sombre");
+    $("theme-toggle").title = $("theme-toggle").getAttribute("aria-label");
   }
   theme(preference("mysync-theme") ? preference("mysync-theme") === "dark" : systemTheme.matches);
   $("theme-toggle").addEventListener("click", () => {
@@ -29,9 +30,10 @@
     $("sidebar").hidden = closed;
     $("sidebar-toggle").setAttribute("aria-expanded", String(!closed));
     $("sidebar-toggle").setAttribute("aria-label", closed ? "Afficher le menu" : "Masquer le menu");
+    $("sidebar-toggle").title = $("sidebar-toggle").getAttribute("aria-label");
     setIcon("sidebar-toggle", closed ? "right" : "left");
   }
-  sidebar(preference("mysync-sidebar") === "closed" || (matchMedia("(max-width: 760px)").matches && preference("mysync-sidebar") !== "open"));
+  sidebar(preference("mysync-sidebar") === "closed" || (matchMedia("(max-width: 1100px)").matches && preference("mysync-sidebar") !== "open"));
   $("sidebar-toggle").addEventListener("click", () => {
     const closed = !document.body.classList.contains("sidebar-collapsed");
     sidebar(closed); preference("mysync-sidebar", closed ? "closed" : "open");
@@ -80,6 +82,7 @@
   }
   const post = (url, signal) => request(url, {method: "POST", signal, headers: {"Content-Type": "application/json"}, body: "{}"});
   let session, expiry, countdown, listingRequest, verification, transfer;
+  let upload, pickerContext, dragDepth = 0, dragCancelled = false;
   let directory = "", search = "", cursors = [""], pageIndex = 0, next;
   let displayedQuery, displayedEntries, retryView;
   let selected, selectedButton, menuEntry, menuButton, searchTimer, toastTimer;
@@ -117,24 +120,31 @@
   }
   function closeDetails(focus = false) {
     $("details").hidden = true;
+    $("details-dismiss").hidden = true;
     document.querySelector(".file-list").inert = false;
     for (const id of ["detail-name", "detail-path", "detail-size", "detail-modified", "detail-revision", "detail-hash"]) $(id).textContent = "";
     document.querySelectorAll("tr.selected").forEach(row => row.classList.remove("selected"));
+    selectedButton?.setAttribute("aria-expanded", "false");
     if (focus && selectedButton?.isConnected) selectedButton.focus();
     selected = undefined; selectedButton = undefined;
+    updateUploadButton();
   }
   function hideToast() { clearTimeout(toastTimer); $("toast").hidden = true; $("toast-message").textContent = ""; }
   function lock(state = "initial", message = "") {
     epoch++;
     session = undefined;
     clearTimeout(expiry); clearInterval(countdown); clearTimeout(searchTimer);
-    listingRequest?.abort(); verification?.abort(); transfer?.abort();
+    listingRequest?.abort(); verification?.abort(); transfer?.abort(); upload?.abort();
+    clearDrop(); dragCancelled = false; pickerContext = undefined; $("upload-input").value = "";
+    $("upload-status").hidden = true; $("upload-results").replaceChildren();
+    $("upload-message").textContent = ""; $("upload-destination").textContent = "";
     listingRequest = undefined; displayedQuery = undefined; displayedEntries = undefined; retryView = undefined;
     listingBusy(false);
     closeMenu(); closeDetails(); hideToast();
     $("rows").replaceChildren(); $("breadcrumbs").replaceChildren();
     $("count").textContent = ""; $("listing-title").textContent = "Tous les fichiers";
-    $("listing-message").textContent = "";
+    $("listing-title").removeAttribute("title");
+    $("listing-message").textContent = ""; $("listing-message").hidden = true;
     $("search").value = ""; $("search").disabled = true; $("clear-search").hidden = true;
     $("explorer").hidden = true; $("access").hidden = statusPage;
     $("logout").hidden = true; $("session-time").textContent = "";
@@ -278,11 +288,14 @@
     const add = (name, path) => {
       if (root.childNodes.length) { const divider = document.createElement("span"); divider.textContent = "/"; divider.setAttribute("aria-hidden", "true"); root.append(divider); }
       const button = document.createElement("button"); button.type = "button"; button.textContent = name;
+      button.title = path || "Tous les fichiers";
       button.addEventListener("click", () => navigate(path)); root.append(button);
     };
     add("Fichiers", "");
     if (search) { const label = document.createElement("span"); label.textContent = "/ Recherche"; root.append(label); }
     else { let path = ""; for (const part of directory.split("/").filter(Boolean)) { path += (path ? "/" : "") + part; add(part, path); } }
+    root.lastElementChild.setAttribute("aria-current", "page");
+    root.scrollLeft = root.scrollWidth;
   }
   function navigate(path) {
     clearTimeout(searchTimer);
@@ -303,7 +316,8 @@
   }
   const currentView = () => ({directory, search, pageIndex, cursors: [...cursors]});
   function listingBusy(busy) {
-    document.querySelector(".file-list").setAttribute("aria-busy", String(busy));
+    clearDrop(); updateUploadButton();
+    $("file-table").setAttribute("aria-busy", String(busy));
     $("refresh").setAttribute("aria-disabled", String(busy));
     $("previous-page").setAttribute("aria-disabled", String(busy)); $("next-page").setAttribute("aria-disabled", String(busy));
     if (!busy) { $("refresh").classList.remove("is-loading"); $("listing-status").textContent = ""; }
@@ -315,10 +329,10 @@
     const current = epoch;
     retryView = view;
     listingBusy(true);
-    $("listing-message").hidden = true;
+    if (!displayedQuery) { $("count").textContent = "Chargement des fichiers…"; $("empty").hidden = true; $("file-table").hidden = false; }
     const waiting = setTimeout(() => {
       if (listingRequest === controller && !controller.signal.aborted) {
-        $("refresh").classList.add("is-loading"); $("listing-status").textContent = "Chargement des fichiers…";
+        $("refresh").classList.add("is-loading"); $("listing-status").textContent = displayedQuery ? "Chargement des fichiers…" : "";
       }
     }, 180);
     try {
@@ -339,6 +353,7 @@
       $("search").value = search; $("clear-search").hidden = !search;
       if (!sameView) {
         breadcrumbs(); $("listing-title").textContent = search ? "Résultats de recherche" : directory ? basename(directory) : "Tous les fichiers";
+        $("listing-title").title = search ? `Recherche : ${search}` : directory || "Tous les fichiers";
       }
       $("listing-message").hidden = true;
       const count = value.entries.length;
@@ -350,11 +365,13 @@
           if (search) row.classList.add("search-row");
           const nameCell = document.createElement("td");
           const button = document.createElement("button"); button.type = "button"; button.className = "entry-button"; button.title = entry.path;
+          if (entry.kind === "file") { button.setAttribute("aria-controls", "details"); button.setAttribute("aria-expanded", "false"); }
           const text = document.createElement("span"); text.className = "entry-text";
           const name = document.createElement("span"); name.className = "entry-name"; highlighted(name, basename(entry.path)); text.append(name);
           if (search) { const path = document.createElement("span"); path.className = "entry-path"; highlighted(path, entry.path); text.append(path); }
           button.append(icon(kindIcon(entry), `file-icon ${kindIcon(entry)}`), text);
           button.addEventListener("click", () => entry.kind === "directory" ? navigate(entry.path) : details(entry, button));
+          row.addEventListener("click", event => { if (!event.target.closest("button") && !getSelection()?.toString()) button.click(); });
           nameCell.append(button); row.append(nameCell);
           const sizeCell = document.createElement("td"); sizeCell.textContent = size(entry.size);
           if (entry.kind === "directory") sizeCell.className = "folder-meta";
@@ -387,6 +404,7 @@
     } catch (error) {
       if (controller.signal.aborted || current !== epoch) return;
       if (error.code === "session_expired" || error.code === "authentication_refused") { lock("expired"); return; }
+      if (!displayedQuery) $("count").textContent = "Liste indisponible";
       $("listing-message").hidden = false;
       $("listing-message").textContent = `Impossible de charger les fichiers.${displayedQuery ? " La liste précédente est conservée." : ""} Réessayez avec le bouton d’actualisation en haut de la page.`;
     } finally {
@@ -397,13 +415,20 @@
   function details(entry, button, focus = true) {
     closeMenu(); closeDetails(); selected = entry; selectedButton = button;
     button.closest("tr")?.classList.add("selected");
+    button.setAttribute("aria-expanded", "true");
     $("detail-name").textContent = basename(entry.path); $("detail-path").textContent = entry.path;
     $("detail-size").textContent = size(entry.size); $("detail-revision").textContent = entry.revision; $("detail-hash").textContent = entry.sha256;
     $("detail-modified").replaceChildren(modifiedTime(entry.updated_at, true));
     $("detail-icon").setAttribute("class", `detail-icon ${kindIcon(entry)}`); setIcon("detail-icon", kindIcon(entry));
     $("details").hidden = false;
-    document.querySelector(".file-list").inert = matchMedia("(max-width: 760px)").matches;
-    if (focus) $("details").focus();
+    detailsLayout();
+    if (focus) { document.querySelector(".details-content").scrollTop = 0; $("details").focus({preventScroll: true}); }
+  }
+  function detailsLayout() {
+    const overlay = !$("details").hidden && matchMedia("(max-width: 1100px)").matches;
+    document.querySelector(".file-list").inert = overlay;
+    $("details-dismiss").hidden = !overlay;
+    clearDrop(); updateUploadButton();
   }
   function openMenu(entry, button) {
     if (menuButton === button) { closeMenu(true); return; }
@@ -443,11 +468,12 @@
     else if (matchMedia("(max-width: 760px)").matches && !$("sidebar").hidden) { sidebar(true); $("sidebar-toggle").focus(); }
   });
   addEventListener("resize", () => {
-    closeMenu();
-    document.querySelector(".file-list").inert = !$("details").hidden && matchMedia("(max-width: 760px)").matches;
+    closeMenu(true);
+    detailsLayout();
   });
   addEventListener("scroll", () => closeMenu(), true);
   $("details-close").addEventListener("click", () => closeDetails(true));
+  $("details-dismiss").addEventListener("click", () => closeDetails(true));
   $("detail-download").addEventListener("click", () => { if (selected) download(selected); });
   $("refresh").addEventListener("click", () => { if (!listingRequest) { clearTimeout(searchTimer); load(retryView || currentView()); } });
   $("next-page").addEventListener("click", () => { if (next && !listingRequest) load({...currentView(), pageIndex: pageIndex + 1, cursors: [...cursors.slice(0, pageIndex + 1), next]}); });
@@ -458,6 +484,7 @@
     const view = {directory, search: $("search").value.trim(), pageIndex: 0, cursors: [""]};
     $("clear-search").hidden = !$("search").value;
     retryView = view;
+    clearDrop(); updateUploadButton();
     searchTimer = setTimeout(() => load(view), 180);
   };
   $("search").addEventListener("input", searchChanged);
@@ -471,9 +498,11 @@
   $("download-cancel").addEventListener("click", () => transfer?.abort());
   async function download(entry) {
     if (!session) return;
+    if (upload) { toast("Attendez la fin de l’envoi ou annulez-le avant de télécharger."); return; }
     if (transfer) { toast("Un téléchargement est déjà en préparation.", true); return; }
     if (entry.size > session.download_limit) { toast("Ce fichier dépasse la limite web de 256 Mio. Retrouvez-le dans votre dossier synchronisé."); return; }
     const controller = new AbortController(); transfer = controller;
+    updateUploadButton();
     const current = epoch; const limit = session.chunk_bytes;
     toast(`Préparation du téléchargement · ${basename(entry.path)}`, true);
     try {
@@ -498,7 +527,179 @@
       if (current !== epoch || !session) return;
       if (error.code === "session_expired" || error.code === "authentication_refused") { lock("expired"); return; }
       toast(controller.signal.aborted ? "Téléchargement annulé." : error.code === "revision_changed" ? "Ce fichier a changé. Actualisez la liste avant de réessayer." : error.code === "integrity_failed" ? "Le fichier reçu ne correspond pas à son empreinte. Téléchargement interrompu." : "Téléchargement interrompu. Vérifiez la connexion et réessayez.");
-    } finally { if (transfer === controller) transfer = undefined; }
+    } finally { if (transfer === controller) transfer = undefined; updateUploadButton(); }
+  }
+  function canUpload() {
+    return !statusPage && session?.upload_limit === 268435456 && !upload && !transfer &&
+      Boolean(displayedQuery) && !search && !$("search").value.trim() && !listingRequest && !retryView && !document.querySelector(".file-list").inert;
+  }
+  function updateUploadButton() {
+    $("upload-add").disabled = !canUpload();
+    $("upload-add").title = search || $("search").value.trim() ? "Ouvrez un dossier pour ajouter des fichiers" :
+      session && !session.upload_limit ? "L’envoi nécessite une mise à jour du serveur" : "Ajouter des fichiers au dossier ouvert";
+  }
+  function clearDrop() { dragDepth = 0; $("drop-overlay").hidden = true; }
+  function fileDrag(event) { return [...(event.dataTransfer?.types || [])].includes("Files"); }
+  const dropTarget = $("drop-target");
+  // Prevent the browser from navigating to a dropped file, even outside the target.
+  document.addEventListener("dragover", event => {
+    if (!fileDrag(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = canUpload() && !dragCancelled && dropTarget.contains(event.target) ? "copy" : "none";
+  });
+  document.addEventListener("drop", event => { if (fileDrag(event)) event.preventDefault(); clearDrop(); dragCancelled = false; });
+  document.addEventListener("dragend", () => { clearDrop(); dragCancelled = false; });
+  document.addEventListener("dragleave", event => { if (!event.relatedTarget && (event.target === document.documentElement || event.target === document)) { clearDrop(); dragCancelled = false; } });
+  dropTarget.addEventListener("dragenter", event => {
+    if (!fileDrag(event) || !canUpload() || dragCancelled) return;
+    event.preventDefault(); dragDepth++;
+    closeMenu();
+    $("drop-description").textContent = directory ? `Ils seront ajoutés au dossier ${basename(directory)}` : "Ils seront ajoutés à Tous les fichiers";
+    $("drop-path").textContent = `Fichiers${directory ? ` / ${directory.split("/").join(" / ")}` : ""}`;
+    $("drop-overlay").hidden = false;
+  });
+  dropTarget.addEventListener("dragleave", event => {
+    if (fileDrag(event) && --dragDepth <= 0) clearDrop();
+  });
+  dropTarget.addEventListener("drop", event => {
+    if (!fileDrag(event)) return;
+    event.preventDefault();
+    const allowed = canUpload() && !dragCancelled;
+    clearDrop();
+    if (!allowed) return;
+    const items = [...(event.dataTransfer.items || [])].filter(item => item.kind === "file");
+    if (items.some(item => item.webkitGetAsEntry?.()?.isDirectory)) {
+      toast("Déposez des fichiers uniquement. L’envoi de dossiers n’est pas pris en charge."); return;
+    }
+    sendFiles([...event.dataTransfer.files], directory);
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && !$("drop-overlay").hidden) { event.preventDefault(); event.stopImmediatePropagation(); clearDrop(); dragCancelled = true; }
+  }, true);
+  $("upload-add").addEventListener("click", () => {
+    if (!canUpload()) return;
+    pickerContext = {directory, epoch}; $("upload-input").value = ""; $("upload-input").click();
+  });
+  $("upload-input").addEventListener("change", event => {
+    const files = [...event.target.files], context = pickerContext;
+    event.target.value = ""; pickerContext = undefined;
+    if (!files.length || !context || context.epoch !== epoch) return;
+    if (!canUpload() || directory !== context.directory) { toast("Le dossier a changé. Sélectionnez à nouveau vos fichiers."); return; }
+    sendFiles(files, context.directory);
+  });
+  $("upload-cancel").addEventListener("click", () => upload?.abort());
+  $("upload-close").addEventListener("click", () => { $("upload-status").hidden = true; $("upload-results").replaceChildren(); });
+  const uploadErrors = {
+    file_exists: "Ce nom existe déjà. Le fichier existant a été conservé ; renommez le fichier à envoyer.",
+    path_conflict: "Un fichier ou dossier occupe déjà ce chemin.",
+    invalid_upload: "Nom ou taille de fichier non pris en charge.",
+    integrity_failed: "Le contenu reçu ne correspond pas à son empreinte. Réessayez.",
+    upload_limit: "Trop d’envois en attente. Réessayez après leur expiration.",
+    files_write_disabled: "L’envoi n’est pas autorisé sur cet appareil.",
+    files_read_disabled: "La lecture web doit être autorisée sur cet appareil.",
+    local_rejected: "Le client local doit être mis à jour pour prendre en charge l’envoi.",
+    pending: "L’autorisation d’envoi n’a pas été confirmée. Vérifiez le client local et réessayez.",
+    files_write_required: "L’autorisation d’envoi a expiré. Réessayez.",
+    invalid_response: "Réponse du serveur invalide. Actualisez la liste avant de réessayer."
+  };
+  async function authorizeUpload(signal) {
+    try { await request("/v1/web/files/write/session", {signal}); return; }
+    catch (error) { if (error.code !== "files_write_required") throw error; }
+    const challenge = await post("/v1/web/files/write/challenges", signal);
+    if (!/^[a-f0-9]{64}$/.test(challenge.challenge_id) || typeof challenge.ticket !== "string" || challenge.ticket.length > 2048) throw new Failure("invalid_response");
+    let localError;
+    try {
+      const local = await request("http://127.0.0.1:47831/v1/status", {local: true, signal, timeout: 30000,
+        headers: {"X-MySync-Bridge": "1", "X-MySync-Challenge": challenge.ticket}});
+      if (!local.response.ok) localError = local.data.error;
+    } catch (_) { /* Check the server even when the bridge acknowledgement is lost. */ }
+    if (signal.aborted) throw new Failure("cancelled");
+    try { await request(`/v1/web/files/write/challenges/${challenge.challenge_id}`, {signal}); }
+    catch (error) {
+      if (error.code === "pending" && ["files_write_disabled", "files_read_disabled"].includes(localError)) throw new Failure(localError);
+      if (error.code === "pending" && localError === "invalid_challenge") throw new Failure("local_rejected");
+      throw error;
+    }
+  }
+  async function sendFiles(files, destination) {
+    if (!canUpload() || !files.length) return;
+    if (files.length > 50) { toast("Ajoutez au maximum 50 fichiers à la fois."); return; }
+    const current = epoch, controller = new AbortController(); upload = controller; clearDrop(); updateUploadButton();
+    const {signal} = controller, limit = session.upload_limit, chunkBytes = session.chunk_bytes;
+    let sent = 0, rejected = 0, activeId, committing = false;
+    const live = () => current === epoch && Boolean(session);
+    const check = () => { if (!live() || signal.aborted) throw new Failure("cancelled"); };
+    const result = (name, message, error) => {
+      const row = document.createElement("li"); row.textContent = `${name} — ${message}`;
+      if (error) row.className = "upload-error";
+      $("upload-results").append(row); $("upload-results").hidden = false;
+    };
+    $("upload-status").hidden = false; $("upload-results").replaceChildren(); $("upload-results").hidden = true;
+    $("upload-help").hidden = true; $("upload-close").hidden = true; $("upload-cancel").hidden = false;
+    $("upload-progress").hidden = false; $("upload-progress").value = 0;
+    $("upload-destination").textContent = `Vers ${destination ? `Fichiers / ${destination}` : "Tous les fichiers"}`;
+    $("upload-message").textContent = "Vérification de l’autorisation d’envoi…";
+    try {
+      await authorizeUpload(signal); check();
+      for (let index = 0; index < files.length; index++) {
+        check(); const file = files[index];
+        const path = `${destination ? destination + "/" : ""}${file.name}`;
+        const bytes = new TextEncoder();
+        if (!file.name || /[/\\\0]/.test(file.name) || [".", "..", ".mysync-conflicts", ".mysync-staging"].includes(file.name) || bytes.encode(file.name).length > 255 || bytes.encode(path).length > 4096 || file.size > limit) {
+          rejected++; result(file.name, file.size > limit ? "Limite de 256 Mio par fichier dépassée." : "Nom de fichier non pris en charge.", true); continue;
+        }
+        try {
+          $("upload-message").textContent = `Préparation · ${index + 1}/${files.length} · ${file.name}`;
+          $("upload-progress").value = 0;
+          // Only one file is hashed at a time; the bounded buffer is released
+          // before transferring 8 MiB slices from the original File.
+          const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer()))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+          check();
+          const started = await request("/v1/web/files/uploads", {method: "POST", signal,
+            headers: {"Content-Type": "application/json"}, body: JSON.stringify({path, size: file.size, sha256})});
+          if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(started.id) || started.offset !== 0) throw new Failure("invalid_response");
+          activeId = started.id;
+          let offset = 0;
+          while (offset < file.size) {
+            check();
+            const end = Math.min(offset + chunkBytes, file.size);
+            $("upload-message").textContent = `Envoi · ${index + 1}/${files.length} · ${file.name}`;
+            const part = await request(`/v1/web/files/uploads/${activeId}?offset=${offset}`, {method: "PUT", signal, timeout: 30000,
+              headers: {"Content-Type": "application/octet-stream"}, body: file.slice(offset, end)});
+            if (part.id !== activeId || part.offset !== end) throw new Failure("invalid_response");
+            offset = end; $("upload-progress").value = Math.floor(offset / file.size * 100);
+          }
+          check(); committing = true;
+          $("upload-message").textContent = `Confirmation · ${file.name}`;
+          const entry = await post(`/v1/web/files/uploads/${activeId}/commit`, signal);
+          if (entry.path !== path || entry.sha256 !== sha256 || entry.size !== file.size || entry.deleted || !Number.isSafeInteger(entry.revision) || entry.revision <= 0) throw new Failure("invalid_response");
+          activeId = undefined; committing = false; check(); sent++;
+          $("upload-progress").value = 100; result(file.name, "Envoyé", false);
+        } catch (error) {
+          if (signal.aborted || !live() || ["session_expired", "authentication_refused", "files_write_required"].includes(error.code)) throw error;
+          rejected++; result(file.name, committing ? "Envoi non confirmé. Actualisez la liste avant de réessayer." : uploadErrors[error.code] || "Envoi interrompu. Vérifiez la connexion et réessayez.", true);
+        } finally {
+          if (activeId && live()) await request(`/v1/web/files/uploads/${activeId}`, {method: "DELETE", timeout: 5000}).catch(() => {});
+          activeId = undefined;
+        }
+        committing = false;
+      }
+      check();
+      $("upload-message").textContent = `${sent} fichier${sent === 1 ? "" : "s"} envoyé${sent === 1 ? "" : "s"}${rejected ? ` · ${rejected} non envoyé${rejected === 1 ? "" : "s"}` : ""}`;
+    } catch (error) {
+      if (!live()) return;
+      if (["session_expired", "authentication_refused"].includes(error.code)) { lock("expired"); return; }
+      $("upload-message").textContent = signal.aborted ? (committing ? "Envoi interrompu pendant la confirmation. Vérifiez la liste." : `Envoi annulé · ${sent} fichier${sent === 1 ? "" : "s"} déjà envoyé${sent === 1 ? "" : "s"}`) : uploadErrors[error.code] || "Envoi interrompu. Vérifiez la connexion et réessayez.";
+      $("upload-help").hidden = !["files_write_disabled", "files_read_disabled", "local_rejected"].includes(error.code);
+    } finally {
+      if (upload === controller) upload = undefined;
+      if (live()) {
+        $("upload-cancel").hidden = true; $("upload-close").hidden = false; $("upload-progress").hidden = true;
+        updateUploadButton();
+        // Refresh the view currently open, never redirect back to a stale target.
+        if (!listingRequest && !retryView) await load();
+      }
+    }
   }
   // Never restore private names from the back-forward cache without a fresh
   // server authorization. Only theme/navigation preferences use local storage.

@@ -110,13 +110,14 @@ fn file_read_consent_is_separate_and_disabled_for_existing_profiles() -> Result<
     assert!(!client::load_config(&config)?.web_files_enabled);
     assert_eq!(
         cli(&config, &["web-files", "status"])?.stdout,
-        b"web_files_enabled=false\n"
+        b"web_files_enabled=false\nweb_uploads_enabled=false\n"
     );
     for (action, enabled) in [("enable", true), ("disable", false)] {
         let output = cli(&config, &["web-files", action])?;
         assert!(output.status.success());
         let saved = client::load_config(&config)?;
         assert_eq!(saved.web_files_enabled, enabled);
+        assert!(!saved.web_uploads_enabled);
         assert!(saved.web_status_enabled);
         assert_eq!(saved.server, "https://sync.example.test");
         assert_eq!(fs::metadata(&config)?.permissions().mode() & 0o777, 0o600);
@@ -125,5 +126,39 @@ fn file_read_consent_is_separate_and_disabled_for_existing_profiles() -> Result<
     lock.lock_exclusive()?;
     assert!(!cli(&config, &["web-files", "enable"])?.status.success());
     assert!(!client::load_config(&config)?.web_files_enabled);
+    Ok(())
+}
+
+#[test]
+fn upload_consent_requires_a_separate_local_command_and_profile_lock() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = temp.path().join("client.json");
+    fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "server":"https://sync.example.test", "root":temp.path(), "web_files_enabled":true
+        }))?,
+    )?;
+    assert!(!client::load_config(&config)?.web_uploads_enabled);
+    for (action, enabled) in [("enable-upload", true), ("disable-upload", false)] {
+        let result = cli(&config, &["web-files", action])?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let saved = client::load_config(&config)?;
+        assert_eq!(saved.web_uploads_enabled, enabled);
+        assert!(saved.web_files_enabled);
+        assert_eq!(fs::metadata(&config)?.permissions().mode() & 0o777, 0o600);
+    }
+    let lock = fs::File::create(config.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    assert!(
+        !cli(&config, &["web-files", "enable-upload"])?
+            .status
+            .success()
+    );
+    assert!(!client::load_config(&config)?.web_uploads_enabled);
     Ok(())
 }

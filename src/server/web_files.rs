@@ -1,4 +1,5 @@
-//! Read-only browser access. A status proof cannot grant file authority.
+//! Scoped browser access. Status, reading and uploading have separate authority.
+mod uploads;
 use super::{ApiError, ServerState, web_assets, web_status};
 use crate::{auth_protocol::now, web_status_protocol::*};
 use axum::{
@@ -35,6 +36,7 @@ pub(super) fn router() -> Router<Arc<ServerState>> {
         .route("/v1/web/files/challenges/{id}", get(challenge_result))
         .route("/v1/web/files/entries", get(entries))
         .route("/v1/web/files/chunk", get(chunk))
+        .merge(uploads::router())
 }
 
 fn failure(status: StatusCode, code: &str) -> ApiError {
@@ -64,6 +66,7 @@ struct FileSession {
     expires_at: i64,
     download_limit: i64,
     chunk_bytes: u64,
+    upload_limit: i64,
 }
 
 /// Rechecks the specific enrollment and logical device on every metadata/chunk
@@ -83,6 +86,7 @@ fn authorize(db: &Connection, headers: &HeaderMap) -> Result<FileSession, ApiErr
                 expires_at: r.get(1)?,
                 download_limit: DOWNLOAD_BYTES,
                 chunk_bytes: CHUNK_BYTES,
+                upload_limit: DOWNLOAD_BYTES,
             })
         },
     )
@@ -355,15 +359,15 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use axum::{Extension, body::to_bytes};
-    fn checked<T>(value: Result<T, ApiError>) -> Result<T> {
+    pub(super) fn checked<T>(value: Result<T, ApiError>) -> Result<T> {
         value.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))
     }
-    struct Fixture {
+    pub(super) struct Fixture {
         _dir: tempfile::TempDir,
-        state: Arc<ServerState>,
+        pub(super) state: Arc<ServerState>,
     }
     impl Fixture {
-        fn new() -> Result<Self> {
+        pub(super) fn new() -> Result<Self> {
             let dir = tempfile::tempdir()?;
             let state = crate::server::open(dir.path())?;
             {
@@ -380,7 +384,7 @@ mod tests {
             }
             Ok(Self { _dir: dir, state })
         }
-        async fn browser(&self) -> Result<HeaderMap> {
+        pub(super) async fn browser(&self) -> Result<HeaderMap> {
             let response = checked(page(State(self.state.clone()), HeaderMap::new()).await)?;
             let cookie = response.headers()[header::SET_COOKIE]
                 .to_str()?
@@ -394,7 +398,7 @@ mod tests {
             headers.insert("content-type", "application/json".parse()?);
             Ok(headers)
         }
-        async fn grant(&self, headers: &HeaderMap, scope: &str) -> Result<String> {
+        pub(super) async fn grant(&self, headers: &HeaderMap, scope: &str) -> Result<String> {
             let challenge = checked(web_status::issue_challenge(
                 &self.state,
                 headers,
@@ -428,7 +432,7 @@ mod tests {
             assert_eq!(accepted.0.challenge_id, challenge.challenge_id);
             Ok(challenge.challenge_id)
         }
-        fn entry(&self, path: &str, contents: &[u8]) -> Result<()> {
+        pub(super) fn entry(&self, path: &str, contents: &[u8]) -> Result<()> {
             let blob = crate::auth_protocol::hash(contents);
             std::fs::write(self.state.data_dir.join("blobs").join(&blob), contents)?;
             self.state.db.lock().unwrap().execute(

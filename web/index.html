@@ -19,22 +19,21 @@
       <a id="status-nav" class="nav-link" href="/status"><svg aria-hidden="true"><use href="/atlas-icons.svg#device"></use></svg>Statut de cet appareil</a>
     </nav>
     <div class="sidebar-bottom">
-      <div class="session-indicator"><span id="session-dot" class="session-dot"></span><div><span id="session-label">Accès non vérifié</span><small id="session-time"></small></div></div>
+      <div class="session-indicator"><span id="session-dot" class="session-dot" aria-hidden="true"></span><div><span id="session-label">Accès non vérifié</span><small id="session-time"></small></div></div>
       <button id="logout" class="nav-link" type="button" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#logout"></use></svg>Déconnexion</button>
     </div>
   </aside>
   <div class="workspace">
     <header class="toolbar">
       <button id="sidebar-toggle" class="icon-button" type="button" aria-label="Masquer le menu" aria-expanded="true" aria-controls="sidebar"><svg aria-hidden="true"><use href="/atlas-icons.svg#left"></use></svg></button>
-      <span class="brand-mark compact-brand" aria-hidden="true"></span>
+      <span class="compact-brand" aria-hidden="true"><span class="brand-mark"></span><span class="compact-brand-name">MySyncFiles</span></span>
       <div id="search-box" class="search-box">
         <svg aria-hidden="true"><use href="/atlas-icons.svg#search"></use></svg>
         <input id="search" type="search" placeholder="Rechercher un fichier" aria-label="Rechercher un fichier par nom ou chemin" maxlength="255" autocomplete="off" disabled>
         <button id="clear-search" class="icon-button" type="button" aria-label="Effacer la recherche" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button>
       </div>
       <span id="toolbar-title" hidden>Statut de cet appareil</span>
-      <button id="refresh" class="icon-button refresh-button" type="button" aria-label="Actualiser les fichiers" title="Actualiser les fichiers" aria-controls="file-table" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#refresh"></use></svg></button>
-      <span id="listing-status" class="sr-only" role="status" aria-live="polite"></span>
+      <button id="refresh" class="icon-button refresh-button" type="button" aria-label="Actualiser les fichiers" title="Actualiser les fichiers" aria-controls="file-table" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#refresh"></use></svg><span>Actualiser</span></button>
       <button id="theme-toggle" class="icon-button theme-button" type="button" aria-label="Passer au thème sombre"><svg aria-hidden="true"><use href="/atlas-icons.svg#moon"></use></svg></button>
     </header>
     <main id="main" tabindex="-1">
@@ -50,19 +49,26 @@
       <section id="explorer" class="explorer" aria-labelledby="listing-title" hidden>
         <div class="file-list">
           <nav id="breadcrumbs" class="breadcrumbs" aria-label="Chemin du dossier"></nav>
-          <h1 id="listing-title" tabindex="-1">Tous les fichiers</h1>
-          <p id="count" class="count" role="status" aria-live="polite"></p>
+          <div class="listing-heading"><h1 id="listing-title" tabindex="-1">Tous les fichiers</h1><button id="upload-add" class="primary" type="button" disabled><svg aria-hidden="true"><use href="/atlas-icons.svg#plus"></use></svg>Ajouter des fichiers</button><input id="upload-input" type="file" multiple hidden></div>
+          <div class="listing-meta"><p id="count" class="count" role="status" aria-live="polite"></p><span id="listing-status" role="status" aria-live="polite"></span></div>
           <div id="listing-message" class="listing-message" role="status" hidden></div>
+          <div id="drop-target" class="drop-target">
           <table id="file-table"><caption class="sr-only">Fichiers et dossiers synchronisés</caption><colgroup><col class="name-column"><col class="size-column"><col class="modified-column"><col class="actions-column"></colgroup><thead><tr><th scope="col" aria-sort="ascending">Nom <svg aria-hidden="true"><use href="/atlas-icons.svg#up"></use></svg></th><th scope="col">Taille</th><th scope="col" class="modified-heading" title="Date d’enregistrement sur le serveur ; pour un dossier, date la plus récente de ses fichiers présents.">Dernière modification</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody id="rows"></tbody></table>
           <div id="empty" class="empty" hidden><svg class="state-icon" aria-hidden="true"><use href="/atlas-icons.svg#folder"></use></svg><h2 id="empty-title">Aucun fichier pour le moment</h2><p id="empty-description">Vos fichiers apparaîtront ici après la première synchronisation.</p><button id="empty-reset" class="secondary" type="button" hidden>Effacer la recherche</button></div>
           <div class="pagination"><button id="previous-page" class="secondary" type="button" hidden>Page précédente</button><button id="next-page" class="secondary" type="button" hidden>Page suivante</button></div>
+          <div id="drop-overlay" class="drop-overlay" hidden><div class="drop-instruction"><svg class="drop-icon" aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg><h2>Déposez vos fichiers ici</h2><p id="drop-description"></p><p class="drop-destination"><svg class="directory" aria-hidden="true"><use href="/atlas-icons.svg#directory"></use></svg><span id="drop-path"></span></p><small>Échap pour annuler</small></div></div>
+          </div>
         </div>
+        <button id="details-dismiss" class="panel-backdrop" type="button" tabindex="-1" aria-label="Fermer les détails" hidden></button>
         <aside id="details" class="details" aria-labelledby="detail-name" tabindex="-1" hidden>
-          <button id="details-close" class="icon-button" type="button" aria-label="Fermer les détails"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button>
-          <svg id="detail-icon" class="detail-icon" aria-hidden="true"><use href="/atlas-icons.svg#file"></use></svg>
-          <h2 id="detail-name"></h2><p id="detail-path" class="mono"></p>
-          <dl><dt>Taille</dt><dd id="detail-size"></dd><dt>Dernière modification</dt><dd id="detail-modified"></dd><dt>Révision</dt><dd id="detail-revision"></dd><dt>SHA-256</dt><dd id="detail-hash" class="mono"></dd></dl>
-          <button id="detail-download" class="primary" type="button"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button>
+          <div class="details-header"><span>Détails du fichier</span><button id="details-close" class="icon-button" type="button" aria-label="Fermer les détails"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
+          <div class="details-content" tabindex="0" role="group" aria-label="Informations du fichier">
+            <svg id="detail-icon" class="detail-icon" aria-hidden="true"><use href="/atlas-icons.svg#file"></use></svg>
+            <h2 id="detail-name"></h2>
+            <p class="detail-path-label">Chemin</p><p id="detail-path" class="mono"></p>
+            <dl><div><dt>Taille</dt><dd id="detail-size"></dd></div><div><dt>Dernière modification</dt><dd id="detail-modified"></dd></div><div class="detail-technical"><dt>Révision</dt><dd id="detail-revision"></dd></div><div><dt>SHA-256</dt><dd id="detail-hash" class="mono"></dd></div></dl>
+          </div>
+          <div class="details-footer"><button id="detail-download" class="primary" type="button"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button></div>
         </aside>
       </section>
       <section id="status-panel" class="status-panel" aria-labelledby="status-title" hidden>
@@ -85,5 +91,11 @@
     <button type="button" role="menuitem" data-action="copy"><svg aria-hidden="true"><use href="/atlas-icons.svg#copy"></use></svg>Copier le chemin</button>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg><span id="toast-message"></span><button id="download-cancel" class="text-button" type="button" hidden>Annuler</button><button id="toast-close" class="icon-button" type="button" aria-label="Fermer le message"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
+  <section id="upload-status" class="upload-status" aria-label="Envoi de fichiers" hidden>
+    <div class="upload-status-heading"><p id="upload-message" role="status" aria-live="polite"></p><button id="upload-cancel" class="text-button" type="button">Annuler</button><button id="upload-close" class="icon-button" type="button" aria-label="Fermer le suivi d’envoi" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
+    <p id="upload-destination"></p><progress id="upload-progress" max="100" value="0" aria-label="Progression de l’envoi"></progress>
+    <ul id="upload-results" aria-label="Résultats des envois" hidden></ul>
+    <p id="upload-help" hidden>Pour autoriser l’envoi sur cet appareil : <code>mysync web-files enable-upload</code>, puis relancez le client. La lecture web doit aussi être activée.</p>
+  </section>
 </body>
 </html>
