@@ -280,20 +280,21 @@ mod tests {
             entry.sha256.as_deref(),
             Some(crate::auth_protocol::hash(&data).as_str())
         );
-        let db = f.state.db.lock().unwrap();
-        assert_eq!(
-            db.query_row("SELECT COUNT(*) FROM uploads", [], |r| r.get::<_, i64>(0))?,
-            0
-        );
-        let blob = server::stored_entry(&db, &entry.path)?
-            .unwrap()
-            .blob
-            .unwrap();
-        assert_eq!(
-            std::fs::read(f.state.data_dir.join("blobs").join(blob))?,
-            data
-        );
-        drop(db);
+        {
+            let db = f.state.db.lock().unwrap();
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM uploads", [], |r| r.get::<_, i64>(0))?,
+                0
+            );
+            let blob = server::stored_entry(&db, &entry.path)?
+                .unwrap()
+                .blob
+                .unwrap();
+            assert_eq!(
+                std::fs::read(f.state.data_dir.join("blobs").join(blob))?,
+                data
+            );
+        }
         let empty = checked(start(&f, &a, "empty.txt", b"").await)?.id;
         assert_eq!(checked(finish(&f, &a, &empty).await)?.size, Some(0));
         let corrupt = checked(start(&f, &a, "corrupt.txt", b"good").await)?.id;
@@ -350,15 +351,16 @@ mod tests {
         checked(part(&f, &b, &second, 0, b"second").await)?;
         checked(finish(&f, &a, &first).await)?;
         assert_eq!(finish(&f, &b, &second).await.unwrap_err().1, "file_exists");
-        let db = f.state.db.lock().unwrap();
-        assert_eq!(
-            server::stored_entry(&db, "race.txt")?
-                .unwrap()
-                .public
-                .sha256,
-            Some(crate::auth_protocol::hash(b"first"))
-        );
-        drop(db);
+        {
+            let db = f.state.db.lock().unwrap();
+            assert_eq!(
+                server::stored_entry(&db, "race.txt")?
+                    .unwrap()
+                    .public
+                    .sha256,
+                Some(crate::auth_protocol::hash(b"first"))
+            );
+        }
         let late = checked(start(&f, &a, "later/file", b"later").await)?.id;
         checked(part(&f, &a, &late, 0, b"later").await)?;
         f.entry("later", b"new parent")?;
