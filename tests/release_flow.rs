@@ -276,6 +276,8 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
             web_files_enabled: false,
             web_uploads_enabled: false,
             web_management_enabled: false,
+            web_edit_enabled: false,
+            web_run_enabled: false,
             update_public_key: public.clone(),
         });
         tasks.push(tokio::spawn(async move {
@@ -372,6 +374,8 @@ async fn update_keeps_installed_client_when_signed_candidate_cannot_run() -> Res
             web_files_enabled: false,
             web_uploads_enabled: false,
             web_management_enabled: false,
+            web_edit_enabled: false,
+            web_run_enabled: false,
             update_public_key: public_key,
         };
         assert!(
@@ -433,6 +437,8 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
         web_files_enabled: false,
         web_uploads_enabled: false,
         web_management_enabled: false,
+        web_edit_enabled: false,
+        web_run_enabled: false,
         update_public_key: public_key,
     };
     let response =
@@ -539,6 +545,8 @@ async fn update_reports_the_actual_published_version_without_replacing_current_c
         web_files_enabled: false,
         web_uploads_enabled: false,
         web_management_enabled: false,
+        web_edit_enabled: false,
+        web_run_enabled: false,
         update_public_key: public_key,
     };
     let config_path = temp.path().join("config.json");
@@ -623,6 +631,8 @@ async fn update_rejects_unsigned_metadata() -> Result<()> {
         web_files_enabled: false,
         web_uploads_enabled: false,
         web_management_enabled: false,
+        web_edit_enabled: false,
+        web_run_enabled: false,
         update_public_key: public_key,
     };
     assert!(

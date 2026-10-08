@@ -1,4 +1,4 @@
-//! Loopback bridge. HTTP reads never scan or mutate the mirror/profile.
+//! Loopback bridge. Code execution requires its own one-use server authorization.
 use super::Api;
 use crate::{
     auth_protocol::{now, random_secret},
@@ -35,6 +35,8 @@ struct BridgeState {
     attempts: Mutex<VecDeque<Instant>>,
     used: Mutex<HashMap<String, i64>>,
     proof_limit: Semaphore,
+    runner: super::runner::Runner,
+    runner_limit: Semaphore,
 }
 
 /// Dropping this guard stops the bridge and all accepted connections.
@@ -102,6 +104,8 @@ impl LocalBridge {
             attempts: Mutex::new(VecDeque::new()),
             used: Mutex::new(HashMap::new()),
             proof_limit: Semaphore::new(1),
+            runner: super::runner::Runner::default(),
+            runner_limit: Semaphore::new(2),
         });
         Ok(Self {
             task: tokio::spawn(serve(v4, v6, state)),
@@ -206,6 +210,9 @@ async fn handle(state: Arc<BridgeState>, host: &str, request: Request<Body>) -> 
 }
 
 async fn handle_allowed(state: &BridgeState, request: Request<Body>) -> Response {
+    if request.uri().path() == "/v1/editor" {
+        return editor(state, request).await;
+    }
     let headers = request.headers();
     if request.uri().scheme().is_some()
         || request.uri().authority().is_some()
@@ -298,6 +305,8 @@ async fn handle_allowed(state: &BridgeState, request: Request<Body>) -> Response
                     "files_read_disabled" => "files_read_disabled",
                     "files_write_disabled" => "files_write_disabled",
                     "files_manage_disabled" => "files_manage_disabled",
+                    "files_edit_disabled" => "files_edit_disabled",
+                    "code_run_disabled" => "code_run_disabled",
                     _ => "invalid_challenge",
                 },
             );
@@ -348,6 +357,101 @@ async fn handle_allowed(state: &BridgeState, request: Request<Body>) -> Response
     }
 }
 
+async fn editor(state: &BridgeState, request: Request<Body>) -> Response {
+    let headers = request.headers();
+    if request.uri().scheme().is_some()
+        || request.uri().authority().is_some()
+        || request.uri().query().is_some()
+        || ["upgrade", "transfer-encoding", "expect"]
+            .iter()
+            .any(|name| headers.contains_key(*name))
+    {
+        return failure(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    if request.method() == Method::OPTIONS {
+        let allowed = header(headers, "access-control-request-headers").is_some_and(|value| {
+            let names: Vec<_> = value
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect();
+            names.iter().any(|s| s == BRIDGE_HEADER)
+                && names
+                    .iter()
+                    .all(|s| s == BRIDGE_HEADER || s == "content-type")
+        });
+        if header(headers, "access-control-request-method") != Some("POST") || !allowed {
+            return failure(StatusCode::FORBIDDEN, "preflight_refused");
+        }
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().insert(
+            "access-control-allow-methods",
+            "POST, OPTIONS".parse().unwrap(),
+        );
+        response.headers_mut().insert(
+            "access-control-allow-headers",
+            "X-MySync-Bridge, Content-Type".parse().unwrap(),
+        );
+        if header(headers, "access-control-request-private-network") == Some("true") {
+            response.headers_mut().insert(
+                "access-control-allow-private-network",
+                "true".parse().unwrap(),
+            );
+        }
+        return response;
+    }
+    if request.method() != Method::POST
+        || header(headers, BRIDGE_HEADER) != Some("1")
+        || header(headers, "content-type") != Some("application/json")
+    {
+        return failure(StatusCode::FORBIDDEN, "invalid_request");
+    }
+    let Ok(_permit) = state.runner_limit.try_acquire() else {
+        return failure(StatusCode::TOO_MANY_REQUESTS, "runner_busy");
+    };
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        ticket: String,
+    }
+    let input = match to_bytes(request.into_body(), MAX_JSON_BYTES).await {
+        Ok(bytes) => serde_json::from_slice::<Input>(&bytes).ok(),
+        Err(_) => None,
+    };
+    let Some(input) = input.filter(|input| valid_secret(&input.ticket)) else {
+        return failure(StatusCode::BAD_REQUEST, "invalid_ticket");
+    };
+    let authorization = match state
+        .api
+        .authorize_runner(input.ticket, state.instance_id.clone())
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return failure(
+                StatusCode::FORBIDDEN,
+                if error.to_string() == "code_run_disabled" {
+                    "code_run_disabled"
+                } else {
+                    "runner_authorization_refused"
+                },
+            );
+        }
+    };
+    match state.runner.handle(authorization).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(
+            StatusCode::CONFLICT,
+            match error.to_string().as_str() {
+                "tool_missing" => "tool_missing",
+                "isolation_unavailable" => "isolation_unavailable",
+                "runner_busy" => "runner_busy",
+                "job_missing" => "job_missing",
+                _ => "runner_failed",
+            },
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +472,8 @@ mod tests {
             attempts: Mutex::new(VecDeque::new()),
             used: Mutex::new(HashMap::new()),
             proof_limit: Semaphore::new(1),
+            runner: super::super::runner::Runner::default(),
+            runner_limit: Semaphore::new(2),
         }))
     }
 

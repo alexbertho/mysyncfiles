@@ -69,7 +69,12 @@ impl Challenge {
             claims.version == 1
                 && matches!(
                     claims.scope.as_str(),
-                    "status.read" | "files.read" | "files.write" | "files.manage"
+                    "status.read"
+                        | "files.read"
+                        | "files.write"
+                        | "files.manage"
+                        | "files.edit"
+                        | "code.run"
                 ),
             "invalid_scope"
         );

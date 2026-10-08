@@ -690,6 +690,8 @@ async fn setup_replaces_an_expired_resumed_pairing_code_in_one_run() -> Result<(
                 web_files_enabled: false,
                 web_uploads_enabled: false,
         web_management_enabled: false,
+        web_edit_enabled: false,
+        web_run_enabled: false,
                 update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
             },
             "challenge": null,
@@ -1137,6 +1139,8 @@ async fn tpm_enrollment_request_binding_replay_and_revocation() -> Result<()> {
         web_files_enabled: false,
         web_uploads_enabled: false,
         web_management_enabled: false,
+        web_edit_enabled: false,
+        web_run_enabled: false,
         update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
     };
     let config_path = local.path().join("config.json");

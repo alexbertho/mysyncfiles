@@ -23,6 +23,10 @@ jobs:
         run: NODE_PATH="$RUNNER_TEMP/mysync-browser/node_modules" node tests/web_status_browser.cjs
       - name: Atlas file explorer
         run: NODE_PATH="$RUNNER_TEMP/mysync-browser/node_modules" node tests/web_files_browser.cjs
+      - name: Reproducible editor bundle
+        run: make editor-check
+      - name: Atlas code editor
+        run: NODE_PATH="$RUNNER_TEMP/mysync-browser/node_modules" node tests/web_editor_browser.cjs
   linux:
     runs-on: ubuntu-24.04
     steps:

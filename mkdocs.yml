@@ -34,6 +34,7 @@ nav:
       - Fonctionnement du client: client.md
       - Présence locale et statut web: web-status.md
       - Explorateur web Atlas: web-files.md
+      - Éditeur Python et C: web-code-editor.md
   - Administrer:
       - Configuration: configuration.md
       - Déploiement et publication: operations.md

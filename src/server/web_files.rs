@@ -1,5 +1,6 @@
 //! Scoped browser access. Status, reading and uploading have separate authority.
 mod directories;
+pub(super) mod editor;
 mod uploads;
 use super::{ApiError, ServerState, web_assets, web_status};
 use crate::{auth_protocol::now, web_status_protocol::*};
@@ -30,6 +31,7 @@ pub(super) fn router() -> Router<Arc<ServerState>> {
         .route("/", get(page))
         .route("/index.html", get(page))
         .route("/files", get(page))
+        .route("/editor", get(page))
         .route(
             "/v1/web/files/session",
             get(read_session).post(start_session),
@@ -42,6 +44,7 @@ pub(super) fn router() -> Router<Arc<ServerState>> {
         .route("/v1/web/files/pdf", get(pdf))
         .merge(uploads::router())
         .merge(directories::router())
+        .merge(editor::router())
 }
 
 fn failure(status: StatusCode, code: &str) -> ApiError {

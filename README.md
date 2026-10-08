@@ -38,6 +38,7 @@ Après comparaison de l'empreinte TPM, le client effectue une première synchron
 - [Guide complet et architecture](docs/index.md)
 - [Installation du serveur](docs/install-server.md) et [du client](docs/install-client.md)
 - [Explorateur web Atlas](docs/web-files.md) : consulter, rechercher, télécharger, ajouter des fichiers et gérer les dossiers depuis un appareil approuvé
+- [Éditeur Python et C](docs/web-code-editor.md) : modifier un fichier synchronisé et l’exécuter sur ce PC, avec des autorisations locales distinctes
 - [Statut web et présence locale TPM](docs/web-status.md)
 - [Sécurité et limites](docs/security.md), [déploiement](docs/operations.md) et [dépannage](docs/troubleshooting.md)
 

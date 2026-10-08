@@ -44,6 +44,8 @@ La version **0.3.11** ajoute des routes d’envoi au serveur et le consentement 
 
 La version **0.3.12** ajoute la gestion des dossiers Atlas et le consentement client distinct `mysync web-files enable-manage`. Elle exige une mise à jour du serveur et une release cliente signée publiée séparément. Les consentements de lecture et d’envoi n’accordent pas la gestion des dossiers. Voir [gérer les dossiers](web-files.md#gerer-les-dossiers).
 
+La version **0.3.13** ajoute l’éditeur Python/C, la sauvegarde web d’un fichier existant et l’exécution isolée sur le PC du navigateur. Elle nécessite une reconstruction du serveur et la publication du client signé. Après mise à jour du client, les commandes `mysync web-files enable-edit` et `mysync web-files enable-run` accordent séparément ces consentements, désactivés par défaut. Voir les [autorisations et prérequis de l’éditeur](web-code-editor.md).
+
 ```sh
 mysync-release publish --secret-key /chemin/prive/cle-signature \
   --binary target/release/mysync --version VERSION \
@@ -90,7 +92,16 @@ Pour passer d’un ancien serveur avec interface embarquée à ce fonctionnement
 
 Hors Docker, `mysync-server serve --web-dir /chemin/vers/web` indique le dossier public ; sa valeur par défaut est `web`, relative au répertoire de lancement. Conserver les autres arguments habituels, notamment `--data-dir`. Distribuer ce dossier avec le serveur lors d’une installation binaire.
 
-Les routes `/`, `/index.html`, `/files` et `/status` servent le même HTML. Seuls les fichiers de l’interface explicitement exposés sont accessibles, sans parcours de répertoire. Les lectures refusent les liens symboliques et les fichiers de plus de 1 Mio. Les clés, profils et données synchronisées restent dans leurs répertoires privés. Un fichier web absent ou invalide produit une erreur `503` ; le remplacer rétablit la page sans redémarrage.
+Les routes `/`, `/index.html`, `/files`, `/editor` et `/status` servent le même HTML. Seuls les fichiers de l’interface explicitement exposés sont accessibles, sans parcours de répertoire. Les lectures refusent les liens symboliques et les fichiers de plus de 1 Mio. Les clés, profils et données synchronisées restent dans leurs répertoires privés. Un fichier web absent ou invalide produit une erreur `503` ; le remplacer rétablit la page sans redémarrage.
+
+Le moteur de l’éditeur est livré dans `web/editor.js`, avec ses sources dans
+`web/editor-src/` et les licences tierces dans `web/editor.LICENSE`. Après une
+modification de ces sources, utiliser `make editor-build` (Node.js 20 ou plus
+récent et npm). `make editor-check` vérifie que le bundle correspond aux sources
+et aux dépendances verrouillées dans `web/package-lock.json`. Le serveur ne
+nécessite pas Node.js et aucun script n’est téléchargé depuis un CDN. Les styles
+de CodeMirror sont isolés dans un ShadowRoot ; la politique CSP conserve
+`script-src 'self'` et `style-src 'self'`, sans exception pour du code inline.
 
 ## Mesurer les performances
 

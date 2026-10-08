@@ -22,6 +22,13 @@ La commande `device auth-configure` enregistre dans SQLite l'origine publique HT
 
 `web_uploads_enabled` autorise séparément l’ajout de fichiers depuis Atlas. Il est désactivé par défaut et se règle avec `mysync web-files enable-upload` ou `disable-upload`, puis un redémarrage du daemon. Une preuve `files.write` exige aussi `web_files_enabled` ; autoriser la lecture seule n’autorise jamais l’envoi. L’envoi web refuse de remplacer les fichiers existants.
 
+`web_edit_enabled` et `web_run_enabled` sont également désactivés par défaut.
+Les commandes `mysync web-files enable-edit` et `enable-run` autorisent
+respectivement l’édition de fichiers Python/C et l’exécution locale isolée.
+Les commandes `disable-edit` et `disable-run` les désactivent. Le daemon doit
+être relancé après modification du profil. Voir les
+[autorisations et limites de l’éditeur](web-code-editor.md).
+
 `web_status_enabled` est un booléen, `true` par défaut depuis la version 0.3.8, enregistré dans les nouveaux profils. Un ancien profil sans ce champ utilise `true` ; un `false` explicite reste conservé. À `true`, `mysync daemon` expose le pont de présence sur le port loopback 47831 pour la page `/status` du serveur. Utiliser `mysync web-status status`, `enable` ou `disable` pour consulter ou modifier ce réglage. L’installateur propose le choix et `mysync setup --web-status true|false` permet de le fixer pendant l’appairage. Un redémarrage du daemon est nécessaire après modification. Voir [le fonctionnement et les limites du statut web](web-status.md).
 
 Le champ `server_public_key` contient la clé publique Ed25519 reçue directement de l'administrateur. `setup` et `enroll` acceptent `--server-public-key CLE_HEX`, ou la demandent dans un terminal. Un ancien profil sans cette clé refuse de synchroniser jusqu'à l'exécution de `mysync trust-server --public-key CLE_HEX` ; voir la [migration](device-auth.md#authenticite-des-reponses-et-migration). Cette clé est distincte de `update_public_key`, utilisée pour les releases.

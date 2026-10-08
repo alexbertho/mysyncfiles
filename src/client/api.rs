@@ -26,6 +26,8 @@ pub struct Api {
     web_files_enabled: bool,
     web_uploads_enabled: bool,
     web_management_enabled: bool,
+    web_edit_enabled: bool,
+    web_run_enabled: bool,
     communication: Arc<Mutex<(crate::web_status_protocol::CommunicationState, Option<i64>)>>,
 }
 
@@ -124,6 +126,8 @@ impl Api {
             web_files_enabled: config.web_files_enabled,
             web_uploads_enabled: config.web_uploads_enabled,
             web_management_enabled: config.web_management_enabled,
+            web_edit_enabled: config.web_edit_enabled,
+            web_run_enabled: config.web_run_enabled,
             http,
             base: config.server.trim_end_matches('/').to_owned(),
             signer: crate::tpm::RequestSigner::new(
@@ -227,7 +231,7 @@ impl Api {
         anyhow::ensure!(
             !matches!(
                 claims.scope.as_str(),
-                "files.read" | "files.write" | "files.manage"
+                "files.read" | "files.write" | "files.manage" | "files.edit" | "code.run"
             ) || self.web_files_enabled,
             "files_read_disabled"
         );
@@ -239,7 +243,37 @@ impl Api {
             claims.scope != "files.manage" || self.web_management_enabled,
             "files_manage_disabled"
         );
+        anyhow::ensure!(
+            claims.scope != "files.edit" || self.web_edit_enabled,
+            "files_edit_disabled"
+        );
+        anyhow::ensure!(
+            claims.scope != "code.run" || self.web_run_enabled,
+            "code_run_disabled"
+        );
         Ok(claims)
+    }
+
+    pub(super) async fn authorize_runner(
+        &self,
+        ticket: String,
+        instance_id: String,
+    ) -> Result<crate::editor_protocol::Authorization> {
+        anyhow::ensure!(
+            self.web_files_enabled && self.web_run_enabled,
+            "code_run_disabled"
+        );
+        let response = self
+            .send(
+                self.http
+                    .post(self.url(crate::editor_protocol::AUTHORIZE_PATH))
+                    .json(&crate::editor_protocol::AuthorizationRequest {
+                        ticket,
+                        instance_id,
+                    }),
+            )
+            .await?;
+        authenticated_json(response, crate::editor_protocol::JSON_BYTES).await
     }
 
     pub(super) fn communication(

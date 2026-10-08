@@ -1,7 +1,7 @@
 :root {
   color-scheme: light;
   font-family: Arial,Helvetica,sans-serif;
-  font-size: 16px;
+  font-size: 14px;
   line-height: 1.5;
   --bg: #fff;
   --surface: #f8fafd;
@@ -29,9 +29,11 @@
   --radius-sm: 4px;
   --radius: 6px;
   --text-small: 12px;
-  --text-ui: 14px;
-  --toolbar-height: 64px;
-  --sidebar-width: 232px;
+  --text-ui: 13px;
+  --text-heading: 22px;
+  --font-mono: ui-monospace, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  --toolbar-height: 56px;
+  --sidebar-width: 216px;
 }
 :root[data-theme=dark] {
   color-scheme: dark;
@@ -128,7 +130,7 @@ h2 {
   align-items: center;
   gap: var(--space-2);
   color: var(--text);
-  font-size: 21px;
+  font-size: 18px;
   font-weight: 700;
   text-decoration: none;
   letter-spacing: -.6px;
@@ -332,6 +334,7 @@ h2 {
   align-items: center;
   gap: var(--space-2);
   font-weight: 700;
+  font-size: 18px;
   letter-spacing: -.3px;
   white-space: nowrap;
 }
@@ -413,7 +416,7 @@ body.sidebar-collapsed .compact-brand {
   font-size: var(--text-small);
 }
 .file-list h1 {
-  font-size: 26px;
+  font-size: var(--text-heading);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -529,7 +532,7 @@ th svg {
   width: 48px;
 }
 td {
-  height: 48px;
+  height: 40px;
   border-bottom: 1px solid var(--border-soft);
   padding: 0 var(--space-3);
   font-size: var(--text-ui);
@@ -575,7 +578,7 @@ tbody tr:focus-within:not(.selected) td {
   text-align: left;
   width: 100%;
   min-width: 0;
-  min-height: 47px;
+  min-height: 39px;
   border-radius: var(--radius-sm);
 }
 .entry-button:focus-visible {
@@ -751,9 +754,9 @@ mark {
   gap: var(--space-2);
   align-items: center;
   justify-content: center;
-  min-height: 44px;
+  min-height: 36px;
   border-radius: var(--radius);
-  padding: 10px var(--space-4);
+  padding: 7px var(--space-4);
   font-size: var(--text-ui);
   font-weight: 500;
   border: 1px solid var(--accent);

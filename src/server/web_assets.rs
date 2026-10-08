@@ -14,6 +14,8 @@ const ASSETS: &[(&str, &str)] = &[
     ("status.css", "text/css; charset=utf-8"),
     ("status.js", "text/javascript; charset=utf-8"),
     ("atlas.js", "text/javascript; charset=utf-8"),
+    ("editor.js", "text/javascript; charset=utf-8"),
+    ("editor.css", "text/css; charset=utf-8"),
     ("atlas-icons.svg", "image/svg+xml"),
     ("atlas-icons.LICENSE", "text/plain; charset=utf-8"),
     ("atlas-brand.png", "image/png"),

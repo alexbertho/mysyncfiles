@@ -89,9 +89,21 @@ Arrêter le daemon avant de modifier un profil verrouillé, puis relancer le cli
 
 Chaque opération est atomique et limitée à **10 000 fichiers**, sous-dossiers compris. Les propriétés restent consultables au-delà de cette limite. Le serveur vérifie les révisions de tout le contenu : si un fichier est ajouté, modifié ou supprimé depuis l’ouverture de la confirmation, fermer celle-ci, actualiser la liste et recommencer. Une réponse perdue n’est pas une confirmation d’échec : actualiser la liste avant de réessayer. Les dossiers vides ne sont toujours pas représentés.
 
+## Éditer et exécuter du code
+
+Les fichiers Python et C disposent aussi d’une action **Modifier le code** et
+s’ouvrent par double-clic dans l’[éditeur dédié](web-code-editor.md). L’édition
+et l’exécution sur ce PC nécessitent chacune une autorisation supplémentaire.
+Ces fonctions exigent un serveur et un client intégrant l’éditeur ; une mise à
+jour des seuls fichiers web ne suffit pas.
+
 ## Expiration et révocation
 
 **Déconnexion** supprime la session sur le serveur, ses challenges et ses autorisations de lecture, d’envoi et de gestion des dossiers. Les autres onglets ouverts sur la même origine effacent aussi leur affichage lorsqu’ils reçoivent cette déconnexion. Après 30 minutes, une nouvelle vérification explicite est nécessaire ; consulter un dossier ne prolonge pas la session.
+
+Les autorisations d’édition et d’exécution sont également supprimées. L’éditeur
+conserve un éventuel brouillon non confirmé à l’écran pour permettre son
+téléchargement ; il bloque alors la sauvegarde et le lancement.
 
 ```sh
 mysync web-files disable

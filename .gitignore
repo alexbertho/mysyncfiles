@@ -1,4 +1,5 @@
 /target/
+/web/node_modules/
 /site/
 /data/
 /backups/

@@ -51,7 +51,15 @@ pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
             challenge_id TEXT NOT NULL, expires_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS web_file_uploads(
             upload_id TEXT PRIMARY KEY REFERENCES uploads(id) ON DELETE CASCADE,
-            session_hash TEXT NOT NULL, grant_id TEXT NOT NULL);")?;
+            session_hash TEXT NOT NULL, grant_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS web_editor_grants(
+            session_hash TEXT NOT NULL REFERENCES web_file_grants(session_hash) ON DELETE CASCADE,
+            scope TEXT NOT NULL, challenge_id TEXT NOT NULL, instance_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL, PRIMARY KEY(session_hash,scope));
+        CREATE TABLE IF NOT EXISTS web_runner_tickets(
+            ticket_hash TEXT PRIMARY KEY,
+            session_hash TEXT NOT NULL REFERENCES web_file_grants(session_hash) ON DELETE CASCADE,
+            grant_id TEXT NOT NULL, operation TEXT NOT NULL, expires_at INTEGER NOT NULL);")?;
     let has_scope = db
         .prepare("PRAGMA table_info(web_status_challenges)")?
         .query_map([], |r| r.get::<_, String>(1))?
@@ -187,10 +195,14 @@ pub(super) async fn middleware(
                 request.uri().path(),
                 "/v1/web/files/directories/rename" | "/v1/web/files/directories/delete"
             );
+        let edit = request.method() == axum::http::Method::PUT
+            && request.uri().path() == "/v1/web/editor/file";
         let (parts, body) = request.into_parts();
         let bytes = to_bytes(
             body,
-            if chunk {
+            if edit {
+                crate::editor_protocol::JSON_BYTES
+            } else if chunk {
                 crate::model::UPLOAD_CHUNK_BYTES as usize
             } else if directory {
                 32 * 1024
@@ -308,7 +320,10 @@ pub(super) fn issue_challenge(
         .as_deref()
         .map(|id| verified_result(&tx, &session, id).map(|p| p.device_id))
         .transpose()?;
-    if matches!(scope, "files.write" | "files.manage") {
+    if matches!(
+        scope,
+        "files.write" | "files.manage" | "files.edit" | "code.run"
+    ) {
         // A write challenge belongs to the device whose read grant is open.
         expected_device_id = Some(
             tx.query_row(
@@ -424,6 +439,8 @@ fn accept_proof(
         let expires = now() + FILES_SESSION_SECONDS;
         tx.execute("DELETE FROM web_file_write_grants WHERE session_hash=(SELECT session_hash FROM web_status_challenges WHERE id=?1)", [&claims.challenge_id]).map_err(ApiError::internal)?;
         tx.execute("DELETE FROM web_file_manage_grants WHERE session_hash=(SELECT session_hash FROM web_status_challenges WHERE id=?1)", [&claims.challenge_id]).map_err(ApiError::internal)?;
+        tx.execute("DELETE FROM web_editor_grants WHERE session_hash=(SELECT session_hash FROM web_status_challenges WHERE id=?1)", [&claims.challenge_id]).map_err(ApiError::internal)?;
+        tx.execute("DELETE FROM web_runner_tickets WHERE session_hash=(SELECT session_hash FROM web_status_challenges WHERE id=?1)", [&claims.challenge_id]).map_err(ApiError::internal)?;
         tx.execute("INSERT INTO web_file_grants(session_hash,challenge_id,device_id,enrollment_id,expires_at)
             SELECT session_hash,id,?2,?3,?4 FROM web_status_challenges WHERE id=?1
             ON CONFLICT(session_hash) DO UPDATE SET challenge_id=excluded.challenge_id,device_id=excluded.device_id,enrollment_id=excluded.enrollment_id,expires_at=excluded.expires_at",
@@ -454,6 +471,17 @@ fn accept_proof(
             WHERE c.id=?1 AND g.device_id=?2 AND g.enrollment_id=?3 AND g.expires_at>?4
             ON CONFLICT(session_hash) DO UPDATE SET challenge_id=excluded.challenge_id,expires_at=excluded.expires_at",
             params![claims.challenge_id, device_id, enrollment_id, now()]).map_err(ApiError::internal)?;
+        if updated != 1 {
+            return Err(denied());
+        }
+    }
+    if matches!(claims.scope.as_str(), "files.edit" | "code.run") {
+        let updated = tx.execute("INSERT INTO web_editor_grants(session_hash,scope,challenge_id,instance_id,expires_at)
+            SELECT g.session_hash,?5,?1,?6,g.expires_at FROM web_file_grants g
+            JOIN web_status_challenges c ON c.session_hash=g.session_hash
+            WHERE c.id=?1 AND g.device_id=?2 AND g.enrollment_id=?3 AND g.expires_at>?4
+            ON CONFLICT(session_hash,scope) DO UPDATE SET challenge_id=excluded.challenge_id,instance_id=excluded.instance_id,expires_at=excluded.expires_at",
+            params![claims.challenge_id, device_id, enrollment_id, now(), claims.scope, result.instance_id]).map_err(ApiError::internal)?;
         if updated != 1 {
             return Err(denied());
         }

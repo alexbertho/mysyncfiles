@@ -280,6 +280,8 @@ pub fn config(url: &str, root: &Path, identity: Identity) -> ClientConfig {
         web_files_enabled: false,
         web_uploads_enabled: false,
         web_management_enabled: false,
+        web_edit_enabled: false,
+        web_run_enabled: false,
         update_public_key: mysyncfiles::release::PUBLIC_KEY_HEX.trim().into(),
     }
 }

@@ -119,6 +119,14 @@ enum WebFilesAction {
     EnableManage,
     /// Refuse new browser directory management authorizations
     DisableManage,
+    /// Allow editing existing Python and C files (requires read access)
+    EnableEdit,
+    /// Refuse new browser editing authorizations
+    DisableEdit,
+    /// Allow isolated local code execution (requires read access)
+    EnableRun,
+    /// Refuse browser code execution after restarting the daemon
+    DisableRun,
     /// Show saved browser permissions without contacting the TPM or server
     Status,
 }
@@ -280,13 +288,35 @@ async fn main() -> Result<()> {
                     "web_management_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
                 );
             }
+            Some(
+                WebFilesAction::EnableEdit
+                | WebFilesAction::DisableEdit
+                | WebFilesAction::EnableRun
+                | WebFilesAction::DisableRun,
+            ) => {
+                let execution = matches!(
+                    action,
+                    Some(WebFilesAction::EnableRun | WebFilesAction::DisableRun)
+                );
+                let enabled = matches!(
+                    action,
+                    Some(WebFilesAction::EnableEdit | WebFilesAction::EnableRun)
+                );
+                client::set_web_editor(&config_path, execution, enabled)?;
+                println!(
+                    "web_{}_enabled={enabled}; restart the running daemon to apply",
+                    if execution { "run" } else { "edit" }
+                );
+            }
             Some(WebFilesAction::Status) | None => {
                 let config = client::load_config(&config_path)?;
                 println!(
-                    "web_files_enabled={}\nweb_uploads_enabled={}\nweb_management_enabled={}",
+                    "web_files_enabled={}\nweb_uploads_enabled={}\nweb_management_enabled={}\nweb_edit_enabled={}\nweb_run_enabled={}",
                     config.web_files_enabled,
                     config.web_uploads_enabled,
-                    config.web_management_enabled
+                    config.web_management_enabled,
+                    config.web_edit_enabled,
+                    config.web_run_enabled
                 );
             }
         },

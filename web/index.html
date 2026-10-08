@@ -7,6 +7,8 @@
   <title>Fichiers · MySyncFiles</title>
   <link rel="icon" href="/atlas-brand.png">
   <link rel="stylesheet" href="/status.css">
+  <link rel="stylesheet" href="/editor.css">
+  <script src="/editor.js" defer></script>
   <script src="/atlas.js" defer></script>
   <script src="/status.js" defer></script>
 </head>
@@ -33,10 +35,34 @@
         <button id="clear-search" class="icon-button" type="button" aria-label="Effacer la recherche" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button>
       </div>
       <span id="toolbar-title" hidden>Statut de cet appareil</span>
+      <nav id="editor-navigation" aria-label="Fichier ouvert" hidden><a id="editor-back" href="/files"><svg aria-hidden="true"><use href="/atlas-icons.svg#left"></use></svg>Retour aux fichiers</a><span id="editor-path"></span></nav>
       <button id="refresh" class="icon-button refresh-button" type="button" aria-label="Actualiser les fichiers" title="Actualiser les fichiers" aria-controls="file-table" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#refresh"></use></svg><span>Actualiser</span></button>
       <button id="theme-toggle" class="icon-button theme-button" type="button" aria-label="Passer au thème sombre"><svg aria-hidden="true"><use href="/atlas-icons.svg#moon"></use></svg></button>
     </header>
     <main id="main" tabindex="-1">
+      <section id="code-editor" aria-label="Éditeur de code" hidden>
+        <header class="editor-heading"><h1 id="editor-name">Ouverture…</h1><span id="editor-language"></span><span id="editor-tool" role="status">Détection en cours…</span><span class="editor-local"><svg aria-hidden="true"><use href="/atlas-icons.svg#laptop"></use></svg>Exécution sur ce PC</span><button id="editor-run" class="primary" type="button" disabled><svg aria-hidden="true"><use href="/atlas-icons.svg#play"></use></svg><span>Exécuter</span></button></header>
+        <div id="editor-panes" class="editor-panes">
+          <section id="code-pane" class="editor-pane" aria-labelledby="code-heading">
+            <div class="editor-pane-heading"><h2 id="code-heading"><svg aria-hidden="true"><use href="/atlas-icons.svg#code"></use></svg>Code</h2><span id="editor-save-state" role="status" aria-live="polite">Ouverture…</span><div class="editor-actions" role="group" aria-label="Outils d’édition">
+              <button id="editor-undo" class="icon-button" type="button" aria-label="Annuler la modification" title="Annuler (Ctrl+Z)" disabled>↶</button><button id="editor-redo" class="icon-button" type="button" aria-label="Rétablir la modification" title="Rétablir (Ctrl+Maj+Z)" disabled>↷</button>
+              <button id="editor-find" class="icon-button" type="button" aria-label="Rechercher et remplacer" title="Rechercher et remplacer (Ctrl+F)"><svg aria-hidden="true"><use href="/atlas-icons.svg#search"></use></svg></button>
+              <button id="editor-reindent" class="icon-button" type="button" aria-label="Réindenter la sélection" title="Réindenter la sélection (Ctrl+Maj+I)" disabled><svg aria-hidden="true"><use href="/atlas-icons.svg#code"></use></svg></button>
+              <button id="editor-wrap" class="icon-button" type="button" aria-label="Retour à la ligne visuel" title="Retour à la ligne visuel" aria-pressed="false">↵</button>
+              <button id="editor-whitespace" class="icon-button" type="button" aria-label="Afficher les espaces et tabulations" title="Afficher les espaces et tabulations" aria-pressed="false">·</button>
+              <button id="editor-shortcuts" class="icon-button" type="button" aria-label="Raccourcis clavier" title="Raccourcis clavier"><svg aria-hidden="true"><use href="/atlas-icons.svg#info"></use></svg></button>
+            </div></div>
+            <div id="editor-notice" class="editor-notice" hidden><p id="editor-error" role="alert"></p><div class="editor-notice-actions"><button id="editor-retry" class="text-button" type="button">Réessayer</button><button id="editor-draft" class="text-button" type="button" hidden>Télécharger le brouillon</button><button id="editor-discard" class="text-button" type="button" hidden>Quitter sans enregistrer</button></div></div>
+            <div id="code-host" class="code-layer"></div>
+            <footer class="editor-statusbar"><button id="editor-goto" class="status-button" type="button" title="Aller à la ligne (Ctrl+G)"><span id="editor-position">Ln 1, Col 1</span></button><span id="editor-lines">1 ligne</span><label class="indent-setting"><span class="sr-only">Indentation</span><select id="editor-indent" aria-label="Indentation"><option value="2">Espaces : 2</option><option value="4" selected>Espaces : 4</option><option value="8">Espaces : 8</option><option value="tab">Tabulations</option></select></label><span id="editor-eol">UTF-8 · LF</span></footer>
+          </section>
+          <div id="editor-splitter" role="separator" tabindex="0" aria-label="Largeur de la colonne Code" aria-orientation="vertical" aria-valuemin="30" aria-valuemax="80" aria-valuenow="65" aria-controls="code-pane output-pane"></div>
+          <section id="output-pane" class="editor-pane" aria-labelledby="output-heading">
+            <div class="editor-pane-heading"><h2 id="output-heading"><svg aria-hidden="true"><use href="/atlas-icons.svg#terminal"></use></svg>Sortie</h2><button id="editor-clear" class="icon-button" type="button" aria-label="Effacer la sortie"><svg aria-hidden="true"><use href="/atlas-icons.svg#trash"></use></svg></button></div>
+            <div id="editor-output" class="editor-output" tabindex="0" role="region" aria-label="Résultat de l’exécution"><p id="runner-message" role="status">Vérification du client sur ce PC…</p><button id="runner-retry" class="text-button" type="button" hidden>Réessayer la détection</button><p id="output-stale" class="output-stale" role="status" hidden>Le code a changé depuis ce lancement. Cette sortie correspond à la version exécutée.</p><div id="run-output"></div><div id="run-result" class="run-result" role="status" hidden></div></div>
+          </section>
+        </div>
+      </section>
       <section id="access" class="access" aria-labelledby="access-title">
         <svg id="access-icon" class="state-icon" aria-hidden="true"><use href="/atlas-icons.svg#laptop"></use></svg>
         <h1 id="access-title">Vérifier cet appareil</h1>
@@ -68,7 +94,7 @@
             <p class="detail-path-label">Chemin</p><p id="detail-path" class="mono"></p>
             <dl><div><dt>Taille</dt><dd id="detail-size"></dd></div><div><dt>Dernière modification</dt><dd id="detail-modified"></dd></div><div id="detail-count-row" hidden><dt>Fichiers, sous-dossiers compris</dt><dd id="detail-count"></dd></div><div id="detail-revision-row" class="detail-technical"><dt>Révision</dt><dd id="detail-revision"></dd></div><div id="detail-hash-row"><dt>SHA-256</dt><dd id="detail-hash" class="mono"></dd></div></dl>
           </div>
-          <div class="details-footer"><button id="detail-download" class="primary" type="button"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button><button id="detail-open" class="primary" type="button" hidden>Ouvrir le dossier</button></div>
+          <div class="details-footer"><button id="detail-edit" class="primary" type="button" hidden>Modifier le code</button><button id="detail-download" class="primary" type="button"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button><button id="detail-open" class="primary" type="button" hidden>Ouvrir le dossier</button></div>
         </aside>
       </section>
       <section id="status-panel" class="status-panel" aria-labelledby="status-title" hidden>
@@ -86,6 +112,7 @@
     </main>
   </div>
   <div id="file-menu" class="file-menu" role="menu" aria-label="Actions du fichier" hidden>
+    <button type="button" role="menuitem" data-action="edit" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#code"></use></svg>Modifier le code</button>
     <button type="button" role="menuitem" data-action="open" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#directory"></use></svg>Ouvrir</button>
     <button type="button" role="menuitem" data-action="download"><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg>Télécharger</button>
     <button type="button" role="menuitem" data-action="details"><svg aria-hidden="true"><use href="/atlas-icons.svg#info"></use></svg>Voir les détails</button>
@@ -101,6 +128,25 @@
       <p id="folder-help" hidden>Autorisez la gestion des dossiers avec <code>mysync web-files enable-manage</code>, puis relancez le client. Cette commande nécessite un client compatible et la lecture web activée.</p>
       <div class="folder-buttons"><button id="folder-cancel" class="text-button" type="button">Annuler</button><button id="folder-confirm" class="primary" type="submit" disabled></button></div>
     </form>
+  </dialog>
+  <dialog id="editor-help" class="folder-dialog editor-help" aria-labelledby="editor-help-title">
+    <div class="editor-help-heading"><h2 id="editor-help-title">Raccourcis de l’éditeur</h2><button id="editor-help-close" class="icon-button" type="button" aria-label="Fermer les raccourcis"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
+    <p>Sur Mac, utilisez ⌘ à la place de Ctrl pour les commandes d’édition.</p>
+    <dl class="shortcut-list">
+      <div><dt>Indenter / désindenter</dt><dd><kbd>Tab</kbd> / <kbd>Maj Tab</kbd></dd></div>
+      <div><dt>Sortir de l’éditeur au clavier</dt><dd><kbd>Échap</kbd> puis <kbd>Tab</kbd></dd></div>
+      <div><dt>Suggestions / valider</dt><dd><kbd>Ctrl Espace</kbd> / <kbd>Entrée</kbd></dd></div>
+      <div><dt>Rechercher / remplacer</dt><dd><kbd>Ctrl F</kbd> / <kbd>Ctrl H</kbd></dd></div>
+      <div><dt>Aller à la ligne</dt><dd><kbd>Ctrl G</kbd></dd></div>
+      <div><dt>Annuler / rétablir</dt><dd><kbd>Ctrl Z</kbd> / <kbd>Ctrl Maj Z</kbd></dd></div>
+      <div><dt>Commenter la sélection</dt><dd><kbd>Ctrl /</kbd></dd></div>
+      <div><dt>Réindenter la sélection</dt><dd><kbd>Ctrl Maj I</kbd></dd></div>
+      <div><dt>Déplacer / dupliquer une ligne</dt><dd><kbd>Alt ↑ ↓</kbd> / <kbd>Alt Maj ↑ ↓</kbd></dd></div>
+      <div><dt>Sélectionner l’occurrence suivante</dt><dd><kbd>Ctrl D</kbd></dd></div>
+      <div><dt>Replier / déplier le bloc</dt><dd><kbd>Ctrl Maj [</kbd> / <kbd>Ctrl Maj ]</kbd></dd></div>
+      <div><dt>Enregistrer / exécuter</dt><dd><kbd>Ctrl S</kbd> / <kbd>Ctrl Entrée</kbd></dd></div>
+    </dl>
+    <p>Entrée reprend automatiquement l’indentation. Les parenthèses, crochets et guillemets se ferment à la saisie. Ctrl+clic ajoute un curseur ; Alt+glisser sélectionne un rectangle.</p>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden><svg aria-hidden="true"><use href="/atlas-icons.svg#download"></use></svg><span id="toast-message"></span><button id="download-cancel" class="text-button" type="button" hidden>Annuler</button><button id="toast-close" class="icon-button" type="button" aria-label="Fermer le message"><svg aria-hidden="true"><use href="/atlas-icons.svg#close"></use></svg></button></div>
   <section id="upload-status" class="upload-status" aria-label="Envoi de fichiers" hidden>

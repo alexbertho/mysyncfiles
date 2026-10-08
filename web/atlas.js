@@ -39,9 +39,14 @@
     sidebar(closed); preference("mysync-sidebar", closed ? "closed" : "open");
   });
   const statusPage = location.pathname === "/status";
+  const editorPage = location.pathname === "/editor";
+  let codeEditor;
+  document.body.classList.toggle("code-editor-page", editorPage);
+  if (editorPage) sidebar(true);
   $(statusPage ? "status-nav" : "files-nav").setAttribute("aria-current", "page");
   $("status-panel").hidden = !statusPage;
-  $("search-box").hidden = statusPage;
+  $("search-box").hidden = statusPage || editorPage;
+  $("editor-navigation").hidden = !editorPage;
   $("toolbar-title").hidden = !statusPage;
   $("access").hidden = statusPage;
   document.title = `${statusPage ? "Statut local" : "Fichiers"} · MySyncFiles`;
@@ -155,6 +160,11 @@
     directory = ""; search = ""; cursors = [""]; pageIndex = 0; next = undefined;
     $("file-verify").disabled = false; $("file-cancel").hidden = true;
     access(state, message);
+    if (editorPage && codeEditor) {
+      const draft = codeEditor.lock();
+      $("code-editor").hidden = !draft;
+      if (draft) $("access").hidden = true;
+    }
   }
   function acceptSession(value) {
     if (!Number.isSafeInteger(value.expires_at) || typeof value.device_name !== "string" || value.device_name.length > 512 ||
@@ -169,7 +179,8 @@
     $("session-dot").className = "session-dot verified";
     $("session-label").textContent = "Appareil reconnu";
     $("logout").hidden = false;
-    if (!statusPage) { $("access").hidden = true; $("explorer").hidden = false; $("search").disabled = false; $("refresh").hidden = false; }
+    if (editorPage) { $("access").hidden = true; $("code-editor").hidden = false; }
+    else if (!statusPage) { $("access").hidden = true; $("explorer").hidden = false; $("search").disabled = false; $("refresh").hidden = false; }
   }
   async function restore() {
     const current = epoch;
@@ -177,7 +188,11 @@
       const value = await request("/v1/web/files/session");
       if (epoch !== current) return;
       acceptSession(value);
-      if (!statusPage) await load();
+      if (editorPage) await codeEditor.open();
+      else if (!statusPage) {
+        const folder = new URLSearchParams(location.search).get("directory") || "";
+        await load({...currentView(), directory: folder});
+      }
     } catch (_) { /* An anonymous browser sees only the access screen. */ }
   }
   async function denied() {
@@ -224,7 +239,7 @@
       }
       if (current !== epoch || controller.signal.aborted) return;
       acceptSession(value);
-      await load();
+      if (editorPage) await codeEditor.open(); else await load();
     } catch (error) {
       if (current !== epoch) return;
       if (userCancelled) {
@@ -307,7 +322,7 @@
     load({directory: path, search: "", pageIndex: 0, cursors: [""]});
   }
   for (const link of [$("files-nav"), document.querySelector(".brand")]) link.addEventListener("click", event => {
-    if (!statusPage && session && event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
+    if (!statusPage && !editorPage && session && event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
       event.preventDefault(); navigate("");
     }
   });
@@ -380,12 +395,15 @@
             if (entry.kind === "directory") { selectDirectory(entry, button); return; }
             // Leave time for the second click before the narrow-screen details
             // overlay makes the file list inert. Keyboard activation is immediate.
-            if (/\.pdf$/i.test(entry.path) && event.detail && matchMedia("(max-width: 1100px)").matches) {
+            if (/\.(pdf|py|c)$/i.test(entry.path) && event.detail && matchMedia("(max-width: 1100px)").matches) {
               const current = epoch;
               detailsTimer = setTimeout(() => { if (current === epoch && session && button.isConnected) details(entry, button); }, 500);
             } else details(entry, button);
           };
           button.addEventListener("click", selectEntry);
+          if (editable(entry)) row.addEventListener("dblclick", event => {
+            if (!event.target.closest("button") || button.contains(event.target)) openEditor(entry);
+          });
           if (entry.kind === "directory") {
             button.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); navigate(entry.path); } });
             row.addEventListener("dblclick", event => { if (!event.target.closest("button") || button.contains(event.target)) navigate(entry.path); });
@@ -454,6 +472,7 @@
     if (folder) button.setAttribute("aria-pressed", "true");
     $("detail-heading").textContent = folder ? "Propriétés du dossier" : "Détails du fichier";
     $("detail-download").hidden = folder; $("detail-open").hidden = !folder;
+    $("detail-edit").hidden = !editable(entry);
     $("detail-revision-row").hidden = folder; $("detail-hash-row").hidden = folder; $("detail-count-row").hidden = !folder;
     $("detail-count").textContent = entry.file_count ?? "—";
     $("detail-name").textContent = basename(entry.path); $("detail-path").textContent = entry.path;
@@ -489,6 +508,7 @@
     for (const action of ["open", "rename", "delete"]) menu.querySelector(`[data-action="${action}"]`).hidden = !folder;
     menu.querySelector('[data-action="download"]').hidden = folder;
     menu.querySelector('[data-action="copy"]').hidden = folder;
+    menu.querySelector('[data-action="edit"]').hidden = !editable(entry);
     menu.querySelector('[data-action="details"]').lastChild.textContent = folder ? "Propriétés" : "Voir les détails";
     for (const action of ["rename", "delete"]) { const control = menu.querySelector(`[data-action="${action}"]`); control.disabled = !session?.manage_limit; control.title = control.disabled ? "La gestion nécessite une mise à jour du serveur" : ""; }
     menu.hidden = false; button.setAttribute("aria-expanded", "true");
@@ -511,6 +531,7 @@
     if (!entry || !action) return;
     closeMenu(true);
     if (action === "open") navigate(entry.path);
+    if (action === "edit") openEditor(entry);
     if (action === "details") {
       const current = epoch;
       try {
@@ -542,6 +563,15 @@
   $("details-dismiss").addEventListener("click", () => closeDetails(true));
   $("detail-download").addEventListener("click", () => { if (selected) download(selected); });
   $("detail-open").addEventListener("click", () => { if (selected?.kind === "directory") navigate(selected.path); });
+  $("detail-edit").addEventListener("click", () => { if (selected) openEditor(selected); });
+  function editable(entry) { return entry?.kind === "file" && /\.(py|c)$/i.test(entry.path); }
+  function openEditor(entry) {
+    clearTimeout(detailsTimer);
+    if (!session || !editable(entry)) return;
+    if (upload || transfer) { toast("Attendez la fin du transfert avant d’ouvrir l’éditeur."); return; }
+    if (entry.size > 262144) { toast("L’éditeur accepte les fichiers jusqu’à 256 Kio."); return; }
+    location.assign(`/editor?${new URLSearchParams({path: entry.path, directory})}`);
+  }
   $("refresh").addEventListener("click", () => { if (!listingRequest) { clearTimeout(searchTimer); load(retryView || currentView()); } });
   $("next-page").addEventListener("click", () => { if (next && !listingRequest) load({...currentView(), pageIndex: pageIndex + 1, cursors: [...cursors.slice(0, pageIndex + 1), next]}); });
   $("previous-page").addEventListener("click", () => { if (pageIndex && !listingRequest) load({...currentView(), pageIndex: pageIndex - 1}); });
@@ -851,5 +881,6 @@
   addEventListener("pagehide", () => lock());
   addEventListener("pageshow", event => { if (event.persisted) restore(); });
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && session && session.expires_at * 1000 <= Date.now()) lock("expired"); });
+  if (editorPage) codeEditor = window.MySyncEditor({request, post, Failure, icon});
   restore();
 })();

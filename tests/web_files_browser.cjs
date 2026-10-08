@@ -105,7 +105,7 @@ async function run(type,name) {
       await route.fulfill({headers,json:{device_name:"Local impostor",challenge_id:"wrong"}});
     });
     if(mode==="denied")await page.addInitScript(()=>{navigator.permissions.query=async()=>({state:"denied"});});
-    const assets={"/files":["index.html","text/html"],"/status":["index.html","text/html"],"/atlas.js":["atlas.js","text/javascript"],"/status.js":["status.js","text/javascript"],"/status.css":["status.css","text/css"],"/atlas-icons.svg":["atlas-icons.svg","image/svg+xml"],"/atlas-brand.png":["atlas-brand.png","image/png"],"/atlas-brand-dark.png":["atlas-brand-dark.png","image/png"]};
+    const assets={"/editor":["index.html","text/html"],"/editor.js":["editor.js","text/javascript"],"/editor.css":["editor.css","text/css"],"/files":["index.html","text/html"],"/status":["index.html","text/html"],"/atlas.js":["atlas.js","text/javascript"],"/status.js":["status.js","text/javascript"],"/status.css":["status.css","text/css"],"/atlas-icons.svg":["atlas-icons.svg","image/svg+xml"],"/atlas-brand.png":["atlas-brand.png","image/png"],"/atlas-brand-dark.png":["atlas-brand-dark.png","image/png"]};
     await context.route(`${origin}/**`,async route=>{
       const url=new URL(route.request().url());
       if(assets[url.pathname]) {

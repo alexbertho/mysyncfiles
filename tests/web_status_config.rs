@@ -110,7 +110,7 @@ fn file_read_consent_is_separate_and_disabled_for_existing_profiles() -> Result<
     assert!(!client::load_config(&config)?.web_files_enabled);
     assert_eq!(
         cli(&config, &["web-files", "status"])?.stdout,
-        b"web_files_enabled=false\nweb_uploads_enabled=false\nweb_management_enabled=false\n"
+        b"web_files_enabled=false\nweb_uploads_enabled=false\nweb_management_enabled=false\nweb_edit_enabled=false\nweb_run_enabled=false\n"
     );
     for (action, enabled) in [("enable", true), ("disable", false)] {
         let output = cli(&config, &["web-files", action])?;
@@ -126,6 +126,39 @@ fn file_read_consent_is_separate_and_disabled_for_existing_profiles() -> Result<
     lock.lock_exclusive()?;
     assert!(!cli(&config, &["web-files", "enable"])?.status.success());
     assert!(!client::load_config(&config)?.web_files_enabled);
+    Ok(())
+}
+
+#[test]
+fn editing_and_execution_require_distinct_local_consent_and_profile_lock() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = temp.path().join("client.json");
+    fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "server":"https://sync.example.test", "root":temp.path(), "web_files_enabled":true
+        }))?,
+    )?;
+    let saved = client::load_config(&config)?;
+    assert!(!saved.web_edit_enabled && !saved.web_run_enabled);
+    for (action, edit, run) in [
+        ("enable-edit", true, false),
+        ("enable-run", true, true),
+        ("disable-edit", false, true),
+        ("disable-run", false, false),
+    ] {
+        assert!(cli(&config, &["web-files", action])?.status.success());
+        let saved = client::load_config(&config)?;
+        assert_eq!((saved.web_edit_enabled, saved.web_run_enabled), (edit, run));
+        assert!(saved.web_files_enabled);
+        assert!(!saved.web_uploads_enabled && !saved.web_management_enabled);
+        assert_eq!(fs::metadata(&config)?.permissions().mode() & 0o777, 0o600);
+    }
+    let lock = fs::File::create(config.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    for action in ["enable-edit", "enable-run"] {
+        assert!(!cli(&config, &["web-files", action])?.status.success());
+    }
     Ok(())
 }
 

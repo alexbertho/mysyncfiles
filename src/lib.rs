@@ -1,6 +1,7 @@
 pub mod auth_protocol;
 pub mod client;
 pub mod device_auth;
+pub mod editor_protocol;
 mod local_fs;
 pub mod model;
 pub mod origin_auth;

@@ -536,6 +536,8 @@ pub async fn enroll_with_tcti(
             web_files_enabled: false,
             web_uploads_enabled: false,
             web_management_enabled: false,
+            web_edit_enabled: false,
+            web_run_enabled: false,
             update_public_key: default_update_public_key(),
         };
         if let Some(enabled) = pairing_web_status(config_path, &config)? {

@@ -8,7 +8,7 @@ MYSYNC_TEST_CPUS ?= 2
 MYSYNC_CARGO_JOBS ?= 1
 MYSYNC_BENCH_ARGS ?= --suite all --repetitions 3 --work-dir target
 
-.PHONY: help check-config check-server-image install start stop logs pair test test-unlocked benchmark benchmark-unlocked build-client build-client-unlocked deploy clean docs docs-stop docs-check docs-build
+.PHONY: help check-config check-server-image install start stop logs pair test test-unlocked benchmark benchmark-unlocked build-client build-client-unlocked deploy clean docs docs-stop docs-check docs-build editor-build editor-check
 
 help:
 	@printf '%s\n' \
@@ -18,6 +18,8 @@ help:
 		'make logs        Suivre les journaux du serveur' \
 		'make pair        Appairer un client par son code temporaire' \
 		'make test        Vérifier le code, l’installateur et la documentation' \
+		'make editor-build Reconstruire le moteur de l’éditeur web' \
+		'make editor-check Vérifier le bundle de l’éditeur et ses licences' \
 		'make benchmark   Mesurer le client et un serveur isolé avec un TPM simulé' \
 		'make build-client Construire le client et l’outil de publication, sans publier' \
 		'make deploy      Tester, reconstruire et déployer le serveur et la documentation' \
@@ -26,6 +28,14 @@ help:
 		'make docs-stop   Arrêter la prévisualisation' \
 		'make docs-check  Construire et vérifier la documentation' \
 		'make docs-build  Générer site/ avec l’origine HTTPS configurée'
+
+editor-build:
+	npm --prefix web ci --ignore-scripts --no-audit --no-fund
+	npm --prefix web run build
+
+editor-check:
+	npm --prefix web ci --ignore-scripts --no-audit --no-fund
+	npm --prefix web run check
 
 check-config:
 	@test -f deploy/.env || { printf '%s\n' "Copier deploy/.env.example vers deploy/.env et le configurer d'abord." >&2; exit 1; }

@@ -1301,6 +1301,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
                     crate::web_status_protocol::PROOFS_PATH,
                     post(web_status::proof),
                 )
+                .route(
+                    crate::editor_protocol::AUTHORIZE_PATH,
+                    post(web_files::editor::runner_authorize),
+                )
                 .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     crate::device_auth::middleware,

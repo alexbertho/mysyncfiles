@@ -79,7 +79,7 @@ async function run(type, name) {
       }
       await context.route(`${origin}/**`, async route => {
         const url = new URL(route.request().url());
-        const files = {"/status": ["index.html", "text/html"], "/status.js": ["status.js", "text/javascript"], "/status.css": ["status.css", "text/css"], "/atlas.js": ["atlas.js", "text/javascript"], "/atlas-icons.svg": ["atlas-icons.svg", "image/svg+xml"], "/atlas-brand.png": ["atlas-brand.png", "image/png"], "/atlas-brand-dark.png": ["atlas-brand-dark.png", "image/png"]};
+        const files = {"/editor.js": ["editor.js", "text/javascript"], "/editor.css": ["editor.css", "text/css"], "/status": ["index.html", "text/html"], "/status.js": ["status.js", "text/javascript"], "/status.css": ["status.css", "text/css"], "/atlas.js": ["atlas.js", "text/javascript"], "/atlas-icons.svg": ["atlas-icons.svg", "image/svg+xml"], "/atlas-brand.png": ["atlas-brand.png", "image/png"], "/atlas-brand-dark.png": ["atlas-brand-dark.png", "image/png"]};
         if (files[url.pathname]) {
           const [file, contentType] = files[url.pathname];
           await route.fulfill({contentType, headers: {"Content-Security-Policy": csp, "Cache-Control": "no-store"}, body: fs.readFileSync(path.join(root, file))});
