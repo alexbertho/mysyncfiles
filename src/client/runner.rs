@@ -136,10 +136,10 @@ impl Runner {
 
     async fn detect(&self) -> Tools {
         let mut cached = self.tools.lock().await;
-        if let Some((time, tools)) = &*cached {
-            if time.elapsed() < Duration::from_secs(30) {
-                return tools.clone();
-            }
+        if let Some((time, tools)) = &*cached
+            && time.elapsed() < Duration::from_secs(30)
+        {
+            return tools.clone();
         }
         let python = tool("python3").is_some();
         let compiler = ["gcc", "clang"]
@@ -401,8 +401,11 @@ async fn phase(
     let mut exit: Option<std::process::ExitStatus> = None;
     let mut check = tokio::time::interval(Duration::from_millis(100));
     let state = loop {
-        if !out_open && !err_open && exit.is_some() {
-            break if exit.unwrap().success() {
+        if !out_open
+            && !err_open
+            && let Some(status) = exit
+        {
+            break if status.success() {
                 "finished"
             } else {
                 "failed"

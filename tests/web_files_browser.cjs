@@ -54,7 +54,9 @@ function listing(entries, query) {
 }
 async function run(type,name) {
   const executablePath=name==="chromium"?process.env.MYSYNC_CHROMIUM:process.env.MYSYNC_FIREFOX;
-  const browser=await type.launch({headless:true,...(name==="firefox"?{firefoxUserPrefs:{"pdfjs.disabled":false}}:{}),...(executablePath?{executablePath}:{})});
+  // The PDF regressions need Chromium's built-in viewer, which is absent from
+  // Playwright's default headless shell. This channel uses full Chromium headless.
+  const browser=await type.launch({headless:true,...(name==="chromium"?{channel:"chromium"}:{firefoxUserPrefs:{"pdfjs.disabled":false}}),...(executablePath?{executablePath}:{})});
   console.log(`${name} ${browser.version()}`);
   let counter=0;
   async function setup(options={}) {
