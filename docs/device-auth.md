@@ -6,7 +6,7 @@ La présence du code dans le dépôt ne signifie pas qu'un serveur ou un miroir 
 
 L'identité repose sur une clé ECDSA P-256 créée dans le TPM, et non sur une adresse MAC ou un numéro de série envoyé par le client. Le serveur vérifie les attributs TPM `fixedTPM`, `fixedParent`, `sensitiveDataOrigin`, `restricted`, `sign`, l'absence de `decrypt` et le nom SHA-256. Une activation de justificatif (`MakeCredential`/`ActivateCredential`) lie cette clé à une clé d'endossement EK dont le certificat remonte à une autorité explicitement approuvée.
 
-La clé d'attestation restreinte (AK) sert directement à signer les requêtes du protocole MySync. Le TPM hache le message avec `TPM2_Hash`, produit le ticket de validation puis signe avec `TPM2_Sign`. Il n'y a pas de seconde clé applicative ni de clé privée logicielle de secours.
+La clé d’attestation restreinte (AK) signe l’ouverture de session et les autorisations web. Le TPM hache le message avec `TPM2_Hash` puis signe avec `TPM2_Sign`. Pour la synchronisation, cette preuve autorise une clé Ed25519 générée en mémoire, liée à l’appareil et à une session d’au plus 15 minutes. La clé temporaire n’est jamais enregistrée dans le profil. Elle réduit les opérations TPM mais n’est pas matériellement non exportable : une capture de la mémoire peut permettre son usage jusqu’à expiration ou révocation. Le jeton seul reste insuffisant. Une clé temporaire ne peut pas ouvrir une session ni autoriser l’accès web.
 
 La création, le chargement et l'activation de la clé utilisent des sessions TPM chiffrées, salées avec l'EK, qui authentifient aussi les réponses du TPM. Cela évite les sessions de politique sans secret partagé, ainsi que le chemin de déchiffrement incompatible observé avec tpm2-tss 4.2 sur Arch. Le test de création puis rechargement s'exécute sur les deux distributions en CI; aucune ancienne bibliothèque système n'est imposée comme contournement.
 
@@ -23,12 +23,13 @@ Le blob privé enregistré dans la configuration est enveloppé par le TPM : le 
 Debian 13 ou Arch Linux/dérivées, TPM 2.0 accessible via `/dev/tpmrm0`, EK RSA-2048 ou ECC P-256 et certificat EK constructeur. Le certificat est lu dans les index NV standards du TPM, ou fourni explicitement en DER via `--ek-cert` lorsqu'il en est absent. Sans certificat constructeur correspondant à l'EK de ce TPM, l'appairage est refusé. Ne pas contourner ce refus par un certificat auto-signé.
 
 ```sh
+# Dans le dépôt mysyncfiles-client
 ./deploy/install-tpm-deps.sh
 ```
 
 Le script installe les paquets de la distribution, sans remplacer les bibliothèques système à la main. Il peut ajouter l'utilisateur au groupe `tss`; redémarrer ensuite pour renouveler les groupes du service utilisateur. Ne pas rendre le périphérique TPM accessible en écriture à tout le monde. Le client fonctionne sans root et sans accès au TPM dans le conteneur serveur.
 
-L'installateur distribué par le serveur effectue aussi un contrôle local avec `mysync doctor` avant de poser le client. Cette commande vérifie l'accès au TPM et que le certificat EK correspond à sa clé. Pour un certificat externe, définir `MYSYNC_EK_CERT=/chemin/ek.der` lors de l'installation. `doctor` ne vérifie **pas** la chaîne de confiance du fabricant : celle-ci reste vérifiée pendant l'appairage contre les autorités configurées sur le serveur.
+L’installateur distribué par le dépôt client effectue aussi un contrôle local avec `mysync doctor` avant de poser le client. Cette commande vérifie l'accès au TPM et que le certificat EK correspond à sa clé. Pour un certificat externe, définir `MYSYNC_EK_CERT=/chemin/ek.der` lors de l'installation. `doctor` ne vérifie **pas** la chaîne de confiance du fabricant : celle-ci reste vérifiée pendant l'appairage contre les autorités configurées sur le serveur.
 
 Les hiérarchies TPM utilisées doivent être accessibles avec leur autorisation vide par défaut; les mots de passe de hiérarchie personnalisés ne sont pas pris en charge. Ne pas effacer un TPM pour contourner cette limitation : il peut contenir d'autres clés, notamment celles utilisées pour déverrouiller des disques.
 
@@ -95,9 +96,9 @@ Après remplacement/effacement du TPM ou perte définitive de la configuration :
 
 Le protocole MySync est un profil de preuve de possession propre au projet, **pas** une implémentation OAuth/DPoP compatible RFC 9449.
 
-Chaque preuve signe `mysync/request/v1\n` suivi de la sérialisation JSON de `Claims` : version, identifiant d'appairage, nonce aléatoire de 256 bits, horodatage, méthode HTTP, SHA-256 de l'URL externe complète (query comprise), SHA-256 du corps brut et SHA-256 du jeton de session. La signature ECDSA P-256 utilise SHA-256. L'enveloppe JSON contient la signature brute `r || s` de 64 octets en hexadécimal et est encodée en base64url dans `x-mysync-proof`.
+Chaque preuve TPM signe `mysync/request/v1\n` suivi de la sérialisation JSON de `Claims` : version, identifiant d'appairage, nonce aléatoire de 256 bits, horodatage, méthode HTTP, SHA-256 de l'URL externe complète (query comprise), SHA-256 du corps brut et SHA-256 du jeton de session. La signature ECDSA P-256 utilise SHA-256. L'enveloppe JSON contient la signature brute `r || s` de 64 octets en hexadécimal et est encodée en base64url dans `x-mysync-proof`.
 
-Une requête signée à `POST /v1/auth/session` obtient une session de 15 minutes. Les autres requêtes utilisent `Authorization: MySync JETON` et une nouvelle preuve liée à ce jeton; le jeton seul est inutilisable. Le client renouvelle automatiquement la session. Les sessions et invitations sont stockées hachées côté serveur, pas les secrets en clair.
+Une requête signée par le TPM à `POST /v1/auth/session` contient `{version: 2, public_key: CLE_ED25519}` et obtient une session de 15 minutes. Les requêtes de synchronisation utilisent `Claims.version = 2`, le domaine `mysync/session-request/v2\n` et une signature Ed25519 stricte. Les preuves TPM utilisent toujours `Claims.version = 1` et le domaine `mysync/request/v1\n`. Huit sessions actives au maximum sont conservées par appareil. Les autres requêtes utilisent `Authorization: MySync JETON` et une nouvelle preuve liée à ce jeton; le jeton seul est inutilisable. Le client renouvelle automatiquement la session. Les sessions et invitations sont stockées hachées côté serveur, pas les secrets en clair.
 
 Le serveur accepte un horodatage compris entre 60 secondes dans le passé et 30 secondes dans le futur. Il conserve chaque nonce utilisé 120 secondes dans une table SQLite partagée, y compris entre redémarrages. Les horloges doivent être synchronisées. Les transferts utilisent des blocs d'au plus 8 Mio; les modifications de corps, query, méthode, jeton ou destination invalident la preuve. Les attributs de clé et le statut de révocation sont vérifiés pour les requêtes authentifiées.
 
@@ -105,11 +106,11 @@ La signature, la session, la fraîcheur et le rejeu sont contrôlés avant de li
 
 ## Authenticité des réponses et migration
 
-Le serveur signe les réponses de l'API authentifiée avec une clé Ed25519 propre à cette installation. Cette clé est générée une seule fois dans la base privée, indépendamment de la clé de signature des releases. La réponse porte `x-mysync-origin` : une enveloppe JSON en base64url contenant le SHA-256 de la preuve TPM de la requête, le statut HTTP, le SHA-256 du corps JSON et la signature. Le message signé est `mysync/origin-response/v1\n` suivi du tableau JSON `[request_sha256,status,body_sha256]`. Le nonce TPM frais lie chaque réponse à une seule requête, même après redémarrage du client. Le client vérifie la signature et le corps avant d'utiliser les révisions, suppressions, listes ou résultats de mutations. Les téléchargements restent diffusés en flux : leur statut est signé avec un digest de corps `null`, puis leurs octets sont vérifiés contre la taille et le SHA-256 du manifeste authentifié.
+Le serveur signe les réponses de l'API authentifiée avec une clé Ed25519 propre à cette installation. Cette clé est générée une seule fois dans la base privée, indépendamment de la clé de signature des releases. La réponse porte `x-mysync-origin` : une enveloppe JSON en base64url contenant le SHA-256 de la preuve de la requête, le statut HTTP, le SHA-256 du corps JSON et la signature. Le message signé est `mysync/origin-response/v1\n` suivi du tableau JSON `[request_sha256,status,body_sha256]`. Le nonce frais lie chaque réponse à une seule requête, même après redémarrage du client. Le client vérifie la signature et le corps avant d'utiliser les révisions, suppressions, listes ou résultats de mutations. Les téléchargements restent diffusés en flux : leur statut est signé avec un digest de corps `null`, puis leurs octets sont vérifiés contre la taille et le SHA-256 du manifeste authentifié.
 
 Le proxy doit conserver `x-mysync-origin` et le corps exact des réponses, sans cache ni transformations. Il peut lire les fichiers et interrompre les échanges, mais il ne peut pas fournir une révision ou des octets acceptés comme provenant du serveur. Un serveur compromis reste hors de cette garantie. L'installation initiale du logiciel et la transmission de la clé publique exigent toujours un canal fiable.
 
-Pour un profil existant, mettre à jour le serveur avant le client, puis obtenir la clé depuis le terminal administrateur :
+Pour un profil existant, planifier la mise à jour coordonnée du serveur et du client 0.4 (sans repli vers l’ancien protocole), puis obtenir la clé depuis le terminal administrateur :
 
 ```sh
 docker compose -f deploy/compose.yaml run --rm server server-key --data-dir /data
@@ -128,15 +129,12 @@ Les routes publiques d'appairage partagent quatre admissions, acquises avant tou
 
 ## Tests et validation
 
+`make test` exécute les tests rapides du serveur et du protocole sans pilote TPM. Dans le dépôt client, `make test` vérifie le client, l’installateur et les mises à jour sans accès matériel ; `make build` active explicitement `--features tpm` pour le binaire opérationnel. Un binaire sans cette fonctionnalité refuse les opérations TPM, sans mécanisme d’authentification de remplacement.
+
+Avant publication, dans le dépôt serveur :
+
 ```sh
-docker buildx build --resource memory=3g --resource memory-swap=3g \
-  --load -t mysyncfiles-tpm-dev -f deploy/Dockerfile.tpm-dev .
-docker run --rm --memory=3g --memory-swap=3g --cpus=2 \
-  --user "$(id -u):$(id -g)" \
-  --mount type=bind,src="$PWD",dst=/src \
-  -e CARGO_HOME=/src/target/docker-cargo \
-  -e CARGO_TARGET_DIR=/src/target/docker-tpm \
-  mysyncfiles-tpm-dev cargo +1.98.1 test --locked --jobs 1
+make test-integration
 ```
 
 Les tests créent des TPM simulés isolés et des autorités éphémères. Ils couvrent les EK RSA/ECC, certificats non fiables/expirés/mauvais usage, activation avec une mauvaise clé, copie du blob sur un autre TPM, approbation, reprise d'appairage, expiration, rejeu, altération de requêtes, sessions volées, révocation et transferts signés par blocs. Les régressions de synchronisation et les mises à jour signées sont aussi testées.

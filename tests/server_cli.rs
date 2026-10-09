@@ -1,6 +1,29 @@
 use anyhow::Result;
-use mysyncfiles::server;
+use mysyncfiles_server::server;
 use std::process::Command;
+
+#[test]
+fn init_requires_and_persists_a_valid_display_name() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let run = |name: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mysync-server"));
+        command.args(["init", "--data-dir"]).arg(temp.path());
+        if let Some(name) = name {
+            command.args(["--name", name]);
+        }
+        command.stdin(std::process::Stdio::null()).output()
+    };
+    for name in [None, Some(" "), Some("line\nbreak")] {
+        assert!(!run(name)?.status.success());
+    }
+    assert!(run(Some("  Home server  "))?.status.success());
+    let state = server::open(temp.path())?;
+    assert_eq!(
+        mysyncfiles_server::device_auth::server_name(&state)?,
+        "Home server"
+    );
+    Ok(())
+}
 
 #[test]
 fn public_url_command_reads_the_administrator_setting() -> Result<()> {

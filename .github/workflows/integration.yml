@@ -1,0 +1,44 @@
+name: TPM integration
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+  schedule:
+    - cron: '23 4 * * 1'
+permissions:
+  contents: read
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: mysyncfiles
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: mysyncfiles
+          fetch-depth: 0
+          persist-credentials: false
+      - id: client
+        run: printf 'revision=%s\n' "$(cat integration/client-revision)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: alexbertho/mysyncfiles-client
+          ref: ${{ steps.client.outputs.revision }}
+          path: mysyncfiles-client
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y libtss2-dev libssl-dev pkg-config swtpm swtpm-tools tpm2-tools
+      - run: make test-integration
+      - name: Verify Debian 13 and Arch TPM runtimes
+        env:
+          MYSYNC_CLIENT_SOURCE: ${{ github.workspace }}/mysyncfiles-client
+        run: |
+          for suite in tpm_flow web_status_flow multi_server_flow; do
+            binary=$(cargo test --locked --manifest-path integration/Cargo.toml --test "$suite" --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' | tail -1)
+            test -x "$binary"
+            for runtime in debian:13-slim archlinux:base; do
+              docker build --build-arg BASE_IMAGE="$runtime" -t mysync-tpm-runtime -f deploy/Dockerfile.tpm-runtime .
+              docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m --workdir / --mount type=bind,src="$PWD/web",dst=/web,readonly --mount type=bind,src="$binary",dst=/test-tpm,readonly --mount type=bind,src="$PWD/integration/target/debug/mysync",dst=/mysync-test-client,readonly --env MYSYNC_TEST_CLIENT_BIN=/mysync-test-client mysync-tpm-runtime
+            done
+          done

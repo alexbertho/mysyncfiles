@@ -8,15 +8,16 @@ Copier `deploy/.env.example` vers `deploy/.env`, puis renseigner les valeurs pro
 | --- | --- |
 | `MYSYNC_UID`, `MYSYNC_GID` | Identité du processus serveur et propriétaire attendu des données. |
 | `MYSYNC_DATA_DIR` | Chemin absolu du stockage privé : SQLite et fichiers. |
-| `MYSYNC_RELEASES_DIR` | Chemin absolu des releases clientes, monté en lecture seule dans le conteneur. |
 
-Créer ces deux dossiers séparément avant `make start`. La clé privée de signature et les invitations doivent rester hors du répertoire des releases. L'[installation serveur](install-server.md#preparer-le-stockage) donne un exemple complet.
+Créer le dossier privé avant `make start`. Les invitations et la base restent hors du dépôt. L'[installation serveur](install-server.md#preparer-le-stockage) donne un exemple complet.
 
 Docker Compose monte aussi `web/` dans `/web`, en lecture seule, pour servir l’interface native. Hors Docker, `mysync-server serve --web-dir CHEMIN` permet de choisir ce dossier (par défaut `web`). Les fichiers sont relus à chaque requête ; voir les [modifications à chaud](operations.md#modifier-linterface-web-a-chaud).
 
 La commande `device auth-configure` enregistre dans SQLite l'origine publique HTTPS exacte (`--public-url`) et les racines EK constructeur vérifiées (`--ek-roots`). Elles ne sont pas déduites des en-têtes du proxy et aucune racine de test n'est installée par défaut. La [procédure TPM](device-auth.md#configuration-du-serveur) donne la commande complète. Le proxy doit préserver le corps et les en-têtes d'authentification, sans mise en cache des routes protégées.
 
 ## Client
+
+Toutes les commandes visant un serveur acceptent `--profile NOM` ; préciser ce nom dès que plusieurs serveurs sont enregistrés. `mysync profiles` affiche les connexions locales. Les dossiers doivent être distincts et non imbriqués, y compris pour les appairages en attente.
 
 `web_files_enabled` est une autorisation distincte, désactivée par défaut, y compris pour les profils existants. `mysync web-files enable` autorise les nouveaux challenges `files.read` après redémarrage du daemon ; `disable` les refuse. Le pont `web_status_enabled` doit aussi être actif. Le statut seul ne permet pas de lire les fichiers. Voir [l’explorateur web Atlas](web-files.md) pour les sessions de 30 minutes et la révocation.
 
@@ -39,4 +40,4 @@ Le champ `server_public_key` contient la clé publique Ed25519 reçue directemen
 
 Le certificat EK externe éventuel est un fichier DER fourni explicitement à l'installateur (`MYSYNC_EK_CERT`) et à `mysync enroll --ek-cert`. Les certificats intermédiaires vérifiés peuvent être passés à `--ek-chain`. Ni l'un ni l'autre ne modifient automatiquement la confiance du serveur. Voir le [guide client](install-client.md) et le [guide TPM](device-auth.md#prerequis-client).
 
-Le service utilisateur installé démarre `mysync daemon` avec la configuration par défaut. Si `--config` est utilisé pour l'appairage, adapter l'unité utilisateur avant de l'activer afin qu'elle pointe vers le même fichier.
+Le service utilisateur installé démarre `mysync daemon --all`. Les profils nommés vivent dans `mysync/profiles/NOM.json` ; l’ancien `config.json` est aussi pris en compte. Un profil passé avec `--config` hors de ces emplacements exige une unité spécifique. Chaque profil possède son identité TPM, son état et ses consentements. Le pont loopback unique sélectionne le profil par origine HTTPS exacte. Deux profils exposant le pont pour la même origine sont refusés.

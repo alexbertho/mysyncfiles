@@ -15,7 +15,7 @@ journalctl --user -u mysync.service -f
 | --- | --- |
 | `make install` réclame `deploy/.env` | Copier et compléter `deploy/.env.example`, puis créer les dossiers avec les droits correspondant à l'UID/GID. Voir l'[installation serveur](install-server.md). |
 | Le serveur ne peut pas ouvrir `/data` ou `/releases` | Contrôler les chemins absolus, leur existence et leurs permissions dans `deploy/.env`. Voir la [configuration](configuration.md). |
-| `/install.sh` répond 503 | Configurer l'origine publique avec `device auth-configure`. Voir le [guide TPM](device-auth.md#configuration-du-serveur). |
+| `/install.sh` ou `/v1/updates/` répond 404 | Utiliser l’installateur du dépôt client ; les releases ne sont plus distribuées par le serveur. |
 | L'installateur ne trouve pas de release | Publier une release signée pour l'architecture du client ; le serveur ne la fabrique pas au démarrage. Voir la [publication](operations.md#publier-un-client-signe). |
 | `mysync update` ne change pas la version après un déploiement serveur | Comparer la version installée à la dernière release signée publiée. Une reconstruction Docker ne publie aucun client. Augmenter la version du paquet, construire et tester le binaire, puis le publier avec la clé de release. Voir la [publication](operations.md#publier-un-client-signe). |
 | La page `/status` indique « Client inaccessible » | Vérifier un client 0.3.7 ou ultérieur sur le PC du navigateur, `web_status_enabled: true` dans son profil et un daemon relancé après la mise à jour. Si le port loopback 47831 n'écoute pas, vérifier ces prérequis avant les permissions du navigateur. Voir le [statut web](web-status.md). |
@@ -31,3 +31,6 @@ journalctl --user -u mysync.service -f
 | Des changements ne remontent pas immédiatement | Lancer `mysync sync` et examiner les conflits locaux ; si la surveillance échoue, le client interroge le miroir toutes les 15 secondes. Voir le [client](client.md). |
 
 Après perte du TPM ou de la configuration, suivre la [révocation et la récupération](device-auth.md#revocation-et-recuperation). Sauvegarder le miroir avant un nouvel appairage ; ne pas effacer le TPM pour résoudre une erreur d'accès.
+
+| Plusieurs serveurs configurés | Préciser `--profile NOM` pour une commande, ou `daemon --all` pour les synchroniser ensemble. |
+| Erreur de protocole après migration | Mettre à jour client et serveur en version 0.4 ; aucun repli vers le protocole précédent. |

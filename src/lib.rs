@@ -1,12 +1,8 @@
-pub mod auth_protocol;
-pub mod client;
+pub use mysync_protocol::{
+    auth_protocol, editor_protocol, model, origin_auth, web_status_protocol,
+};
 pub mod device_auth;
-pub mod editor_protocol;
-mod local_fs;
-pub mod model;
-pub mod origin_auth;
-pub mod release;
 pub mod server;
-pub mod tpm;
-pub mod update;
-pub mod web_status_protocol;
+// The capability layer also exposes client-side operations retained for shared regression coverage.
+#[allow(dead_code)]
+mod local_fs;

@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mysyncfiles::server;
+use mysyncfiles_server::server;
 
 #[derive(Parser)]
 #[command(
@@ -31,6 +31,9 @@ enum Command {
     Init {
         #[arg(long)]
         data_dir: PathBuf,
+        /// Display name announced to clients (prompts in an interactive terminal)
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Start the HTTP API on a loopback address behind an HTTPS reverse proxy
     Serve {
@@ -38,8 +41,6 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8484")]
         listen: SocketAddr,
-        #[arg(long)]
-        releases_dir: Option<PathBuf>,
         /// Directory containing the static web interface, read on every request
         #[arg(long, default_value = "web")]
         web_dir: PathBuf,
@@ -149,11 +150,11 @@ async fn pair(data_dir: PathBuf) -> Result<()> {
     println!("Give this key directly to the client before entering its pairing code.");
     let name = prompt_line("Device name: ")?;
     let code = rpassword::prompt_password("Code shown by the client: ")?;
-    let id = mysyncfiles::device_auth::register_pair(&state, &name, &code)?;
+    let id = mysyncfiles_server::device_auth::register_pair(&state, &name, &code)?;
     println!("Waiting for the client's TPM proof (up to 15 minutes)...");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
     let fingerprint = loop {
-        let entry = mysyncfiles::device_auth::enrollment_by_id(&state, &id)?;
+        let entry = mysyncfiles_server::device_auth::enrollment_by_id(&state, &id)?;
         match entry.status.as_str() {
             "pending-approval" => {
                 break entry
@@ -175,10 +176,10 @@ async fn pair(data_dir: PathBuf) -> Result<()> {
     println!("Compare the full fingerprint directly with the client.");
     let answer = prompt_line("Approve this device? [y/N] ")?;
     if !matches!(answer.as_str(), "y" | "Y" | "yes" | "YES") {
-        mysyncfiles::device_auth::cancel(&state, &id)?;
+        mysyncfiles_server::device_auth::cancel(&state, &id)?;
         bail!("pairing cancelled; the client was not approved");
     }
-    mysyncfiles::device_auth::approve(&state, &id, &fingerprint)?;
+    mysyncfiles_server::device_auth::approve(&state, &id, &fingerprint)?;
     println!("Device approved. The client will finish its first synchronization.");
     Ok(())
 }
@@ -188,16 +189,25 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::ServerKey { data_dir } => println!("{}", server::open(data_dir)?.public_key()),
-        Command::Init { data_dir } => {
-            server::open(&data_dir)?;
-            println!("server initialized at {}", data_dir.display());
+        Command::Init { data_dir, name } => {
+            let state = server::open(&data_dir)?;
+            let name = match name {
+                Some(name) => name,
+                None if io::stdin().is_terminal() => prompt_line("Server display name: ")?,
+                None => bail!("--name is required without an interactive terminal"),
+            };
+            mysyncfiles_server::device_auth::set_server_name(&state, &name)?;
+            println!(
+                "server {} initialized at {}",
+                mysyncfiles_server::device_auth::server_name(&state)?,
+                data_dir.display()
+            );
         }
         Command::Serve {
             data_dir,
             listen,
-            releases_dir,
             web_dir,
-        } => server::serve(data_dir, listen, releases_dir, web_dir).await?,
+        } => server::serve(data_dir, listen, web_dir).await?,
         Command::Device { command } => match command {
             DeviceCommand::Pair { data_dir } => pair(data_dir).await?,
             DeviceCommand::AuthConfigure {
@@ -205,7 +215,7 @@ async fn main() -> Result<()> {
                 public_url,
                 ek_roots,
             } => {
-                mysyncfiles::device_auth::configure(
+                mysyncfiles_server::device_auth::configure(
                     server::open(data_dir)?.as_ref(),
                     &public_url,
                     &ek_roots,
@@ -215,7 +225,7 @@ async fn main() -> Result<()> {
             DeviceCommand::PublicUrl { data_dir } => {
                 println!(
                     "{}",
-                    mysyncfiles::device_auth::public_url(server::open(data_dir)?.as_ref())?
+                    mysyncfiles_server::device_auth::public_url(server::open(data_dir)?.as_ref())?
                 );
             }
             DeviceCommand::Invite {
@@ -223,7 +233,7 @@ async fn main() -> Result<()> {
                 name,
                 output,
             } => {
-                mysyncfiles::device_auth::invite_to_file(
+                mysyncfiles_server::device_auth::invite_to_file(
                     server::open(data_dir)?.as_ref(),
                     &name,
                     &output,
@@ -231,7 +241,9 @@ async fn main() -> Result<()> {
                 println!("invitation created; valid for 15 minutes");
             }
             DeviceCommand::Pending { data_dir } => {
-                for entry in mysyncfiles::device_auth::list(server::open(data_dir)?.as_ref())? {
+                for entry in
+                    mysyncfiles_server::device_auth::list(server::open(data_dir)?.as_ref())?
+                {
                     println!(
                         "id={} name={} status={} fingerprint={}",
                         entry.id,
@@ -242,7 +254,7 @@ async fn main() -> Result<()> {
                 }
             }
             DeviceCommand::Cancel { data_dir, id } => {
-                mysyncfiles::device_auth::cancel(server::open(data_dir)?.as_ref(), &id)?;
+                mysyncfiles_server::device_auth::cancel(server::open(data_dir)?.as_ref(), &id)?;
                 println!("invitation cancelled; approved devices are unchanged");
             }
             DeviceCommand::Approve {
@@ -250,7 +262,7 @@ async fn main() -> Result<()> {
                 id,
                 fingerprint,
             } => {
-                mysyncfiles::device_auth::approve(
+                mysyncfiles_server::device_auth::approve(
                     server::open(data_dir)?.as_ref(),
                     &id,
                     &fingerprint,

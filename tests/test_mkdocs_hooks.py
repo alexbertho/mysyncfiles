@@ -13,14 +13,14 @@ SPEC.loader.exec_module(HOOKS)
 
 
 class PublishedDocsTest(unittest.TestCase):
-    def test_published_install_command_uses_configured_origin(self):
+    def test_client_installer_stays_on_github_for_every_server_origin(self):
         with patch.dict(os.environ, {"MYSYNC_PUBLIC_URL": "https://files.example.test"}):
             for page in ("index.md", "install-client.md"):
                 with self.subTest(page=page):
                     source = (ROOT / "docs" / page).read_text()
                     published = HOOKS.on_page_markdown(source)
                     self.assertIn(
-                        "curl -fsS --proto '=https' --max-redirs 0 https://files.example.test/install.sh | sh",
+                        "curl -fsS --proto '=https' --max-redirs 0 https://raw.githubusercontent.com/alexbertho/mysyncfiles-client/main/deploy/install.sh | sh",
                         published,
                     )
                     self.assertNotIn("sync.example.org", published)

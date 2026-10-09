@@ -35,33 +35,14 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
-      - name: Install TPM build and simulator dependencies
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libssl-dev pkg-config swtpm swtpm-tools tpm2-tools
+      - name: Install server build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Format and test
         run: make test
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Build release binaries
-        run: cargo build --release --locked --bins
-      - name: Verify TPM enrollment on Debian 13 and Arch runtimes
-        run: |
-          tpm_test_binary=$(cargo test --locked --test tpm_flow --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "tpm_flow") | .executable // empty')
-          status_test_binary=$(cargo test --locked --test web_status_flow --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "web_status_flow") | .executable // empty')
-          test -x "$tpm_test_binary"
-          test -x "$status_test_binary"
-          for runtime in debian:13-slim archlinux:base; do
-            docker build --build-arg BASE_IMAGE="$runtime" -t mysync-tpm-runtime -f deploy/Dockerfile.tpm-runtime .
-            docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
-              --mount type=bind,src="$tpm_test_binary",dst=/test-tpm,readonly mysync-tpm-runtime
-            docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
-              --workdir / \
-              --mount type=bind,src="$PWD/web",dst=/web,readonly \
-              --mount type=bind,src="$status_test_binary",dst=/test-tpm,readonly mysync-tpm-runtime
-          done
-      - name: Smoke-test client on Arch Linux
-        run: docker run --rm --mount type=bind,source="$PWD/target/release/mysync",target=/usr/local/bin/mysync,readonly archlinux:base bash -c 'pacman -Syu --noconfirm --needed tpm2-tss openssl && /usr/local/bin/mysync --version'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Build server binary
+        run: cargo build --release --locked --bin mysync-server
       - name: Build server image
         run: docker build -f deploy/Dockerfile .
       - name: Audit Rust dependencies

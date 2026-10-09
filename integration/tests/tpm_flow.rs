@@ -790,6 +790,23 @@ async fn cancelled_pairing_discards_the_local_code() -> Result<()> {
     assert!(!config.exists());
     Ok(())
 }
+// Software session keys exist only in this test process; the TPM still signs
+// every session creation and every browser authorization request.
+fn session_keys()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::SigningKey>> {
+    static KEYS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::SigningKey>>,
+    > = std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default)
+}
+fn session_proof(identity: &Identity, claims: Claims) -> Result<String> {
+    let keys = session_keys().lock().unwrap();
+    match keys.get(&claims.session_sha256) {
+        Some(key) => mysyncfiles::auth_protocol::Proof::session(claims, key)?.encode(),
+        None => identity.proof(claims),
+    }
+}
+
 async fn signed(
     http: &Client,
     url: &str,
@@ -799,7 +816,11 @@ async fn signed(
     token: &str,
 ) -> Result<reqwest::Request> {
     let claims = Claims::new(&key.device, method.as_str(), url, &body, token)?;
-    let proof = key.proof(claims)?;
+    let proof = if mysyncfiles::auth_protocol::requires_tpm(reqwest::Url::parse(url)?.path()) {
+        key.proof(claims)?
+    } else {
+        session_proof(key, claims)?
+    };
     let mut request = http
         .request(method, url)
         .body(body)
@@ -810,22 +831,38 @@ async fn signed(
     Ok(request.build()?)
 }
 async fn session(http: &Client, server: &Server, key: &Identity) -> Result<Session> {
-    Ok(http
-        .execute(
-            signed(
-                http,
-                &format!("{}/v1/auth/session", server.url),
-                Method::POST,
-                vec![],
-                key,
-                "",
-            )
-            .await?,
-        )
+    let ephemeral = ed25519_dalek::SigningKey::from_bytes(
+        &hex::decode(mysyncfiles::auth_protocol::random_secret()?)?
+            .try_into()
+            .unwrap(),
+    );
+    let body = serde_json::to_vec(&mysyncfiles::auth_protocol::SessionRequest {
+        version: mysyncfiles::auth_protocol::PROTOCOL_VERSION,
+        public_key: hex::encode(ephemeral.verifying_key().to_bytes()),
+    })?;
+    let mut request = signed(
+        http,
+        &format!("{}/v1/auth/session", server.url),
+        Method::POST,
+        body,
+        key,
+        "",
+    )
+    .await?;
+    request
+        .headers_mut()
+        .insert("content-type", "application/json".parse()?);
+    let session: Session = http
+        .execute(request)
         .await?
         .error_for_status()?
         .json()
-        .await?)
+        .await?;
+    session_keys()
+        .lock()
+        .unwrap()
+        .insert(mysyncfiles::auth_protocol::hash(&session.token), ephemeral);
+    Ok(session)
 }
 
 fn pending_body() -> reqwest::Body {
@@ -867,7 +904,7 @@ async fn signed_requests_authenticate_before_buffering_and_bound_in_flight_bodie
         if case == "future" {
             claims.issued_at = now() + 120;
         }
-        let mut proof = Proof::decode(&key.proof(claims)?)?;
+        let mut proof = Proof::decode(&session_proof(&key, claims)?)?;
         if case == "signature" {
             proof.signature = "00".repeat(64);
         }
@@ -1118,7 +1155,7 @@ async fn tpm_enrollment_request_binding_replay_and_revocation() -> Result<()> {
     assert_eq!(
         http.get(&url)
             .header("authorization", format!("MySync {}", active.token))
-            .header(PROOF_HEADER, key.proof(expired)?)
+            .header(PROOF_HEADER, session_proof(&key, expired)?)
             .send()
             .await?
             .status(),

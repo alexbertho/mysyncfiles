@@ -2,61 +2,17 @@
 
 Le [guide d'installation serveur](install-server.md) couvre la préparation de `deploy/.env`, des volumes et du proxy HTTPS. Cette page décrit les opérations qui suivent le premier démarrage. Les chemins et noms ci-dessous sont des exemples à adapter. Dans le dépôt source, le domaine est aussi un exemple ; le site publié utilise l'origine configurée par l'administrateur. Les secrets restent hors du dépôt et des fichiers servis publiquement.
 
-## Construire et installer depuis les sources
+## Compiler
 
-La version Rust est fixée dans `rust-toolchain.toml`. Installer Rust avec [rustup](https://rustup.rs/) dans l'espace utilisateur, sans `sudo cargo`. Pour construire et tester hors Docker :
-
-```sh
-# Debian 13
-sudo apt install build-essential pkg-config libssl-dev libtss2-dev tpm2-tools swtpm swtpm-tools
-# Arch Linux et dérivées
-sudo pacman -S --needed base-devel pkgconf openssl tpm2-tss tpm2-tools swtpm
-
-cargo build --release --locked
-cargo test --locked
-```
-
-Les binaires sont `mysync` (client), `mysync-server` et `mysync-release`. L'[environnement Docker TPM de développement](device-auth.md#tests-et-validation) permet aussi de compiler et tester sans installer cette chaîne sur l'hôte.
-
-Pour préparer seulement le client et l'outil de publication, lancer `make build-client`. Cette cible construit `target/release/mysync` et `target/release/mysync-release`, avec une tâche Cargo par défaut et le conteneur TPM si nécessaire. Elle ne remplace aucun client installé et ne publie aucune release.
-
-Pour installer un client construit depuis les sources, exécuter `./deploy/install-tpm-deps.sh` et `./target/release/mysync doctor`, puis `./target/release/mysync setup --server URL_HTTPS --dir "$HOME/Sync"` et [appairer l'appareil](install-client.md#appairer-et-approuver-un-appareil) avec `make pair` sur le serveur. Après une première synchronisation sans conflit, lancer `./deploy/install-client.sh`. Ce script copie le binaire dans `~/.local/bin`, installe l'unité utilisateur, active le *linger* et démarre le service. Il accepte un chemin de binaire de confiance en argument. Pour un premier binaire téléchargé autrement que par `/install.sh`, vérifier sa provenance et son empreinte : une mise à jour signée ne protège pas rétroactivement ce premier téléchargement.
+Le dépôt serveur produit uniquement `mysync-server`. `cargo build --locked --release` nécessite Rust, OpenSSL et pkg-config, sans pilote TPM. L’image serveur ajoute `tpm2_makecredential` pour l’appairage, sans accès matériel. Le client se construit avec `make build` depuis [mysyncfiles-client](https://github.com/alexbertho/mysyncfiles-client), avec les bibliothèques TPM de Debian 13 ou Arch Linux.
 
 ## Publier un client signé
 
-Le serveur distribue `/install.sh` et les routes publiques `/v1/updates/<cible>/latest.signed.json`, `latest.json`, `latest.sig` et `mysync-<version>-<cible>`. L'enveloppe `latest.signed.json` associe atomiquement le manifeste signé ; les deux anciens fichiers restent publiés pour les clients déjà installés. Les clients récents ne retombent sur le format précédent que si l'enveloppe répond `404`, jamais si sa signature est invalide. Le script est intégré à l'image serveur avec sa clé publique de release ; il vérifie la signature et le SHA-256 du binaire et la présence de `mysync setup` avant de l'exécuter. L'outil de publication vérifie aussi que le binaire annonce la bonne version et accepte `setup --help` avant de le signer. Si un binaire déjà installé diffère de la release signée, l'installateur demande confirmation avant de conserver une copie et de le remplacer ; il refuse une version installée plus récente. `mysync update` reste disponible pour les profils clients déjà configurés.
+La signature et la distribution du client sont gérées dans le dépôt client : consulter son README et `docs/releases.md`. Les assets GitHub sont `latest-linux-x86_64.signed.json`, `latest-linux-aarch64.signed.json` et les binaires nommés dans les manifestes signés. La clé privée reste hors des dépôts et des assets publics. Le client contrôle signature, taille et SHA-256 avant remplacement, conserve le verrou d’installation et refuse les versions plus anciennes.
 
-La publication est une opération administrateur distincte du build serveur, de la CI et du démarrage. Elle doit être effectuée avec la clé privée correspondant à la clé publique intégrée au client **et** au serveur :
+Les téléchargements de releases peuvent suivre au plus cinq redirections HTTPS, nécessaires pour les assets GitHub ; toute redirection HTTP est refusée. Les échanges avec un serveur de synchronisation continuent de refuser les redirections. L’installateur demande séparément l’URL de ce serveur. Le serveur ne sert plus `/install.sh` ni `/v1/updates/`.
 
-Avant la compilation, augmenter la version du paquet dans `Cargo.toml` et son entrée `mysyncfiles` dans `Cargo.lock`, puis lancer `make test` et `make build-client`. Une modification du client conservant le numéro déjà publié ne sera pas installée par `mysync update`. Vérifier le binaire construit sur les distributions ciblées avant publication. La fonctionnalité de présence locale apparaît dans la version **0.3.7**.
-
-La version **0.3.8** active cette présence par défaut et ajoute `mysync web-status` et `setup --web-status true|false`. La question de l’installateur HTTPS nécessite aussi le déploiement du serveur qui embarque `deploy/install.sh` ; publier uniquement le client ne remplace pas ce script. L’installateur depuis les sources propose également le réglage et accepte `MYSYNC_WEB_STATUS=true|false`.
-
-La version **0.3.9** améliore les scans SHA-256, les transferts et la préparation
-de `status` et `sync`, et corrige la pagination des grands manifestes. Le nouveau
-client fonctionne avec les serveurs précédents ; le résumé signé utilisé par
-`status` nécessite le nouveau serveur pour réduire le nombre de requêtes. Les
-profils, signatures, contrôles de révision et copies de conflits restent compatibles.
-
-La version **0.3.10** ajoute l’autorisation de lecture web `mysync web-files` pour l’explorateur Atlas. Le client 0.3.9 publié ne peut vérifier que la présence `/status` ; publier cette nouvelle version cliente signée est nécessaire pour utiliser `/files`. Après `mysync update`, arrêter le daemon avant `mysync web-files enable`, puis relancer le service déjà installé. Ce consentement reste désactivé par défaut. Le serveur doit également inclure Atlas ; son interface HTML/CSS/JavaScript native se modifie ensuite à chaud dans `web/`. Voir le [guide d’activation](web-files.md).
-
-La version **0.3.11** ajoute des routes d’envoi au serveur et le consentement client distinct `mysync web-files enable-upload` pour le glisser-déposer. Elle nécessite une reconstruction du serveur et la publication de cette release cliente signée ; remplacer seulement les fichiers `web/` ne suffit pas. Un client 0.3.10 ne connaît pas `enable-upload`. La reconstruction, le déploiement, la publication signée et l’activation du consentement sont des opérations distinctes. Voir [ajouter des fichiers](web-files.md#ajouter-des-fichiers).
-
-La version **0.3.12** ajoute la gestion des dossiers Atlas et le consentement client distinct `mysync web-files enable-manage`. Elle exige une mise à jour du serveur et une release cliente signée publiée séparément. Les consentements de lecture et d’envoi n’accordent pas la gestion des dossiers. Voir [gérer les dossiers](web-files.md#gerer-les-dossiers).
-
-La version **0.3.13** ajoute l’éditeur Python/C, la sauvegarde web d’un fichier existant et l’exécution isolée sur le PC du navigateur. Elle nécessite une reconstruction du serveur et la publication du client signé. Après mise à jour du client, les commandes `mysync web-files enable-edit` et `mysync web-files enable-run` accordent séparément ces consentements, désactivés par défaut. Voir les [autorisations et prérequis de l’éditeur](web-code-editor.md).
-
-```sh
-mysync-release publish --secret-key /chemin/prive/cle-signature \
-  --binary target/release/mysync --version VERSION \
-  --target linux-x86_64 --output-dir /srv/mysyncfiles-releases
-```
-
-Publier séparément `linux-x86_64` et `linux-aarch64` avec des binaires construits et testés sur l'architecture correspondante. La version annoncée doit correspondre à `mysync --version` et dépasser celle déjà publiée. `--output-dir` désigne la racine montée dans `/releases` ; l'outil crée le sous-dossier de la cible. Le dépôt source ne garantit pas qu'un artefact signé soit disponible sur un serveur donné. La publication de `latest.signed.json` peut déclencher les mises à jour automatiques : vérifier au préalable les bibliothèques natives et le TPM des clients concernés.
-
-Après publication, exécuter `mysync update` puis `mysync --version` sur un client. Si aucune mise à jour n'est installée, la commande indique la version du client et celle de la dernière release signée proposée par ce serveur. Relancer le daemon après une installation manuelle pour qu'il utilise le nouveau binaire. `make deploy` met à jour le serveur et la documentation ; les clients continuent à recevoir la release précédemment publiée tant que cette étape de publication n'a pas eu lieu.
-
-Garder la clé privée hors du conteneur et du répertoire public de releases, idéalement hors ligne sur un poste de publication distinct. Un fork génère sa propre clé avec `mysync-release keygen --secret-key /chemin/prive/cle-signature`, remplace `src/update_public_key.hex`, puis reconstruit client et serveur avant publication. La rotation de la clé publique n'est pas automatisée : les anciens clients doivent être réinstallés par un canal fiable. Voir les [garanties de distribution](security.md#distribution-et-exploitation).
+La version 0.4 exige une mise à jour coordonnée. La séparation des sources ne publie pas une release signée et ne remplace aucun binaire installé. Conserver les profils, états et clés TPM existants ; sauvegarder la base avant toute intervention de production.
 
 ## Administrer les appareils
 
@@ -72,7 +28,11 @@ L'état client est publié atomiquement une fois par passe modifiée, avec séri
 
 Sauvegarder de façon cohérente le répertoire de données privé, qui contient la base SQLite et les blobs, ainsi que les éléments de configuration nécessaires à la restauration. Éviter une copie brute de SQLite pendant les écritures : arrêter le serveur le temps d'une copie des fichiers, ou utiliser une méthode de sauvegarde SQLite cohérente. Tester régulièrement la restauration sur un hôte isolé. Conserver les sauvegardes et la clé privée hors du dépôt et du répertoire de releases. MySyncFiles ne remplace pas ces sauvegardes : les écrasements ordinaires n'ont pas d'historique restaurable.
 
-`make test` vérifie l'installateur, le formatage Rust, les tests Rust, le rendu des URL de documentation et le build MkDocs. Si les bibliothèques TPM manquent sur l'hôte, les tests Rust passent dans `deploy/Dockerfile.tpm-dev`. Les compilations Cargo utilisent une tâche par défaut. Les conteneurs de développement et les étapes de construction Rust via Buildx sont limités à 3 Gio de mémoire ; les conteneurs de test et de compilation cliente disposent de deux processeurs. `MYSYNC_BUILD_MEMORY` ajuste la limite mémoire, `MYSYNC_TEST_CPUS` les processeurs de ces conteneurs et `MYSYNC_CARGO_JOBS` les tâches Cargo des tests et du client ; l'image serveur reste compilée avec une tâche. `make test`, `make install` et `make build-client` prennent un verrou sur le répertoire du projet et refusent de lancer deux compilations en parallèle. Une limite mémoire atteinte fait échouer le build ou le test ; elle évite qu'il épuise la mémoire de l'hôte.
+## Tests et déploiement
+
+`make test` vérifie le formatage, les tests du serveur et du paquet commun, le script d’installation serveur et la documentation. Il ne compile pas le client et ne requiert ni pilote TPM ni `swtpm`. Les tests navigateur restent une étape distincte de la CI.
+
+`make test-integration` assemble le serveur et une révision précise du dépôt client dans `integration/`, puis vérifie appairage TPM, transferts, refus, conflits, révocation et pont web. Les bibliothèques TPM manquantes sont fournies par `deploy/Dockerfile.tpm-dev`. Ces contrôles et les vérifications Debian 13/Arch restent requis avant publication. Pour travailler sur des changements coordonnés non commités, utiliser `MYSYNC_INTEGRATION_WORKTREE=1 make test-integration` avec les deux dépôts voisins.
 
 `make deploy` lance les contrôles, valide `deploy/.env`, reconstruit l'image, génère la documentation avec l'origine configurée, recrée le service serveur et copie `site/` vers `/var/www/mysyncfiles/docs/` (ou `MYSYNC_DOCS_DIR`). Il faut Docker Compose, Docker Buildx, `flock`, Rust, Python 3, `rsync` et `sudo` sur l'hôte de déploiement. Cette commande ne publie pas de binaire client signé. `make clean` supprime seulement `target/` et `site/` ; les données privées, releases et fichiers déjà déployés restent en place.
 
@@ -109,7 +69,7 @@ de CodeMirror sont isolés dans un ShadowRoot ; la politique CSP conserve
 `mysync` face à un serveur local isolé, avec appairage et signatures via `swtpm`.
 Les profils, clés et fichiers de test sont temporaires. Cette cible ne contacte
 pas le serveur configuré dans `deploy/.env`. Elle utilise le même environnement
-TPM que `make test` ; Python 3 et Linux sont nécessaires.
+TPM que `make test-integration` ; Python 3 et Linux sont nécessaires.
 
 ```sh
 make benchmark > benchmark.jsonl
@@ -153,7 +113,7 @@ de comparer un ancien client : les versions qui reprennent après le curseur
 
 La prévisualisation MkDocs est réservée au poste local. Pour servir la documentation sur l'origine HTTPS du serveur à `/docs/`, construire des fichiers statiques, puis les faire servir par le proxy existant. Cette opération ne change ni l'API, ni l'origine configurée pour les clients TPM.
 
-Depuis la racine du dépôt, générer le site après `device auth-configure`. `make docs-build` lit l'origine HTTPS enregistrée par l'administrateur dans la base serveur. Elle sert aux commandes d'installation, aux liens canoniques et au sitemap ; elle n'est pas enregistrée dans le dépôt public :
+Depuis la racine du dépôt, générer le site après `device auth-configure`. `make docs-build` lit l'origine HTTPS enregistrée par l'administrateur dans la base serveur. Elle sert aux exemples d’origine serveur, aux liens canoniques et au sitemap ; l’URL de l’installateur reste celle du dépôt GitHub client ; elle n'est pas enregistrée dans le dépôt public :
 
 ```sh
 make docs-build

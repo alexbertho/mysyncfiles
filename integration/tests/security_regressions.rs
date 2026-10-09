@@ -341,7 +341,7 @@ impl TestServer {
                 "/v1/auth/session",
                 post(|| async {
                     Json(mysyncfiles::auth_protocol::Session {
-                        token: "test-session".into(),
+                        token: "a".repeat(64),
                         expires_at: mysyncfiles::auth_protocol::now() + 900,
                     })
                 }),

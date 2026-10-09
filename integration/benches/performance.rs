@@ -18,6 +18,7 @@ use std::{
 mod common;
 
 #[derive(Parser)]
+#[command(args_override_self = true)]
 struct Options {
     // Cargo passes this to custom benchmark executables.
     #[arg(long, hide = true)]

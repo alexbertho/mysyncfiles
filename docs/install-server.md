@@ -4,20 +4,19 @@ Le serveur tourne dans Docker Compose derrière un proxy HTTPS. Ces commandes se
 
 ## Préparer le stockage
 
-Copier l'exemple, puis adapter **les quatre valeurs** au compte et aux chemins de l'hôte :
+Copier l'exemple, puis adapter **les trois valeurs** au compte et aux chemins de l'hôte :
 
 ```sh
 cp deploy/.env.example deploy/.env
 ${EDITOR:-vi} deploy/.env
 ```
 
-`MYSYNC_DATA_DIR` contient les fichiers et SQLite ; `MYSYNC_RELEASES_DIR` contient seulement les versions clientes publiques. Les deux chemins doivent être absolus et distincts. `MYSYNC_UID` et `MYSYNC_GID` désignent le propriétaire des fichiers dans le conteneur. Ne placer aucune clé privée de signature, invitation ou profil client dans les releases publiques, le dépôt ou la documentation.
+`MYSYNC_DATA_DIR` contient les fichiers et SQLite et doit être un chemin absolu. Les releases clientes sont hébergées sur le dépôt GitHub client. `MYSYNC_UID` et `MYSYNC_GID` désignent le propriétaire des fichiers dans le conteneur. Ne placer aucune clé privée de signature, invitation ou profil client dans les releases publiques, le dépôt ou la documentation.
 
 Créer les dossiers avant le démarrage. Ces commandes correspondent exactement aux valeurs de `deploy/.env.example` ; adapter chemins, UID et GID si le fichier a été modifié :
 
 ```sh
 sudo install -d -m 0700 -o 1000 -g 1000 /srv/mysyncfiles
-sudo install -d -m 0750 -o 1000 -g 1000 /srv/mysyncfiles-releases
 ```
 
 `deploy/.env` est ignoré par Git. Conserver le répertoire de données et ses sauvegardes hors du dépôt. Voir la [configuration](configuration.md) pour le rôle de chaque valeur.
@@ -49,10 +48,12 @@ Sur Btrfs, la création d'un fichier de swap exige des précautions particulièr
 ## Construire et démarrer
 
 ```sh
-make install
+sh deploy/install-server.sh
 make start
 curl -fsS http://127.0.0.1:8484/v1/health
 ```
+
+Le script demande un nom d’affichage (ou lit `MYSYNC_SERVER_NAME`), construit le serveur puis enregistre ce nom dans sa base. Le nom apparaît dans Atlas et dans la réponse authentifiée `/v1/server` ; il ne remplace ni l’URL ni la clé épinglée. Hors Docker : `mysync-server init --data-dir DOSSIER --name "Maison"`.
 
 `make install` valide la configuration Compose, l'existence des dossiers et leurs chemins absolus, puis construit l'image avec une limite mémoire. `make start` refait ces vérifications et lance l'image déjà construite sans déclencher de compilation ; le serveur initialise SQLite dans le dossier de données. Le point de santé est accessible uniquement sur la boucle locale de l'hôte. Pour consulter les journaux ou arrêter sans effacer les données : `make logs` et `make stop`.
 
@@ -66,7 +67,7 @@ Les commandes directes `docker compose -f deploy/compose.yaml ...` restent dispo
 
 Configurer un proxy TLS qui transmet les requêtes vers `127.0.0.1:8484`, sans redirection vers HTTP. L'exemple `deploy/nginx-sync.conf` illustre le proxy HTTP **derrière une terminaison TLS** ; il ne fournit pas lui-même HTTPS et ne doit pas être exposé seul sur Internet. Garder intacts méthode, chemin, query, corps et en-têtes `Authorization` et `x-mysync-proof`. Désactiver le cache et les transformations des routes authentifiées. Les transferts par blocs de 8 Mio restent compatibles avec un proxy Cloudflare, qui peut néanmoins lire les fichiers si TLS s'y termine.
 
-Utiliser ensuite l'[origine publique et les racines EK vérifiées](device-auth.md#configuration-du-serveur) pour exécuter `device auth-configure`. L'origine doit être l'URL HTTPS exacte vue par les clients, sans sous-chemin. Cette configuration est indispensable avant que `/install.sh` soit disponible.
+Utiliser ensuite l'[origine publique et les racines EK vérifiées](device-auth.md#configuration-du-serveur) pour exécuter `device auth-configure`. L'origine doit être l'URL HTTPS exacte vue par les clients, sans sous-chemin. Cette configuration est indispensable avant tout appairage.
 
 ## Préparer le premier client
 

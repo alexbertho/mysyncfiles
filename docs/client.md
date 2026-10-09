@@ -1,6 +1,6 @@
 # Fonctionnement du client
 
-`mysync` synchronise un miroir local configuré lors de l'appairage. `mysync sync` lance un passage ; `mysync daemon` surveille les changements et relance périodiquement la synchronisation. Le service `mysync.service` est un service systemd **utilisateur**, activé seulement après l'approbation de l'appareil.
+`mysync` synchronise un miroir local configuré lors de l'appairage. `mysync sync` lance un passage ; `mysync daemon --all` surveille les changements des dossiers des profils enregistrés et relance périodiquement la synchronisation. Le service `mysync.service` est un service systemd **utilisateur**, activé seulement après l'approbation de l'appareil.
 
 ## Réconciliation et conflits
 

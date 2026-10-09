@@ -81,7 +81,7 @@ fn check_active_session(
         return Err(auth_error("device revoked"));
     }
     if !is_session {
-        let valid: bool = db.prepare_cached("SELECT EXISTS(SELECT 1 FROM device_sessions WHERE token_hash=?1 AND enrollment_id=?2 AND expires_at>?3)").map_err(auth_error)?.query_row(
+        let valid: bool = db.prepare_cached("SELECT EXISTS(SELECT 1 FROM device_sessions WHERE token_hash=?1 AND enrollment_id=?2 AND expires_at>?3 AND public_key!='')").map_err(auth_error)?.query_row(
             params![hash(token), enrollment, now()], |r| r.get(0)).map_err(auth_error)?;
         if !valid {
             return Err(auth_error("expired or mismatched session"));
@@ -117,6 +117,16 @@ pub fn initialize(db: &Connection) -> Result<()> {
           PRIMARY KEY(enrollment_id,nonce));
         CREATE INDEX IF NOT EXISTS proof_nonces_expiry ON proof_nonces(expires_at);
         CREATE INDEX IF NOT EXISTS device_sessions_expiry ON device_sessions(expires_at);")?;
+    let columns = db
+        .prepare("PRAGMA table_info(device_sessions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == "public_key") {
+        db.execute(
+            "ALTER TABLE device_sessions ADD COLUMN public_key TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     Ok(())
 }
 fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
@@ -126,13 +136,30 @@ fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+pub fn server_name(state: &ServerState) -> Result<String> {
+    Ok(setting(&state.db.lock().unwrap(), "server_name")?.unwrap_or_else(|| "MySyncFiles".into()))
+}
+
+pub fn set_server_name(state: &ServerState, name: &str) -> Result<()> {
+    let name = name.trim();
+    ensure!(
+        !name.is_empty() && name.len() <= 80 && !name.chars().any(char::is_control),
+        "server name must contain 1 to 80 bytes without control characters"
+    );
+    state.db.lock().unwrap().execute(
+        "INSERT OR REPLACE INTO auth_settings VALUES('server_name', ?1)",
+        [name],
+    )?;
+    Ok(())
+}
+
 pub fn public_url(state: &ServerState) -> Result<String> {
     let db = state.db.lock().unwrap();
     setting(&db, "public_url")?.context("public URL is not configured; run device auth-configure")
 }
 
 pub fn configure(state: &ServerState, public_url: &str, roots: &Path) -> Result<()> {
-    let url = reqwest::Url::parse(public_url)?;
+    let url = url::Url::parse(public_url)?;
     ensure!(
         url.scheme() == "https"
             || (url.scheme() == "http"
@@ -542,6 +569,7 @@ pub async fn middleware(
     next: Next,
 ) -> Result<Response, ApiError> {
     let is_session = request.uri().path() == "/v1/auth/session";
+    let needs_tpm = requires_tpm(request.uri().path());
     let authorization = request
         .headers()
         .get("authorization")
@@ -583,8 +611,15 @@ pub async fn middleware(
             (public, setting(&db, "public_url").map_err(auth_error)?
                 .ok_or_else(|| auth_error("public URL missing"))?, device)
         };
-        proof.verify_headers(&public, &method, &format!("{origin}{target}"), &header_token)
-            .map_err(auth_error)?;
+        if needs_tpm {
+            proof.verify_headers(&public, &method, &format!("{origin}{target}"), &header_token).map_err(auth_error)?;
+        } else {
+            let session_public: String = state.db.lock().unwrap().query_row(
+                "SELECT public_key FROM device_sessions WHERE token_hash=?1 AND enrollment_id=?2 AND expires_at>?3",
+                params![hash(&header_token), proof.claims.device, now()], |row| row.get(0),
+            ).map_err(auth_error)?;
+            proof.verify_session_headers(&session_public, &method, &format!("{origin}{target}"), &header_token).map_err(auth_error)?;
+        }
         let body_permit = {
             let mut db = state.db.lock().unwrap();
             let tx = db.transaction().map_err(ApiError::internal)?;
@@ -637,7 +672,11 @@ pub async fn middleware(
     // The nonce is durably consumed even on a failed/cancelled body read.
     // Check revocation again AFTER receiving and verifying the bounded body.
     let (parts, body) = request.into_parts();
-    let bytes = read_signed_body(body).await?;
+    let bytes = if is_session {
+        read_body(body, 4096).await?
+    } else {
+        read_signed_body(body).await?
+    };
     // Retain admission in the worker if the requesting task is cancelled.
     let permit = body_permit.clone();
     let (enrollment, bytes) = state
@@ -663,7 +702,9 @@ pub async fn middleware(
 pub async fn session(
     State(state): State<Arc<ServerState>>,
     axum::Extension(id): axum::Extension<String>,
+    Json(request): Json<SessionRequest>,
 ) -> Result<Json<Session>, ApiError> {
+    ensure_session_request(&request).map_err(auth_error)?;
     state
         .blocking(move |state| {
             let token = random_secret().map_err(ApiError::internal)?;
@@ -671,9 +712,11 @@ pub async fn session(
             let db = state.db.lock().unwrap();
             db.execute("DELETE FROM device_sessions WHERE expires_at<=?1", [now()])
                 .map_err(ApiError::internal)?;
+            check_active_session(&db, &id, "", true)?;
+            db.execute("DELETE FROM device_sessions WHERE token_hash IN (SELECT token_hash FROM device_sessions WHERE enrollment_id=?1 ORDER BY expires_at DESC, rowid DESC LIMIT -1 OFFSET 7)", [&id]).map_err(ApiError::internal)?;
             db.execute(
-                "INSERT INTO device_sessions VALUES(?1,?2,?3)",
-                params![hash(&token), id, expires],
+                "INSERT INTO device_sessions(token_hash,enrollment_id,expires_at,public_key) VALUES(?1,?2,?3,?4)",
+                params![hash(&token), id, expires, request.public_key],
             )
             .map_err(ApiError::internal)?;
             Ok(Json(Session {
@@ -682,6 +725,16 @@ pub async fn session(
             }))
         })
         .await
+}
+
+fn ensure_session_request(request: &SessionRequest) -> Result<()> {
+    ensure!(
+        request.version == PROTOCOL_VERSION,
+        "protocol v2 required; upgrade the client and server together"
+    );
+    let key = crate::origin_auth::public_key(&request.public_key)?;
+    ensure!(!key.is_weak(), "weak session key");
+    Ok(())
 }
 
 #[cfg(test)]

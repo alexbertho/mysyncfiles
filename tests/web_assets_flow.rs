@@ -1,5 +1,5 @@
 use anyhow::Result;
-use mysyncfiles::server;
+use mysyncfiles_server::server;
 use reqwest::{Client, StatusCode};
 use std::{path::PathBuf, time::Duration};
 
@@ -23,7 +23,7 @@ impl Site {
         let web = temp.path().join("public");
         std::fs::create_dir(&web)?;
         let data = temp.path().join("private");
-        let state = server::open_with_web_dir(&data, None, web.clone())?;
+        let state = server::open_with_web_dir(&data, web.clone())?;
         rusqlite::Connection::open(data.join("metadata.sqlite3"))?.execute(
             "INSERT INTO auth_settings(key,value) VALUES('public_url','https://sync.example.test')",
             [],
@@ -51,6 +51,32 @@ impl Site {
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
         Ok(self.http.get(format!("{}{path}", self.url)).send().await?)
     }
+}
+
+#[tokio::test]
+async fn server_display_name_is_visible_and_html_escaped() -> Result<()> {
+    let site = Site::start().await?;
+    std::fs::write(
+        site.web.join("index.html"),
+        include_str!("../web/index.html"),
+    )?;
+    rusqlite::Connection::open(site._temp.path().join("private/metadata.sqlite3"))?.execute(
+        "INSERT INTO auth_settings(key,value) VALUES('server_name',?1)",
+        ["Home <script>alert(1)</script> & work"],
+    )?;
+    let html = site.get("/").await?.error_for_status()?.text().await?;
+    assert!(html.contains("Home &lt;script&gt;alert(1)&lt;/script&gt; &amp; work</a>"));
+    assert!(html.contains("Home &lt;script&gt;alert(1)&lt;/script&gt; &amp; work</span>"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+    let info: mysyncfiles_server::auth_protocol::ServerInfo = site
+        .get("/v1/server-info")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(info.name, "Home <script>alert(1)</script> & work");
+    assert_eq!(info.protocol, 2);
+    Ok(())
 }
 
 #[tokio::test]

@@ -18,3 +18,5 @@
 .env.*
 !.env.example
 deploy/.env
+
+/integration/target/

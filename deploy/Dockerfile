@@ -1,11 +1,10 @@
 FROM rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS build
-RUN apt-get update && apt-get install -y --no-install-recommends libtss2-dev libssl-dev pkg-config \
+RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY benches ./benches
-COPY deploy/install.sh deploy/mysync.service ./deploy/
+COPY crates ./crates
 RUN cargo build --locked --release --jobs 1 --bin mysync-server
 
 FROM debian:13-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime-deps
@@ -32,4 +31,4 @@ COPY web /web
 USER 65532:65532
 EXPOSE 8484
 ENTRYPOINT ["/usr/local/bin/mysync-server"]
-CMD ["serve", "--data-dir", "/data", "--listen", "0.0.0.0:8484", "--releases-dir", "/releases", "--web-dir", "/web"]
+CMD ["serve", "--data-dir", "/data", "--listen", "0.0.0.0:8484", "--web-dir", "/web"]

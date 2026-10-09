@@ -1,7 +1,7 @@
 site_name: MySyncFiles
 site_description: Guide d'installation et d'exploitation de MySyncFiles
 site_url: !ENV MYSYNC_DOCS_SITE_URL
-repo_url: https://github.com/alexbertho/mysyncfiles
+repo_url: https://github.com/alexbertho/mysyncfiles-server
 docs_dir: docs
 site_dir: site
 

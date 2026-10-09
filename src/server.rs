@@ -28,7 +28,6 @@ use crate::model::{
     BeginUpload, Entry, Manifest, ManifestPage, ManifestSummary, RestoreRequest, TrashItem,
     UPLOAD_CHUNK_BYTES, UploadProgress, valid_path,
 };
-use crate::release;
 
 mod origin;
 mod web_assets;
@@ -43,7 +42,6 @@ const FILE_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 pub struct ServerState {
     pub(crate) origin_key: ed25519_dalek::SigningKey,
     data_dir: PathBuf,
-    releases_dir: Option<crate::local_fs::Mirror>,
     web_dir: PathBuf,
     pub(crate) db: Mutex<Connection>,
     pub(crate) enrollment_limit: tokio::sync::Semaphore,
@@ -243,21 +241,10 @@ fn private_dir(path: &Path) -> Result<()> {
 }
 
 pub fn open(data_dir: impl AsRef<Path>) -> Result<Arc<ServerState>> {
-    open_with_releases(data_dir, None)
+    open_with_web_dir(data_dir, PathBuf::from("web"))
 }
 
-pub fn open_with_releases(
-    data_dir: impl AsRef<Path>,
-    releases_dir: Option<PathBuf>,
-) -> Result<Arc<ServerState>> {
-    open_with_web_dir(data_dir, releases_dir, PathBuf::from("web"))
-}
-
-pub fn open_with_web_dir(
-    data_dir: impl AsRef<Path>,
-    releases_dir: Option<PathBuf>,
-    web_dir: PathBuf,
-) -> Result<Arc<ServerState>> {
+pub fn open_with_web_dir(data_dir: impl AsRef<Path>, web_dir: PathBuf) -> Result<Arc<ServerState>> {
     let data_dir = data_dir.as_ref().to_path_buf();
     private_dir(&data_dir)?;
     private_dir(&data_dir.join("blobs"))?;
@@ -326,10 +313,6 @@ pub fn open_with_web_dir(
         origin_key: origin::load_key(&conn)?,
         data_dir,
         web_dir,
-        releases_dir: releases_dir
-            .as_deref()
-            .map(crate::local_fs::Mirror::open)
-            .transpose()?,
         db: Mutex::new(conn),
         enrollment_limit: tokio::sync::Semaphore::new(4),
         pair_ready_rate: Mutex::new((std::time::Instant::now(), 0)),
@@ -430,81 +413,13 @@ async fn health() -> &'static str {
     "ok"
 }
 
-fn shell_quoted(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-async fn client_installer(State(state): State<Arc<ServerState>>) -> Result<Response, ApiError> {
-    let public_url: Option<String> = state
-        .db
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT value FROM auth_settings WHERE key = 'public_url'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(ApiError::internal)?;
-    let public_url = public_url.ok_or_else(|| {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "configure the server public URL before installing clients".into(),
-        )
-    })?;
-    let script = include_str!("../deploy/install.sh")
-        .replace("@MYSYNC_SERVER_URL@", &shell_quoted(&public_url))
-        .replace(
-            "@MYSYNC_PUBLIC_KEY@",
-            &shell_quoted(release::PUBLIC_KEY_HEX.trim()),
-        )
-        .replace(
-            "@MYSYNC_UNIT@",
-            include_str!("../deploy/mysync.service").trim_end_matches('\n'),
-        );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-store")
-        .header("x-content-type-options", "nosniff")
-        .body(Body::from(script))
-        .map_err(ApiError::internal)
-}
-
-async fn client_release(
+async fn server_info(
     State(state): State<Arc<ServerState>>,
-    UrlPath((target, file)): UrlPath<(String, String)>,
-) -> Result<Response, ApiError> {
-    if !release::valid_target(&target) || !release::valid_release_file(&file) {
-        return Err(ApiError(StatusCode::NOT_FOUND, "release not found".into()));
-    }
-    let root = state
-        .releases_dir
-        .as_ref()
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "release not found".into()))?;
-    // Pin the configured root at startup and open every component with
-    // O_NOFOLLOW. The length and stream must refer to the very same inode.
-    let opened = root
-        .read(&format!("{target}/{file}"))
-        .map_err(|_| ApiError(StatusCode::NOT_FOUND, "release not found".into()))?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "release not found".into()))?;
-    let metadata = opened.metadata().map_err(ApiError::internal)?;
-    let opened = tokio::fs::File::from_std(opened);
-    let cache = if file.starts_with("latest.") {
-        "public, no-cache"
-    } else {
-        "public, max-age=31536000, immutable"
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, metadata.len().to_string())
-        .header(header::CACHE_CONTROL, cache)
-        .body(Body::from_stream(ReaderStream::with_capacity(
-            opened,
-            FILE_STREAM_BUFFER_BYTES,
-        )))
-        .map_err(ApiError::internal)
+) -> Result<Json<crate::auth_protocol::ServerInfo>, ApiError> {
+    Ok(Json(crate::auth_protocol::ServerInfo {
+        protocol: crate::auth_protocol::PROTOCOL_VERSION,
+        name: crate::device_auth::server_name(&state).map_err(ApiError::internal)?,
+    }))
 }
 
 #[derive(Default, Deserialize)]
@@ -1319,6 +1234,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
             web_status::middleware,
         ));
     let protected = Router::new()
+        .route("/v1/server", get(server_info))
         .route("/v1/manifest", get(manifest))
         .route("/v1/manifest/page", get(manifest_page))
         .route("/v1/file", get(download).put(upload).delete(delete))
@@ -1352,8 +1268,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .merge(protected)
         .merge(enrollment)
         .route("/v1/health", get(health))
-        .route("/install.sh", get(client_installer))
-        .route("/v1/updates/{target}/{file}", get(client_release))
+        .route("/v1/server-info", get(server_info))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
 }
@@ -1370,15 +1285,10 @@ pub fn api_listener(
     })
 }
 
-pub async fn serve(
-    data_dir: impl AsRef<Path>,
-    listen: SocketAddr,
-    releases_dir: Option<PathBuf>,
-    web_dir: PathBuf,
-) -> Result<()> {
+pub async fn serve(data_dir: impl AsRef<Path>, listen: SocketAddr, web_dir: PathBuf) -> Result<()> {
     private_dir(data_dir.as_ref())?;
     let _service_lock = service_lock(data_dir.as_ref())?;
-    let state = open_with_web_dir(data_dir, releases_dir, web_dir)?;
+    let state = open_with_web_dir(data_dir, web_dir)?;
     recover_storage(&state).context("recovering interrupted storage operations")?;
     purge_expired(&state).context("purging expired trash")?;
     purge_upload_sessions(&state).context("purging expired upload sessions")?;

@@ -1,6 +1,6 @@
 # Fonctionnement du serveur
 
-`mysync-server` expose une API HTTP sur `127.0.0.1:8484` côté hôte Docker ; un proxy assure l'accès HTTPS public. Le conteneur fonctionne sans privilège, avec un système de fichiers racine en lecture seule, `/tmp` privé en mémoire et deux montages : les données privées en écriture et les releases publiques en lecture seule. Le serveur n'utilise pas de TPM local.
+`mysync-server` expose une API HTTP sur `127.0.0.1:8484` côté hôte Docker ; un proxy assure l'accès HTTPS public. Le conteneur fonctionne sans privilège, avec un système de fichiers racine en lecture seule, `/tmp` privé en mémoire et deux montages : les données privées en écriture et les fichiers de l’interface web en lecture seule. Le serveur n'utilise pas de TPM local.
 
 ## Stockage et révisions
 
@@ -10,7 +10,7 @@ Le serveur est l'autorité sur les révisions. Une requête qui part d'une ancie
 
 ## Routes et administration
 
-`/v1/health` donne un contrôle local de disponibilité. `/install.sh` sert le script client après configuration de l'origine publique. `/v1/updates/…` sert les releases signées présentes dans le montage dédié. Les routes de synchronisation exigent une session et une preuve TPM liée à la requête. Les réponses et transferts sont bornés, et l'API ne suit aucune redirection HTTP.
+`/v1/health` donne un contrôle local de disponibilité. `/v1/server-info` annonce le nom d’affichage et le protocole. `/v1/server` fournit les mêmes informations dans une réponse authentifiée. L’installateur et les releases sont distribués par le dépôt client. Les routes de synchronisation exigent une session autorisée par le TPM et une preuve Ed25519 liée à la requête. Les réponses et transferts sont bornés, et l'API ne suit aucune redirection HTTP.
 
 Les opérations d'administration des appareils (`device auth-configure`, `pair`, `invite`, `pending`, `approve`, `revoke`) s'exécutent localement via `mysync-server` dans le conteneur. `make pair` guide l'appairage courant ; il n'existe pas de route HTTP pour approuver un appareil. Voir la [configuration](configuration.md) et l'[appairage](device-auth.md#appairage-et-approbation).
 

@@ -316,7 +316,18 @@ pub async fn send_signed(
     let mut session_url = request.url().clone();
     session_url.set_path("/v1/auth/session");
     session_url.set_query(None);
-    let mut session_request = http.post(session_url).build()?;
+    let ephemeral = ed25519_dalek::SigningKey::from_bytes(
+        &hex::decode(mysyncfiles::auth_protocol::random_secret()?)?
+            .try_into()
+            .unwrap(),
+    );
+    let mut session_request = http
+        .post(session_url)
+        .json(&mysyncfiles::auth_protocol::SessionRequest {
+            version: mysyncfiles::auth_protocol::PROTOCOL_VERSION,
+            public_key: hex::encode(ephemeral.verifying_key().to_bytes()),
+        })
+        .build()?;
     sign(&mut session_request, key, "")?;
     let session: Session = http
         .execute(session_request)
@@ -324,7 +335,31 @@ pub async fn send_signed(
         .error_for_status()?
         .json()
         .await?;
-    sign(&mut request, key, &session.token)?;
+    if mysyncfiles::auth_protocol::requires_tpm(request.url().path()) {
+        sign(&mut request, key, &session.token)?;
+    } else {
+        let body = request
+            .body()
+            .and_then(|b| b.as_bytes())
+            .unwrap_or_default();
+        let claims = Claims::new(
+            &key.device,
+            request.method().as_str(),
+            request.url().as_str(),
+            body,
+            &session.token,
+        )?;
+        request.headers_mut().insert(
+            PROOF_HEADER,
+            mysyncfiles::auth_protocol::Proof::session(claims, &ephemeral)?
+                .encode()?
+                .parse()?,
+        );
+        request.headers_mut().insert(
+            reqwest::header::AUTHORIZATION,
+            format!("MySync {}", session.token).parse()?,
+        );
+    }
     Ok(http.execute(request).await?)
 }
 fn sign(request: &mut reqwest::Request, key: &Identity, token: &str) -> Result<()> {

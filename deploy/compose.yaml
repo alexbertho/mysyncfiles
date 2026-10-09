@@ -25,10 +25,6 @@ services:
       - type: bind
         source: ${MYSYNC_DATA_DIR:?Set MYSYNC_DATA_DIR in deploy/.env}
         target: /data
-      - type: bind
-        source: ${MYSYNC_RELEASES_DIR:?Set MYSYNC_RELEASES_DIR in deploy/.env}
-        target: /releases
-        read_only: true
     ports:
       - "127.0.0.1:8484:8484"
     logging:

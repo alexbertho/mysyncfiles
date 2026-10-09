@@ -58,6 +58,26 @@ pub(super) async fn read(
                 let mut bytes = Vec::new();
                 file.take(MAX_ASSET_BYTES + 1).read_to_end(&mut bytes)?;
                 anyhow::ensure!(bytes.len() as u64 <= MAX_ASSET_BYTES, "web asset too large");
+                if name == "index.html" {
+                    let label = crate::device_auth::server_name(&state)?;
+                    let label = label
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('"', "&quot;")
+                        .replace('\'', "&#39;");
+                    let html = String::from_utf8(bytes)?
+                        .replace("MySyncFiles</a>", &format!("{label}</a>"))
+                        .replace(
+                            "compact-brand-name\">MySyncFiles</span>",
+                            &format!("compact-brand-name\">{label}</span>"),
+                        )
+                        .replace(
+                            "Fichiers · MySyncFiles</title>",
+                            &format!("Fichiers · {label}</title>"),
+                        );
+                    return Ok(html.into_bytes());
+                }
                 Ok(bytes)
             })();
             contents.map_err(|error| {

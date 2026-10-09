@@ -1,38 +1,38 @@
-[workspace]
-members = ["crates/protocol"]
-exclude = ["integration"]
-resolver = "2"
-
 [package]
-name = "mysyncfiles-server"
+name = "mysync-integration"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.88"
-license = "GPL-3.0-only"
-description = "Server-authoritative Linux file synchronization server"
+publish = false
 
-[[bin]]
-name = "mysync-server"
-path = "src/bin/mysync-server.rs"
+[workspace]
+
+[lib]
+name = "mysyncfiles"
 
 [dependencies]
-mysync-protocol = { path = "crates/protocol", version = "0.4.0" }
+mysyncfiles-server = { path = ".." }
+mysyncfiles-client = { path = "../../mysyncfiles-client", features = ["tpm"] }
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "3"
 futures-util = "0.3"
 fs2 = "0.4"
+getrandom = "0.4"
 hex = "0.4"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+notify = "8"
 openssl = "0.10"
-url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rpassword = "7"
 rustix = { version = "1", features = ["fs"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+sha2 = "0.10"
 socket2 = "0.6"
 tokio = {
     version = "1",
@@ -49,20 +49,19 @@ tokio = {
     ],
 }
 tokio-util = { version = "0.7", features = ["io"] }
+tss-esapi = "7.7"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 x509-parser = "0.18"
 
-
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 walkdir = "2"
 tokio = { version = "1", features = ["test-util"] }
 
-[profile.release]
-strip = "symbols"
-lto = "thin"
-codegen-units = 1
+
+[[bench]]
+name = "performance"
+harness = false
 
 [profile.dev]
 debug = 0
@@ -71,3 +70,8 @@ incremental = false
 [profile.test]
 debug = 0
 incremental = false
+
+[patch."https://github.com/alexbertho/mysyncfiles-server"]
+# One Rust type identity for both halves. test.sh first checks that this source
+# is identical to the client's pinned protocol revision.
+mysync-protocol = { path = "../crates/protocol" }
